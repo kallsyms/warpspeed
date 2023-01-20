@@ -1,8 +1,9 @@
 use clap::Parser;
-use log::{error, info, trace, warn};
+use log::{trace, debug, info, warn, error};
+use mach::message::mach_msg_header_t;
 use nix::libc;
 use nix::sys::signal::{kill, Signal};
-use nix::sys::{ptrace, wait};
+use nix::sys::{ptrace};
 use nix::unistd::{execve, fork, getpid, ForkResult};
 use std::ffi::CStr;
 use std::ffi::CString;
@@ -10,7 +11,7 @@ use std::ffi::CString;
 // Extra stuff that's not in the mach crate yet.
 //mod mach_ext;
 
-extern "C" {
+extern {
     pub fn task_set_exception_ports(
         task: mach::mach_types::task_t,
         exception_mask: mach::exception_types::exception_mask_t,
@@ -26,10 +27,14 @@ extern "C" {
                                           notifyPoly: mach::message::mach_msg_type_name_t,
                                           previous: *mut mach::port::mach_port_t,
     ) -> mach::kern_return::kern_return_t;
-    pub fn mach_error_string(error_value: mach::kern_return::kern_return_t)
-     -> *const std::os::raw::c_char;
+    pub fn mach_error_string(error_value: mach::kern_return::kern_return_t) -> *const std::os::raw::c_char;
+
+    fn mach_exc_server(
+        request: *mut mach_msg_header_t,
+        reply: *mut mach_msg_header_t,
+    ) -> bool;
 }
-pub const MACH_NOTIFY_DEAD_NAME: i32 = 0110;
+pub const MACH_NOTIFY_DEAD_NAME: i32 = 0o110;
 
 /// mRR, the macOS Record Replay Debugger
 #[derive(Parser, Debug)]
@@ -76,7 +81,7 @@ fn target(executable: &str, args: &Vec<String>) {
     let args: Vec<&CStr> = cargs_owned.iter().map(|s| s.as_c_str()).collect();
     let env: Vec<&CStr> = vec![]; // TODO
 
-    trace!("Executing target: {:?} {:?}", executable, args);
+    debug!("Executing target: {:?} {:?}", executable, args);
 
     if execve(&executable, &args, &env).is_err() {
         warn!("Failed to execve");
@@ -93,12 +98,40 @@ fn check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str>
     }
 }
 
+pub extern fn catch_mach_exception_raise() -> mach::kern_return::kern_return_t {
+    error!("Unexpected mach_exception_raise");
+    return mach::message::MACH_RCV_INVALID_TYPE;
+}
+
+pub extern fn catch_mach_exception_raise_state(
+    exception_port: mach::port::mach_port_t,
+    exception: mach::exception_types::exception_type_t,
+    code: mach::exception_types::exception_data_t,
+    code_count: mach::message::mach_msg_type_number_t,
+    flavor: *mut mach::thread_status::thread_state_flavor_t,
+    old_state: mach::thread_status::thread_state_t,
+    old_state_count: mach::message::mach_msg_type_number_t,
+    new_state: mach::thread_status::thread_state_t,
+    new_state_count: *mut mach::message::mach_msg_type_number_t,
+) -> mach::kern_return::kern_return_t {
+    info!("Got mach_exception_raise_state: port: {:?}, exception: {:?}, code: {:?}, code_count: {:?}, flavor: {:?}, old_state: {:?}, old_state_count: {:?}, new_state: {:?}, new_state_count: {:?}",
+          exception_port, exception, code, code_count, flavor, old_state, old_state_count, new_state, new_state_count);
+    return mach::kern_return::KERN_SUCCESS;
+}
+
+pub extern fn catch_mach_exception_raise_state_identity() -> mach::kern_return::kern_return_t {
+    error!("Unexpected mach_exception_raise_state_identity");
+    return mach::message::MACH_RCV_INVALID_TYPE;
+}
+
 fn main() {
     let args = Args::parse();
 
     env_logger::Builder::new()
         .filter_level(args.verbose.log_level_filter())
         .init();
+
+    trace!("{:?}", catch_mach_exception_raise_state as *const ());
 
     let f;
     unsafe {
@@ -139,9 +172,11 @@ fn main() {
                     mach::exception_types::EXC_MASK_ALL,
                     exception_port,
                     // TODO: request state
-                    (mach::exception_types::EXCEPTION_DEFAULT
-                        | mach::exception_types::MACH_EXCEPTION_CODES) as i32,
-                    mach::thread_status::THREAD_STATE_NONE,
+                    mach::exception_types::EXCEPTION_STATE as i32,
+                    // (mach::exception_types::EXCEPTION_DEFAULT
+                    //     | mach::exception_types::MACH_EXCEPTION_CODES) as i32,
+                    //mach::thread_status::THREAD_STATE_NONE,
+                    mach::thread_status::x86_THREAD_STATE64,
                 )).unwrap();
 
                 let mut req_port: mach::port::mach_port_t = 0;
@@ -157,21 +192,40 @@ fn main() {
             }
 
             loop {
-                let mut req: mach::message::mach_msg_header_t = Default::default();
+                let mut req: [u8; 4096] = [0; 4096];
+                let req_hdr = &mut req as *mut _ as *mut mach_msg_header_t;
+                let mut rpl: [u8; 4096] = [0; 4096];
+                let rpl_hdr = &mut rpl as *mut _ as *mut mach_msg_header_t;
 
                 unsafe {
                     check_return(mach::message::mach_msg(
-                        &mut req,
+                        req_hdr,
                         mach::message::MACH_RCV_MSG,
                         0,
-                        std::mem::size_of::<mach::message::mach_msg_header_t>() as u32,
+                        4096,
                         exception_port,
                         mach::message::MACH_MSG_TIMEOUT_NONE,
                         mach::port::MACH_PORT_NULL,
                     )).unwrap();
-                }
 
-                trace!("Got exception: {:?}", req);
+                    // Will call back into catch_mach_exception_raise_state
+                    if !mach_exc_server(
+                        req_hdr,
+                        rpl_hdr,
+                    ) {
+                        warn!("mach_exc_server failed");
+                    }
+
+                    check_return(mach::message::mach_msg(
+                        rpl_hdr,
+                        mach::message::MACH_SEND_MSG,
+                        (*rpl_hdr).msgh_size,
+                        0,
+                        mach::port::MACH_PORT_NULL,
+                        mach::message::MACH_MSG_TIMEOUT_NONE,
+                        mach::port::MACH_PORT_NULL,
+                    )).unwrap();
+                }
             }
         }
         ForkResult::Child => {

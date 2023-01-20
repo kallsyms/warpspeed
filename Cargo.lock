@@ -208,6 +208,7 @@ dependencies = [
 name = "mrr"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "clap",
  "clap-verbosity-flag",
  "env_logger",

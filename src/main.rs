@@ -173,24 +173,6 @@ fn main() {
 
                 trace!("Got exception: {:?}", req);
             }
-
-            loop {
-                let status = wait::waitpid(child, None).unwrap();
-                match status {
-                    wait::WaitStatus::Exited(_, code) => {
-                        info!("Child exited code {:?}", code);
-                        break;
-                    }
-                    wait::WaitStatus::Signaled(_, signum, _) => {
-                        trace!("Child signaled {:?}", signum);
-                    }
-                    wait::WaitStatus::Stopped(_, _) => {
-                        info!("Child stopped");
-                        ptrace::cont(child, None).unwrap();
-                    }
-                    _ => {}
-                }
-            }
         }
         ForkResult::Child => {
             target(&args.executable, &args.arguments);

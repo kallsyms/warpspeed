@@ -1,6 +1,5 @@
 use clap::Parser;
 use log::{trace, debug, info, warn, error};
-use mach::message::mach_msg_header_t;
 use nix::libc;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::{ptrace};
@@ -8,9 +7,7 @@ use nix::unistd::{execve, fork, getpid, ForkResult};
 use std::ffi::CStr;
 use std::ffi::CString;
 
-// Extra stuff that's not in the mach crate yet.
-//mod mach_ext;
-
+// Couple of defs which aren't in the mach crate
 extern {
     pub fn task_set_exception_ports(
         task: mach::mach_types::task_t,
@@ -28,13 +25,17 @@ extern {
                                           previous: *mut mach::port::mach_port_t,
     ) -> mach::kern_return::kern_return_t;
     pub fn mach_error_string(error_value: mach::kern_return::kern_return_t) -> *const std::os::raw::c_char;
+}
 
+#[link(name = "mach_excServer", kind = "static")]
+extern {
     fn mach_exc_server(
-        request: *mut mach_msg_header_t,
-        reply: *mut mach_msg_header_t,
+        request: *mut mach::message::mach_msg_header_t,
+        reply: *mut mach::message::mach_msg_header_t,
     ) -> bool;
 }
-pub const MACH_NOTIFY_DEAD_NAME: i32 = 0o110;
+
+mod mig;
 
 /// mRR, the macOS Record Replay Debugger
 #[derive(Parser, Debug)]
@@ -88,21 +89,27 @@ fn target(executable: &str, args: &Vec<String>) {
     }
 }
 
+fn r_mach_error_string(r: mach::kern_return::kern_return_t) -> &'static str {
+    unsafe {
+        CStr::from_ptr(mach_error_string(r)).to_str().unwrap()
+    }
+}
+
 fn check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str> {
     if r != mach::kern_return::KERN_SUCCESS {
-        unsafe {
-            Err(CStr::from_ptr(mach_error_string(r)).to_str().unwrap())
-        }
+        Err(r_mach_error_string(r))
     } else {
         Ok(())
     }
 }
 
+#[no_mangle]
 pub extern fn catch_mach_exception_raise() -> mach::kern_return::kern_return_t {
     error!("Unexpected mach_exception_raise");
     return mach::message::MACH_RCV_INVALID_TYPE;
 }
 
+#[no_mangle]
 pub extern fn catch_mach_exception_raise_state(
     exception_port: mach::port::mach_port_t,
     exception: mach::exception_types::exception_type_t,
@@ -119,6 +126,7 @@ pub extern fn catch_mach_exception_raise_state(
     return mach::kern_return::KERN_SUCCESS;
 }
 
+#[no_mangle]
 pub extern fn catch_mach_exception_raise_state_identity() -> mach::kern_return::kern_return_t {
     error!("Unexpected mach_exception_raise_state_identity");
     return mach::message::MACH_RCV_INVALID_TYPE;
@@ -130,8 +138,6 @@ fn main() {
     env_logger::Builder::new()
         .filter_level(args.verbose.log_level_filter())
         .init();
-
-    trace!("{:?}", catch_mach_exception_raise_state as *const ());
 
     let f;
     unsafe {
@@ -183,7 +189,7 @@ fn main() {
                 check_return(mach_port_request_notification(
                     mach::traps::mach_task_self(),
                     task_port,
-                    MACH_NOTIFY_DEAD_NAME,
+                    mig::MACH_NOTIFY_DEAD_NAME as i32,  // steal the def from mig here
                     0,
                     exception_port,
                     mach::message::MACH_MSG_TYPE_MAKE_SEND_ONCE,
@@ -193,9 +199,9 @@ fn main() {
 
             loop {
                 let mut req: [u8; 4096] = [0; 4096];
-                let req_hdr = &mut req as *mut _ as *mut mach_msg_header_t;
+                let req_hdr = &mut req as *mut _ as *mut mach::message::mach_msg_header_t;
                 let mut rpl: [u8; 4096] = [0; 4096];
-                let rpl_hdr = &mut rpl as *mut _ as *mut mach_msg_header_t;
+                let rpl_hdr = &mut rpl as *mut _ as *mut mach::message::mach_msg_header_t;
 
                 unsafe {
                     check_return(mach::message::mach_msg(
@@ -213,7 +219,7 @@ fn main() {
                         req_hdr,
                         rpl_hdr,
                     ) {
-                        warn!("mach_exc_server failed");
+                        warn!("mach_exc_server failed: {}", r_mach_error_string((*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode));
                     }
 
                     check_return(mach::message::mach_msg(

@@ -1,9 +1,9 @@
 use clap::Parser;
 use log::{trace, debug, info, warn, error};
 use nix::libc;
+use nix::sys::ptrace;
 use nix::sys::signal::{kill, Signal};
-use nix::sys::{ptrace};
-use nix::unistd::{execve, fork, getpid, ForkResult};
+use nix::unistd::{execve, fork, getpid, ForkResult, sleep};
 use std::ffi::CStr;
 use std::ffi::CString;
 
@@ -72,10 +72,19 @@ fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
     }
 }
 
-fn target(executable: &str, args: &Vec<String>) {
-    ptrace::traceme().unwrap();
-    kill(getpid(), Signal::SIGSTOP).unwrap();
+fn ptrace_thupdate(pid: nix::unistd::Pid, port: mach::port::mach_port_t, signal: i32) -> nix::Result<()> {
+    unsafe {
+        nix::errno::Errno::result(libc::ptrace(
+            ptrace::Request::PT_THUPDATE as ptrace::RequestType,
+            pid.into(),
+            port as *mut i8,
+            signal,
+        ))
+        .map(|_| ())
+    }
+}
 
+fn target(executable: &str, args: &Vec<String>) {
     let executable = CString::new(executable.as_bytes()).unwrap();
     let mut cargs_owned: Vec<CString> = vec![CString::new(executable.as_bytes()).unwrap()];
     cargs_owned.extend(args.iter().map(|s| CString::new(s.as_bytes()).unwrap()));
@@ -84,9 +93,14 @@ fn target(executable: &str, args: &Vec<String>) {
 
     debug!("Executing target: {:?} {:?}", executable, args);
 
-    if execve(&executable, &args, &env).is_err() {
-        warn!("Failed to execve");
+    loop {
+        println!("hello!");
+        sleep(3);
     }
+
+    // if execve(&executable, &args, &env).is_err() {
+    //     warn!("Failed to execve");
+    // }
 }
 
 fn r_mach_error_string(r: mach::kern_return::kern_return_t) -> &'static str {
@@ -103,10 +117,42 @@ fn check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str>
     }
 }
 
+static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
+
 #[no_mangle]
-pub extern fn catch_mach_exception_raise() -> mach::kern_return::kern_return_t {
-    error!("Unexpected mach_exception_raise");
-    return mach::message::MACH_RCV_INVALID_TYPE;
+pub extern fn catch_mach_exception_raise(
+    exception_port: mach::port::mach_port_t,
+    thread_port: mach::port::mach_port_t,
+    task_port: mach::port::mach_port_t,
+    exception: mach::exception_types::exception_type_t,
+    code: *mut u32, //mach::exception_types::exception_data_t,
+    code_count: mach::message::mach_msg_type_number_t,
+) -> mach::kern_return::kern_return_t {
+    let codes = unsafe { std::slice::from_raw_parts(code, code_count as usize) };
+    trace!("mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?} ({:?})", exception_port, thread_port, task_port, exception, code, code_count, codes);
+
+    match exception as u32 {
+        mach::exception_types::EXC_SOFTWARE => {
+            match codes {
+                [mach::exception_types::EXC_SOFT_SIGNAL, signal] => {
+                    trace!("EXC_SOFT_SIGNAL: {}", signal);
+                }
+                _ => {
+                    info!("Unhandled EXC_SOFTWARE code: {:?}", codes);
+                }
+            }
+            unsafe {
+                ptrace_thupdate(global_child, thread_port, codes[1] as i32).unwrap();
+            }
+        }
+        mach::exception_types::EXC_SYSCALL => {
+            trace!("EXC_SYSCALL");
+        }
+        _ => {
+            info!("Unhandled exception type: {}", exception);
+        }
+    };
+    return mach::kern_return::KERN_SUCCESS;
 }
 
 #[no_mangle]
@@ -121,9 +167,8 @@ pub extern fn catch_mach_exception_raise_state(
     new_state: mach::thread_status::thread_state_t,
     new_state_count: *mut mach::message::mach_msg_type_number_t,
 ) -> mach::kern_return::kern_return_t {
-    info!("Got mach_exception_raise_state: port: {:?}, exception: {:?}, code: {:?}, code_count: {:?}, flavor: {:?}, old_state: {:?}, old_state_count: {:?}, new_state: {:?}, new_state_count: {:?}",
-          exception_port, exception, code, code_count, flavor, old_state, old_state_count, new_state, new_state_count);
-    return mach::kern_return::KERN_SUCCESS;
+    error!("Unexpected mach_exception_raise_state");
+    return mach::message::MACH_RCV_INVALID_TYPE;
 }
 
 #[no_mangle]
@@ -148,13 +193,15 @@ fn main() {
 
     match f {
         ForkResult::Parent { child, .. } => {
+            unsafe { global_child = child; }
             info!("Child pid {}", child);
 
-            ptrace_attachexc(child).unwrap();
+            // trace!("Waiting for child STOP");
+            // trace!("{:?}", waitpid(child, None).unwrap());
 
             // https://www.spaceflint.com/?p=150
             // https://sourcegraph.com/github.com/hhhaiai/decompile/-/blob/bin/radareorg_radare2/libr/debug/p/native/xnu/xnu_excthreads.c?L455:23
-            let mut task_port: mach::port::mach_port_t = 0;
+            let mut task_port: mach::mach_types::task_t = 0;
             let mut exception_port: mach::port::mach_port_name_t = 0;
             unsafe {
                 check_return(mach::traps::task_for_pid(mach::traps::mach_task_self(), child.into(), &mut task_port)).unwrap();
@@ -177,13 +224,12 @@ fn main() {
                     task_port,
                     mach::exception_types::EXC_MASK_ALL,
                     exception_port,
-                    // TODO: request state
-                    mach::exception_types::EXCEPTION_STATE as i32,
-                    // (mach::exception_types::EXCEPTION_DEFAULT
-                    //     | mach::exception_types::MACH_EXCEPTION_CODES) as i32,
-                    //mach::thread_status::THREAD_STATE_NONE,
+                    (mach::exception_types::EXCEPTION_DEFAULT
+                        | mach::exception_types::MACH_EXCEPTION_CODES) as i32,
+                    //mach::thread_status::THREAD_STATE_NONE,  // causes invalid arg?
                     mach::thread_status::x86_THREAD_STATE64,
                 )).unwrap();
+                trace!("set exception port");
 
                 let mut req_port: mach::port::mach_port_t = 0;
                 check_return(mach_port_request_notification(
@@ -196,6 +242,9 @@ fn main() {
                     &mut req_port,
                 )).unwrap();
             }
+
+            ptrace_attachexc(child).unwrap();
+            trace!("Attached");
 
             loop {
                 let mut req: [u8; 4096] = [0; 4096];
@@ -213,15 +262,22 @@ fn main() {
                         mach::message::MACH_MSG_TIMEOUT_NONE,
                         mach::port::MACH_PORT_NULL,
                     )).unwrap();
+                    trace!("Got message: {:?}", *req_hdr);
 
-                    // Will call back into catch_mach_exception_raise_state
+                    // Will call back into catch_mach_exception_raise
                     if !mach_exc_server(
                         req_hdr,
                         rpl_hdr,
                     ) {
+                        if(*req_hdr).msgh_id == mig::MACH_NOTIFY_DEAD_NAME as i32 {
+                            info!("Child died");
+                            return;
+                        }
+
                         warn!("mach_exc_server failed: {}", r_mach_error_string((*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode));
                     }
 
+                    *rpl_hdr = *req_hdr;
                     check_return(mach::message::mach_msg(
                         rpl_hdr,
                         mach::message::MACH_SEND_MSG,

@@ -93,14 +93,9 @@ fn target(executable: &str, args: &Vec<String>) {
 
     debug!("Executing target: {:?} {:?}", executable, args);
 
-    loop {
-        println!("hello!");
-        sleep(3);
+    if execve(&executable, &args, &env).is_err() {
+        warn!("Failed to execve");
     }
-
-    // if execve(&executable, &args, &env).is_err() {
-    //     warn!("Failed to execve");
-    // }
 }
 
 fn r_mach_error_string(r: mach::kern_return::kern_return_t) -> &'static str {

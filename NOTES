@@ -1,0 +1,28 @@
+* Original idea is macos' ptrace_attachext "extension", in which we receive ptrace notifications over a mach port instead of signaling
+    * XNU doesn't seem to support syscall interception (with `EXC_SYSCALL`): https://github.com/checkra1n/BugTracker/issues/1137
+        * `EXC_SYSCALL` is only referenced when the syscall number is bad: https://github.com/search?q=repo%3Aapple-oss-distributions%2Fxnu%20EXC_SYSCALL&type=code
+        * and `EXC_MACH_SYSCALL` is never referenced
+    * XNU also doesn't implement `task_set_emulation` which would let us specify a userland handler for syscalls
+
+    * Potential resolution: sandbox (w/ seatbelt) target with no privs - does this raise an exception back to us that we could then record and somehow continue from?
+        * Raises, but the child is killed and we can't undo that
+    * Potential resolution: other ways of blocking syscalls
+        * `proc_set_syscall_filter_mask`
+            * Looks like it'd just skip...
+        * AUDIT
+            * Not hookable, read-only
+    * Potential resolution: dynamic rewriting of syscall and calls to msg_trap
+        * Alternative idea: LLDB plugin
+            * Reuse LLDB's disasm and everything else to implement dynamic rewriting
+
+* Alternative idea: dtrace
+    * Most (simple) data could be extracted as a D script
+        * Arbitrary dereferencing can be done with e.g. `*(uint32_t*)copyin(arg0, 4)`
+        * Appears this all has to be "serialized" and printed out, no easy way to return a byte array
+    * Dtrace is "async" though, which makes dynamic struct walking and whatnot very hard
+        * https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/systrace.c#L190
+    * Idea: is it possible to signal within a dtrace program/handler?
+        * Yes! Pass `-w` to enable destructive actions, then `stop();` or `raise(SIGTRAP);`
+        * Does this work both on entry and exit?
+            * Yes, but the syscall is still evaluated before the signal is delivered
+                * https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/dtrace.c#L6701

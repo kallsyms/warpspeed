@@ -93,6 +93,22 @@ fn ptrace_thupdate(
     }
 }
 
+// https://stackoverflow.com/a/32270215
+extern "C" fn dtrace_agg_walk_handler(agg: *const dtrace::dtrace_aggdata_t, arg: *mut libc::c_void) -> libc::c_int {
+    let closure: &mut &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> bool = unsafe { std::mem::transmute(arg) };
+    closure(agg) as libc::c_int
+}
+
+pub fn dtrace_aggregate_walk_cb<F>(handle: *mut dtrace::dtrace_hdl, mut callback: F) -> libc::c_int
+    where F: FnMut(*const dtrace::dtrace_aggdata_t) -> libc::c_int
+{
+    let mut cb: &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> libc::c_int = &mut callback;
+    let cb = &mut cb;
+    unsafe {
+        dtrace::dtrace_aggregate_walk(handle, Some(dtrace_agg_walk_handler), cb as *mut _ as *mut libc::c_void)
+    }
+}
+
 fn target(executable: &str, args: &Vec<String>) -> ! {
     sleep(1);
 
@@ -119,7 +135,7 @@ fn r_mach_error_string(r: mach::kern_return::kern_return_t) -> &'static str {
     unsafe { CStr::from_ptr(mach_error_string(r)).to_str().unwrap() }
 }
 
-fn check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str> {
+fn mach_check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str> {
     if r != mach::kern_return::KERN_SUCCESS {
         Err(r_mach_error_string(r))
     } else {
@@ -128,6 +144,7 @@ fn check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str>
 }
 
 static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
+static mut dtrace_handle: *mut dtrace::dtrace_hdl = std::ptr::null_mut();
 
 #[no_mangle]
 pub extern "C" fn catch_mach_exception_raise(
@@ -159,6 +176,24 @@ pub extern "C" fn catch_mach_exception_raise(
                         signal = std::mem::transmute(*signum);
                     }
                     trace!("EXC_SOFT_SIGNAL: {}", signal);
+
+                    unsafe {
+                        if dtrace::dtrace_aggregate_snap(dtrace_handle) == -1 {
+                            warn!("dtrace_aggregate_snap failed: {}", CStr::from_ptr(dtrace::dtrace_errmsg(dtrace_handle, dtrace::dtrace_errno(dtrace_handle))).to_str().unwrap());
+                        }
+                        let closure = |agg: *const dtrace::dtrace_aggdata_t| {
+                            let desc = *((*agg).dtada_desc);
+                            let records: &[dtrace::dtrace_recdesc] = std::slice::from_raw_parts(&(*(*agg).dtada_desc).dtagd_rec as *const dtrace::dtrace_recdesc_t, (desc.dtagd_nrecs) as usize);
+                            let mut vals: Vec<u32> = vec![];
+                            for rec in records {
+                                vals.push(*(((*agg).dtada_data).offset(rec.dtrd_offset as isize) as *const u32));
+                            }
+                            trace!("name: {}, records: {:?}, vals: {:?}", CStr::from_ptr(desc.dtagd_name).to_str().unwrap(), records, vals);
+                            dtrace::DTRACE_AGGWALK_REMOVE as i32
+                        };
+                        dtrace_aggregate_walk_cb(dtrace_handle, closure);
+                        dtrace::dtrace_aggregate_clear(dtrace_handle);
+                    }
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", codes);
@@ -234,7 +269,6 @@ fn main() {
             // trace!("Waiting for child STOP");
             // trace!("{:?}", waitpid(child, None).unwrap());
 
-            let dtrace_handle;
             unsafe {
                 let mut err: i32 = 0;
                 dtrace_handle = dtrace::dtrace_open(3, 0, &mut err); 
@@ -242,21 +276,37 @@ fn main() {
                     panic!("dtrace_open failed: {}", err);
                 }
 
+                // https://docs.oracle.com/cd/E23824_01/html/E22973/gkzhi.html#scrolltoc
                 let opt = CString::new("bufsize").unwrap();
-                let val = CString::new("1024").unwrap();
+                let val = CString::new("4096").unwrap();
                 if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
                     let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_setopt failed: {}", err);
+                    panic!("dtrace_setopt(bufsize) failed: {}", err);
                 }
 
+                let opt = CString::new("aggsize").unwrap();
+                let val = CString::new("4096").unwrap();
+                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
+                    let err = dtrace::dtrace_errno(dtrace_handle);
+                    panic!("dtrace_setopt(bufsize) failed: {}", err);
+                }
+
+                let opt = CString::new("aggrate").unwrap();
+                let val = CString::new("1ns").unwrap();
+                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
+                    let err = dtrace::dtrace_errno(dtrace_handle);
+                    panic!("dtrace_setopt(bufsize) failed: {}", err);
+                }
+
+                // Needed for raise() to work
                 let opt = CString::new("destructive").unwrap();
                 if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), std::ptr::null()) != 0 {
                     let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_setopt failed: {}", err);
+                    panic!("dtrace_setopt(destructive) failed: {}", err);
                 }
 
                 let program = CString::new(format!(
-                    "syscall:::entry /pid == {}/ {{ raise(SIGSTOP); }}",
+                    "syscall:::entry /pid == {}/ {{ @counts[uregs[16]] = count(); raise(SIGSTOP); }}",
                     child
                 )).unwrap();
                 trace!("DTrace program: {}", program.to_str().unwrap());
@@ -291,7 +341,7 @@ fn main() {
             let mut task_port: mach::mach_types::task_t = 0;
             let mut exception_port: mach::port::mach_port_name_t = 0;
             unsafe {
-                check_return(mach::traps::task_for_pid(
+                mach_check_return(mach::traps::task_for_pid(
                     mach::traps::mach_task_self(),
                     child.into(),
                     &mut task_port,
@@ -299,7 +349,7 @@ fn main() {
                 .unwrap();
                 trace!("task_port: {}", task_port);
 
-                check_return(mach::mach_port::mach_port_allocate(
+                mach_check_return(mach::mach_port::mach_port_allocate(
                     mach::traps::mach_task_self(),
                     mach::port::MACH_PORT_RIGHT_RECEIVE,
                     &mut exception_port,
@@ -307,14 +357,14 @@ fn main() {
                 .unwrap();
                 trace!("exception_port: {}", exception_port);
 
-                check_return(mach::mach_port::mach_port_insert_right(
+                mach_check_return(mach::mach_port::mach_port_insert_right(
                     mach::traps::mach_task_self(),
                     exception_port,
                     exception_port,
                     mach::message::MACH_MSG_TYPE_MAKE_SEND,
                 ))
                 .unwrap();
-                check_return(task_set_exception_ports(
+                mach_check_return(task_set_exception_ports(
                     task_port,
                     mach::exception_types::EXC_MASK_ALL,
                     exception_port,
@@ -327,7 +377,7 @@ fn main() {
                 trace!("set exception port");
 
                 let mut req_port: mach::port::mach_port_t = 0;
-                check_return(mach_port_request_notification(
+                mach_check_return(mach_port_request_notification(
                     mach::traps::mach_task_self(),
                     task_port,
                     mig::MACH_NOTIFY_DEAD_NAME as i32, // steal the def from mig here
@@ -349,7 +399,7 @@ fn main() {
                 let rpl_hdr = &mut rpl as *mut _ as *mut mach::message::mach_msg_header_t;
 
                 unsafe {
-                    check_return(mach::message::mach_msg(
+                    mach_check_return(mach::message::mach_msg(
                         req_hdr,
                         mach::message::MACH_RCV_MSG,
                         0,
@@ -376,7 +426,7 @@ fn main() {
                         );
                     }
 
-                    check_return(mach::message::mach_msg(
+                    mach_check_return(mach::message::mach_msg(
                         rpl_hdr,
                         mach::message::MACH_SEND_MSG,
                         (*rpl_hdr).msgh_size,

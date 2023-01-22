@@ -84,7 +84,7 @@ fn ptrace_thupdate(pid: nix::unistd::Pid, port: mach::port::mach_port_t, signal:
     }
 }
 
-fn target(executable: &str, args: &Vec<String>) {
+fn target(executable: &str, args: &Vec<String>) -> ! {
     let executable = CString::new(executable.as_bytes()).unwrap();
     let mut cargs_owned: Vec<CString> = vec![CString::new(executable.as_bytes()).unwrap()];
     cargs_owned.extend(args.iter().map(|s| CString::new(s.as_bytes()).unwrap()));
@@ -93,9 +93,15 @@ fn target(executable: &str, args: &Vec<String>) {
 
     debug!("Executing target: {:?} {:?}", executable, args);
 
-    if execve(&executable, &args, &env).is_err() {
-        warn!("Failed to execve");
-    }
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).unwrap();
+    panic!("bye");
+
+    // if execve(&executable, &args, &env).is_err() {
+    //     warn!("Failed to execve");
+    // }
+
+    // panic!("Return from execve");
 }
 
 fn r_mach_error_string(r: mach::kern_return::kern_return_t) -> &'static str {
@@ -123,30 +129,32 @@ pub extern fn catch_mach_exception_raise(
     code: *mut u32, //mach::exception_types::exception_data_t,
     code_count: mach::message::mach_msg_type_number_t,
 ) -> mach::kern_return::kern_return_t {
-    let codes = unsafe { std::slice::from_raw_parts(code, code_count as usize) };
+    let codes = unsafe { std::slice::from_raw_parts(code, (code_count + 1) as usize) };
     trace!("mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?} ({:?})", exception_port, thread_port, task_port, exception, code, code_count, codes);
 
     match exception as u32 {
         mach::exception_types::EXC_SOFTWARE => {
             match codes {
-                [mach::exception_types::EXC_SOFT_SIGNAL, signal] => {
+                [mach::exception_types::EXC_SOFT_SIGNAL, _, signum] => {
+                    let signal: Signal;
+                    unsafe {
+                        signal = std::mem::transmute(*signum);
+                    }
                     trace!("EXC_SOFT_SIGNAL: {}", signal);
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", codes);
                 }
             }
-            unsafe {
-                ptrace_thupdate(global_child, thread_port, codes[1] as i32).unwrap();
-            }
-        }
-        mach::exception_types::EXC_SYSCALL => {
-            trace!("EXC_SYSCALL");
+            // unsafe {
+            //     ptrace_thupdate(global_child, thread_port, codes[1] as i32).unwrap();
+            // }
         }
         _ => {
             info!("Unhandled exception type: {}", exception);
         }
     };
+    // Does returning here implicitly continue?
     return mach::kern_return::KERN_SUCCESS;
 }
 
@@ -167,7 +175,19 @@ pub extern fn catch_mach_exception_raise_state(
 }
 
 #[no_mangle]
-pub extern fn catch_mach_exception_raise_state_identity() -> mach::kern_return::kern_return_t {
+pub extern fn catch_mach_exception_raise_state_identity(
+    exception_port: mach::port::mach_port_t,
+    thread_port: mach::port::mach_port_t,
+    task_port: mach::port::mach_port_t,
+    exception: mach::exception_types::exception_type_t,
+    code: mach::exception_types::exception_data_t,
+    code_count: mach::message::mach_msg_type_number_t,
+    flavor: *mut mach::thread_status::thread_state_flavor_t,
+    old_state: mach::thread_status::thread_state_t,
+    old_state_count: mach::message::mach_msg_type_number_t,
+    new_state: mach::thread_status::thread_state_t,
+    new_state_count: *mut mach::message::mach_msg_type_number_t,
+) -> mach::kern_return::kern_return_t {
     error!("Unexpected mach_exception_raise_state_identity");
     return mach::message::MACH_RCV_INVALID_TYPE;
 }
@@ -266,13 +286,13 @@ fn main() {
                     ) {
                         if(*req_hdr).msgh_id == mig::MACH_NOTIFY_DEAD_NAME as i32 {
                             info!("Child died");
+                            // TODO: close down ports
                             return;
                         }
 
                         warn!("mach_exc_server failed: {}", r_mach_error_string((*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode));
                     }
 
-                    *rpl_hdr = *req_hdr;
                     check_return(mach::message::mach_msg(
                         rpl_hdr,
                         mach::message::MACH_SEND_MSG,
@@ -287,7 +307,6 @@ fn main() {
         }
         ForkResult::Child => {
             target(&args.executable, &args.arguments);
-            return;
         }
     }
 }

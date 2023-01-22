@@ -1,14 +1,15 @@
 use clap::Parser;
-use log::{trace, debug, info, warn, error};
+use log::{debug, error, info, trace, warn};
 use nix::libc;
 use nix::sys::ptrace;
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::{execve, fork, getpid, ForkResult, sleep};
+use nix::sys::wait::waitpid;
+use nix::unistd::{execve, fork, getpid, sleep, ForkResult};
 use std::ffi::CStr;
 use std::ffi::CString;
 
 // Couple of defs which aren't in the mach crate
-extern {
+extern "C" {
     pub fn task_set_exception_ports(
         task: mach::mach_types::task_t,
         exception_mask: mach::exception_types::exception_mask_t,
@@ -16,25 +17,29 @@ extern {
         behavior: mach::exception_types::exception_behavior_t,
         new_flavor: mach::thread_status::thread_state_flavor_t,
     ) -> mach::kern_return::kern_return_t;
-    pub fn mach_port_request_notification(task: mach::mach_types::ipc_space_t,
-                                          name: mach::port::mach_port_name_t,
-                                          msgid: mach::message::mach_msg_id_t,
-                                          sync: mach::vm_types::natural_t, // mach::port::mach_port_mscount_t,
-                                          notify: mach::port::mach_port_t,
-                                          notifyPoly: mach::message::mach_msg_type_name_t,
-                                          previous: *mut mach::port::mach_port_t,
+    pub fn mach_port_request_notification(
+        task: mach::mach_types::ipc_space_t,
+        name: mach::port::mach_port_name_t,
+        msgid: mach::message::mach_msg_id_t,
+        sync: mach::vm_types::natural_t, // mach::port::mach_port_mscount_t,
+        notify: mach::port::mach_port_t,
+        notifyPoly: mach::message::mach_msg_type_name_t,
+        previous: *mut mach::port::mach_port_t,
     ) -> mach::kern_return::kern_return_t;
-    pub fn mach_error_string(error_value: mach::kern_return::kern_return_t) -> *const std::os::raw::c_char;
+    pub fn mach_error_string(
+        error_value: mach::kern_return::kern_return_t,
+    ) -> *const std::os::raw::c_char;
 }
 
 #[link(name = "mach_excServer", kind = "static")]
-extern {
+extern "C" {
     fn mach_exc_server(
         request: *mut mach::message::mach_msg_header_t,
         reply: *mut mach::message::mach_msg_header_t,
     ) -> bool;
 }
 
+mod dtrace;
 mod mig;
 
 /// mRR, the macOS Record Replay Debugger
@@ -72,7 +77,11 @@ fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
     }
 }
 
-fn ptrace_thupdate(pid: nix::unistd::Pid, port: mach::port::mach_port_t, signal: i32) -> nix::Result<()> {
+fn ptrace_thupdate(
+    pid: nix::unistd::Pid,
+    port: mach::port::mach_port_t,
+    signal: i32,
+) -> nix::Result<()> {
     unsafe {
         nix::errno::Errno::result(libc::ptrace(
             ptrace::Request::PT_THUPDATE as ptrace::RequestType,
@@ -85,6 +94,8 @@ fn ptrace_thupdate(pid: nix::unistd::Pid, port: mach::port::mach_port_t, signal:
 }
 
 fn target(executable: &str, args: &Vec<String>) -> ! {
+    sleep(1);
+
     let executable = CString::new(executable.as_bytes()).unwrap();
     let mut cargs_owned: Vec<CString> = vec![CString::new(executable.as_bytes()).unwrap()];
     cargs_owned.extend(args.iter().map(|s| CString::new(s.as_bytes()).unwrap()));
@@ -105,9 +116,7 @@ fn target(executable: &str, args: &Vec<String>) -> ! {
 }
 
 fn r_mach_error_string(r: mach::kern_return::kern_return_t) -> &'static str {
-    unsafe {
-        CStr::from_ptr(mach_error_string(r)).to_str().unwrap()
-    }
+    unsafe { CStr::from_ptr(mach_error_string(r)).to_str().unwrap() }
 }
 
 fn check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str> {
@@ -121,7 +130,7 @@ fn check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static str>
 static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
 
 #[no_mangle]
-pub extern fn catch_mach_exception_raise(
+pub extern "C" fn catch_mach_exception_raise(
     exception_port: mach::port::mach_port_t,
     thread_port: mach::port::mach_port_t,
     task_port: mach::port::mach_port_t,
@@ -130,7 +139,16 @@ pub extern fn catch_mach_exception_raise(
     code_count: mach::message::mach_msg_type_number_t,
 ) -> mach::kern_return::kern_return_t {
     let codes = unsafe { std::slice::from_raw_parts(code, (code_count + 1) as usize) };
-    trace!("mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?} ({:?})", exception_port, thread_port, task_port, exception, code, code_count, codes);
+    trace!(
+        "mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?} ({:?})",
+        exception_port,
+        thread_port,
+        task_port,
+        exception,
+        code,
+        code_count,
+        codes
+    );
 
     match exception as u32 {
         mach::exception_types::EXC_SOFTWARE => {
@@ -159,34 +177,34 @@ pub extern fn catch_mach_exception_raise(
 }
 
 #[no_mangle]
-pub extern fn catch_mach_exception_raise_state(
-    exception_port: mach::port::mach_port_t,
-    exception: mach::exception_types::exception_type_t,
-    code: mach::exception_types::exception_data_t,
-    code_count: mach::message::mach_msg_type_number_t,
-    flavor: *mut mach::thread_status::thread_state_flavor_t,
-    old_state: mach::thread_status::thread_state_t,
-    old_state_count: mach::message::mach_msg_type_number_t,
-    new_state: mach::thread_status::thread_state_t,
-    new_state_count: *mut mach::message::mach_msg_type_number_t,
+pub extern "C" fn catch_mach_exception_raise_state(
+    _exception_port: mach::port::mach_port_t,
+    _exception: mach::exception_types::exception_type_t,
+    _code: mach::exception_types::exception_data_t,
+    _code_count: mach::message::mach_msg_type_number_t,
+    _flavor: *mut mach::thread_status::thread_state_flavor_t,
+    _old_state: mach::thread_status::thread_state_t,
+    _old_state_count: mach::message::mach_msg_type_number_t,
+    _new_state: mach::thread_status::thread_state_t,
+    _new_state_count: *mut mach::message::mach_msg_type_number_t,
 ) -> mach::kern_return::kern_return_t {
     error!("Unexpected mach_exception_raise_state");
     return mach::message::MACH_RCV_INVALID_TYPE;
 }
 
 #[no_mangle]
-pub extern fn catch_mach_exception_raise_state_identity(
-    exception_port: mach::port::mach_port_t,
-    thread_port: mach::port::mach_port_t,
-    task_port: mach::port::mach_port_t,
-    exception: mach::exception_types::exception_type_t,
-    code: mach::exception_types::exception_data_t,
-    code_count: mach::message::mach_msg_type_number_t,
-    flavor: *mut mach::thread_status::thread_state_flavor_t,
-    old_state: mach::thread_status::thread_state_t,
-    old_state_count: mach::message::mach_msg_type_number_t,
-    new_state: mach::thread_status::thread_state_t,
-    new_state_count: *mut mach::message::mach_msg_type_number_t,
+pub extern "C" fn catch_mach_exception_raise_state_identity(
+    _exception_port: mach::port::mach_port_t,
+    _thread_port: mach::port::mach_port_t,
+    _task_port: mach::port::mach_port_t,
+    _exception: mach::exception_types::exception_type_t,
+    _code: mach::exception_types::exception_data_t,
+    _code_count: mach::message::mach_msg_type_number_t,
+    _flavor: *mut mach::thread_status::thread_state_flavor_t,
+    _old_state: mach::thread_status::thread_state_t,
+    _old_state_count: mach::message::mach_msg_type_number_t,
+    _new_state: mach::thread_status::thread_state_t,
+    _new_state_count: *mut mach::message::mach_msg_type_number_t,
 ) -> mach::kern_return::kern_return_t {
     error!("Unexpected mach_exception_raise_state_identity");
     return mach::message::MACH_RCV_INVALID_TYPE;
@@ -208,25 +226,85 @@ fn main() {
 
     match f {
         ForkResult::Parent { child, .. } => {
-            unsafe { global_child = child; }
+            unsafe {
+                global_child = child;
+            }
             info!("Child pid {}", child);
 
             // trace!("Waiting for child STOP");
             // trace!("{:?}", waitpid(child, None).unwrap());
+
+            let dtrace_handle;
+            unsafe {
+                let mut err: i32 = 0;
+                dtrace_handle = dtrace::dtrace_open(3, 0, &mut err); 
+                if dtrace_handle.is_null() {
+                    panic!("dtrace_open failed: {}", err);
+                }
+
+                let opt = CString::new("bufsize").unwrap();
+                let val = CString::new("1024").unwrap();
+                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
+                    let err = dtrace::dtrace_errno(dtrace_handle);
+                    panic!("dtrace_setopt failed: {}", err);
+                }
+
+                let opt = CString::new("destructive").unwrap();
+                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), std::ptr::null()) != 0 {
+                    let err = dtrace::dtrace_errno(dtrace_handle);
+                    panic!("dtrace_setopt failed: {}", err);
+                }
+
+                let program = CString::new(format!(
+                    "syscall:::entry /pid == {}/ {{ raise(SIGSTOP); }}",
+                    child
+                )).unwrap();
+                trace!("DTrace program: {}", program.to_str().unwrap());
+
+                let prog = dtrace::dtrace_program_strcompile(
+                    dtrace_handle,
+                    program.as_ptr(),
+                    dtrace::dtrace_probespec_DTRACE_PROBESPEC_NAME,
+                    0,
+                    0,
+                    std::ptr::null(),
+                );
+                if prog.is_null() {
+                    let err = dtrace::dtrace_errno(dtrace_handle);
+                    panic!("dtrace_program_strcompile failed: {}", err);
+                }
+
+                let mut pip: dtrace::dtrace_proginfo_t = std::mem::zeroed();
+                if dtrace::dtrace_program_exec(dtrace_handle, prog, &mut pip) != 0 {
+                    let err = dtrace::dtrace_errno(dtrace_handle);
+                    panic!("dtrace_program_exec failed: {}", err);
+                }
+
+                if dtrace::dtrace_go(dtrace_handle) != 0 {
+                    let err = dtrace::dtrace_errno(dtrace_handle);
+                    panic!("dtrace_go failed: {}", err);
+                }
+            }
 
             // https://www.spaceflint.com/?p=150
             // https://sourcegraph.com/github.com/hhhaiai/decompile/-/blob/bin/radareorg_radare2/libr/debug/p/native/xnu/xnu_excthreads.c?L455:23
             let mut task_port: mach::mach_types::task_t = 0;
             let mut exception_port: mach::port::mach_port_name_t = 0;
             unsafe {
-                check_return(mach::traps::task_for_pid(mach::traps::mach_task_self(), child.into(), &mut task_port)).unwrap();
+                check_return(mach::traps::task_for_pid(
+                    mach::traps::mach_task_self(),
+                    child.into(),
+                    &mut task_port,
+                ))
+                .unwrap();
                 trace!("task_port: {}", task_port);
 
                 check_return(mach::mach_port::mach_port_allocate(
                     mach::traps::mach_task_self(),
                     mach::port::MACH_PORT_RIGHT_RECEIVE,
                     &mut exception_port,
-                )).unwrap();
+                ))
+                .unwrap();
                 trace!("exception_port: {}", exception_port);
 
                 check_return(mach::mach_port::mach_port_insert_right(
@@ -234,7 +312,8 @@ fn main() {
                     exception_port,
                     exception_port,
                     mach::message::MACH_MSG_TYPE_MAKE_SEND,
-                )).unwrap();
+                ))
+                .unwrap();
                 check_return(task_set_exception_ports(
                     task_port,
                     mach::exception_types::EXC_MASK_ALL,
@@ -243,19 +322,21 @@ fn main() {
                         | mach::exception_types::MACH_EXCEPTION_CODES) as i32,
                     //mach::thread_status::THREAD_STATE_NONE,  // causes invalid arg?
                     mach::thread_status::x86_THREAD_STATE64,
-                )).unwrap();
+                ))
+                .unwrap();
                 trace!("set exception port");
 
                 let mut req_port: mach::port::mach_port_t = 0;
                 check_return(mach_port_request_notification(
                     mach::traps::mach_task_self(),
                     task_port,
-                    mig::MACH_NOTIFY_DEAD_NAME as i32,  // steal the def from mig here
+                    mig::MACH_NOTIFY_DEAD_NAME as i32, // steal the def from mig here
                     0,
                     exception_port,
                     mach::message::MACH_MSG_TYPE_MAKE_SEND_ONCE,
                     &mut req_port,
-                )).unwrap();
+                ))
+                .unwrap();
             }
 
             ptrace_attachexc(child).unwrap();
@@ -276,21 +357,23 @@ fn main() {
                         exception_port,
                         mach::message::MACH_MSG_TIMEOUT_NONE,
                         mach::port::MACH_PORT_NULL,
-                    )).unwrap();
+                    ))
+                    .unwrap();
                     trace!("Got message: {:?}", *req_hdr);
 
                     // Will call back into catch_mach_exception_raise
-                    if !mach_exc_server(
-                        req_hdr,
-                        rpl_hdr,
-                    ) {
-                        if(*req_hdr).msgh_id == mig::MACH_NOTIFY_DEAD_NAME as i32 {
+                    if !mach_exc_server(req_hdr, rpl_hdr) {
+                        if (*req_hdr).msgh_id == mig::MACH_NOTIFY_DEAD_NAME as i32 {
                             info!("Child died");
-                            // TODO: close down ports
-                            return;
+                            break;
                         }
 
-                        warn!("mach_exc_server failed: {}", r_mach_error_string((*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode));
+                        warn!(
+                            "mach_exc_server failed: {}",
+                            r_mach_error_string(
+                                (*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode
+                            )
+                        );
                     }
 
                     check_return(mach::message::mach_msg(
@@ -301,8 +384,17 @@ fn main() {
                         mach::port::MACH_PORT_NULL,
                         mach::message::MACH_MSG_TIMEOUT_NONE,
                         mach::port::MACH_PORT_NULL,
-                    )).unwrap();
+                    ))
+                    .unwrap();
                 }
+            }
+
+            trace!("Cleaning up");
+
+            // TODO: close down ports
+            unsafe {
+                dtrace::dtrace_stop(dtrace_handle);
+                dtrace::dtrace_close(dtrace_handle);
             }
         }
         ForkResult::Child => {

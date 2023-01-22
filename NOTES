@@ -1,3 +1,5 @@
+# Exploratory Notes
+
 * Original idea is macos' ptrace_attachext "extension", in which we receive ptrace notifications over a mach port instead of signaling
     * XNU doesn't seem to support syscall interception (with `EXC_SYSCALL`): https://github.com/checkra1n/BugTracker/issues/1137
         * `EXC_SYSCALL` is only referenced when the syscall number is bad: https://github.com/search?q=repo%3Aapple-oss-distributions%2Fxnu%20EXC_SYSCALL&type=code
@@ -22,7 +24,15 @@
     * Dtrace is "async" though, which makes dynamic struct walking and whatnot very hard
         * https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/systrace.c#L190
     * Idea: is it possible to signal within a dtrace program/handler?
-        * Yes! Pass `-w` to enable destructive actions, then `stop();` or `raise(SIGTRAP);`
+        * Yes! Pass `-w` to enable destructive actions, then `stop();` or `raise(SIGSTOP);`
         * Does this work both on entry and exit?
             * Yes, but the syscall is still evaluated before the signal is delivered
                 * https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/dtrace.c#L6701
+
+
+# Current Design
+* ptrace with `PT_ATTACHEXC`
+* child starts, another thread running dtrace is spun up which causes all syscalls (both unix and mach) to `raise(SIGSTOP)`
+* sigstop causes ptrace event
+* child memory is probed and stored
+* PC of syscall is recorded so we know to set breakpoint there in replay

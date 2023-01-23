@@ -146,6 +146,63 @@ fn mach_check_return(r: mach::kern_return::kern_return_t) -> Result<(), &'static
 static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
 static mut dtrace_handle: *mut dtrace::dtrace_hdl = std::ptr::null_mut();
 
+fn record_syscall(
+    number: i32,
+    task_port: mach::port::mach_port_t,
+    thread_port: mach::port::mach_port_t,
+) {
+    let regs = unsafe {
+        let mut threads: mach::mach_types::thread_act_array_t = std::ptr::null_mut();
+        let mut nthreads = 0;
+        mach_check_return(mach::task::task_threads(task_port, &mut threads, &mut nthreads)).unwrap();
+
+        trace!("threads {:x?}, count {}", *threads, nthreads);
+
+        let mut count = 64;
+        let mut regs: [u64; 64] = [0; 64];
+        let r = mach::thread_act::thread_get_state(
+            *threads, // thread_port,
+            6,
+            &mut regs as *mut _ as mach::thread_status::thread_state_t,
+            &mut count,
+        );
+        if r != mach::kern_return::KERN_SUCCESS {
+            warn!("thread_get_state failed: {}", r_mach_error_string(r));
+            return;
+        }
+        regs
+    };
+
+    trace!("regs {:x?}", regs);
+
+    // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/kern/syscalls.master#L45
+    match number {
+        3 => {
+            // read. store the data that was read
+            let mut data: Vec<u8> = vec![0; regs[2] as usize];
+            let mut copy_size: mach::vm_types::mach_vm_size_t = 0;
+            
+            let r = unsafe {
+                mach::vm::mach_vm_read_overwrite(
+                    thread_port,
+                    regs[1],
+                    regs[2],
+                    &mut data as *mut _ as mach::vm_types::mach_vm_address_t,
+                    &mut copy_size,
+                )
+            };
+            if r != mach::kern_return::KERN_SUCCESS {
+                warn!("vm_read_overwrite failed: {}", r_mach_error_string(r));
+            }
+
+            trace!("read({}, _, {}) = {:x?}", regs[0], regs[2], data);
+        }
+        _ => {
+            warn!("Unhandled syscall {}", number);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn catch_mach_exception_raise(
     exception_port: mach::port::mach_port_t,
@@ -177,6 +234,8 @@ pub extern "C" fn catch_mach_exception_raise(
                     }
                     trace!("EXC_SOFT_SIGNAL: {}", signal);
 
+                    let mut syscall_number: i32 = 0;
+
                     unsafe {
                         if dtrace::dtrace_aggregate_snap(dtrace_handle) == -1 {
                             warn!("dtrace_aggregate_snap failed: {}", CStr::from_ptr(dtrace::dtrace_errmsg(dtrace_handle, dtrace::dtrace_errno(dtrace_handle))).to_str().unwrap());
@@ -184,16 +243,23 @@ pub extern "C" fn catch_mach_exception_raise(
                         let closure = |agg: *const dtrace::dtrace_aggdata_t| {
                             let desc = *((*agg).dtada_desc);
                             let records: &[dtrace::dtrace_recdesc] = std::slice::from_raw_parts(&(*(*agg).dtada_desc).dtagd_rec as *const dtrace::dtrace_recdesc_t, (desc.dtagd_nrecs) as usize);
-                            let mut vals: Vec<u32> = vec![];
+                            let mut vals: Vec<i32> = vec![];
                             for rec in records {
-                                vals.push(*(((*agg).dtada_data).offset(rec.dtrd_offset as isize) as *const u32));
+                                vals.push(*(((*agg).dtada_data).offset(rec.dtrd_offset as isize) as *const i32));
                             }
-                            trace!("name: {}, records: {:?}, vals: {:?}", CStr::from_ptr(desc.dtagd_name).to_str().unwrap(), records, vals);
-                            dtrace::DTRACE_AGGWALK_REMOVE as i32
+                            trace!("dtrace agg vals: {:?}", vals);
+                            if vals[2] != 0 {
+                                syscall_number = vals[1];
+                            }
+                            //dtrace::DTRACE_AGGWALK_REMOVE as i32
+                            dtrace::DTRACE_AGGWALK_NEXT as i32
                         };
                         dtrace_aggregate_walk_cb(dtrace_handle, closure);
                         dtrace::dtrace_aggregate_clear(dtrace_handle);
                     }
+
+                    trace!("syscall number {}", syscall_number);
+                    record_syscall(syscall_number, task_port, thread_port);
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", codes);
@@ -276,7 +342,7 @@ fn main() {
                     panic!("dtrace_open failed: {}", err);
                 }
 
-                // https://docs.oracle.com/cd/E23824_01/html/E22973/gkzhi.html#scrolltoc
+                // Option reference: https://docs.oracle.com/cd/E23824_01/html/E22973/gkzhi.html#scrolltoc
                 let opt = CString::new("bufsize").unwrap();
                 let val = CString::new("4096").unwrap();
                 if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
@@ -291,6 +357,9 @@ fn main() {
                     panic!("dtrace_setopt(bufsize) failed: {}", err);
                 }
 
+                // Set an aggregate interval of 1ns, so that snapshot and aggregate walking
+                // always fetch new data.
+                // https://github.com/apple-oss-distributions/dtrace/blob/05b1f5b12ead47eb14e4712e24a1b1a981498020/lib/libdtrace/common/dt_aggregate.c#L733
                 let opt = CString::new("aggrate").unwrap();
                 let val = CString::new("1ns").unwrap();
                 if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
@@ -305,8 +374,11 @@ fn main() {
                     panic!("dtrace_setopt(destructive) failed: {}", err);
                 }
 
+                // x16 is the syscall number
+                // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/systrace.c#L156
                 let program = CString::new(format!(
                     "syscall:::entry /pid == {}/ {{ @counts[uregs[16]] = count(); raise(SIGSTOP); }}",
+                    //"syscall:::entry /pid == {}/ {{ @counts[probefunc] = count(); raise(SIGSTOP); }}",
                     child
                 )).unwrap();
                 trace!("DTrace program: {}", program.to_str().unwrap());
@@ -371,7 +443,9 @@ fn main() {
                     (mach::exception_types::EXCEPTION_DEFAULT
                         | mach::exception_types::MACH_EXCEPTION_CODES) as i32,
                     //mach::thread_status::THREAD_STATE_NONE,  // causes invalid arg?
-                    mach::thread_status::x86_THREAD_STATE64,
+                    //mach::thread_status::x86_THREAD_STATE64,
+                    //1,
+                    5,  //https://github.com/apple/darwin-xnu/blob/main/osfmk/mach/arm/thread_status.h#L55
                 ))
                 .unwrap();
                 trace!("set exception port");

@@ -32,7 +32,11 @@
 
 # Current Design
 * ptrace with `PT_ATTACHEXC`
-* child starts, another thread running dtrace is spun up which causes all syscalls (both unix and mach) to `raise(SIGSTOP)`
+* child starts, another thread running dtrace is spun up which causes all syscalls (both unix and mach) to store the syscall number to an aggregation and `raise(SIGSTOP)`
+    * libdtrace doesn't expose an easy way to iterate over received principal buffers
+        * `dtrace_consume` streams formatted output to a `FILE*`
+            * https://github.com/apple-oss-distributions/dtrace/blob/05b1f5b12ead47eb14e4712e24a1b1a981498020/lib/libdtrace/common/dt_consume.c#L2667
+    * Not ideal, but aggregations work to get a few values out in a simpler way, since those can be snapshot and retrieved in binary form
 * sigstop causes ptrace event
 * child memory is probed and stored
 * PC of syscall is recorded so we know to set breakpoint there in replay

@@ -8,8 +8,6 @@ use nix::unistd::{execve, fork, getpid, sleep, ForkResult};
 use std::ffi::CStr;
 use std::ffi::CString;
 
-embed_plist::embed_info_plist!("Info.plist");
-
 // Couple of defs which aren't in the mach crate
 extern "C" {
     pub fn task_set_exception_ports(

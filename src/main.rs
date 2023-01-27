@@ -8,6 +8,8 @@ use nix::unistd::{execve, fork, getpid, sleep, ForkResult};
 use std::ffi::CStr;
 use std::ffi::CString;
 
+embed_plist::embed_info_plist!("Info.plist");
+
 // Couple of defs which aren't in the mach crate
 extern "C" {
     pub fn task_set_exception_ports(
@@ -147,22 +149,16 @@ static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
 static mut dtrace_handle: *mut dtrace::dtrace_hdl = std::ptr::null_mut();
 
 fn record_syscall(
-    number: i32,
     task_port: mach::port::mach_port_t,
     thread_port: mach::port::mach_port_t,
+    clobbered_regs: [u64; 2],
 ) {
-    let regs = unsafe {
-        let mut threads: mach::mach_types::thread_act_array_t = std::ptr::null_mut();
-        let mut nthreads = 0;
-        mach_check_return(mach::task::task_threads(task_port, &mut threads, &mut nthreads)).unwrap();
-
-        trace!("threads {:x?}, count {}", *threads, nthreads);
-
-        let mut count = 64;
-        let mut regs: [u64; 64] = [0; 64];
+    let mut regs = unsafe {
+        let mut count = 68;  // ARM_THREAD_STATE64_COUNT
+        let mut regs: [u64; 68] = [0; 68];
         let r = mach::thread_act::thread_get_state(
-            *threads, // thread_port,
-            6,
+            thread_port,
+            6,  // ARM_THREAD_STATE64
             &mut regs as *mut _ as mach::thread_status::thread_state_t,
             &mut count,
         );
@@ -173,21 +169,28 @@ fn record_syscall(
         regs
     };
 
+    let ret_vals = regs[0..2].to_vec();
+
+    regs[0] = clobbered_regs[0];
+    regs[1] = clobbered_regs[1];
+
     trace!("regs {:x?}", regs);
 
+    let syscall_number = regs[16];
+
     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/kern/syscalls.master#L45
-    match number {
+    match syscall_number {
         3 => {
             // read. store the data that was read
             let mut data: Vec<u8> = vec![0; regs[2] as usize];
-            let mut copy_size: mach::vm_types::mach_vm_size_t = 0;
+            let mut copy_size: mach::vm_types::mach_vm_size_t = regs[2];
             
             let r = unsafe {
                 mach::vm::mach_vm_read_overwrite(
-                    thread_port,
+                    task_port,
                     regs[1],
                     regs[2],
-                    &mut data as *mut _ as mach::vm_types::mach_vm_address_t,
+                    data.as_mut_ptr() as mach::vm_types::mach_vm_address_t,
                     &mut copy_size,
                 )
             };
@@ -195,10 +198,10 @@ fn record_syscall(
                 warn!("vm_read_overwrite failed: {}", r_mach_error_string(r));
             }
 
-            trace!("read({}, _, {}) = {:x?}", regs[0], regs[2], data);
+            trace!("read({}, _, {}) = {:x?}", regs[0], regs[2], &data[..ret_vals[0] as usize]);
         }
         _ => {
-            warn!("Unhandled syscall {}", number);
+            warn!("Unhandled syscall {}", syscall_number);
         }
     }
 }
@@ -213,16 +216,16 @@ pub extern "C" fn catch_mach_exception_raise(
     code_count: mach::message::mach_msg_type_number_t,
 ) -> mach::kern_return::kern_return_t {
     let codes = unsafe { std::slice::from_raw_parts(code, (code_count + 1) as usize) };
-    trace!(
-        "mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?} ({:?})",
-        exception_port,
-        thread_port,
-        task_port,
-        exception,
-        code,
-        code_count,
-        codes
-    );
+    // trace!(
+    //     "mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?} ({:?})",
+    //     exception_port,
+    //     thread_port,
+    //     task_port,
+    //     exception,
+    //     code,
+    //     code_count,
+    //     codes
+    // );
 
     match exception as u32 {
         mach::exception_types::EXC_SOFTWARE => {
@@ -234,7 +237,7 @@ pub extern "C" fn catch_mach_exception_raise(
                     }
                     trace!("EXC_SOFT_SIGNAL: {}", signal);
 
-                    let mut syscall_number: i32 = 0;
+                    let mut regs: [u64; 2] = [0; 2];
 
                     unsafe {
                         if dtrace::dtrace_aggregate_snap(dtrace_handle) == -1 {
@@ -243,23 +246,33 @@ pub extern "C" fn catch_mach_exception_raise(
                         let closure = |agg: *const dtrace::dtrace_aggdata_t| {
                             let desc = *((*agg).dtada_desc);
                             let records: &[dtrace::dtrace_recdesc] = std::slice::from_raw_parts(&(*(*agg).dtada_desc).dtagd_rec as *const dtrace::dtrace_recdesc_t, (desc.dtagd_nrecs) as usize);
-                            let mut vals: Vec<i32> = vec![];
+                            let mut vals: Vec<u64> = vec![];
                             for rec in records {
-                                vals.push(*(((*agg).dtada_data).offset(rec.dtrd_offset as isize) as *const i32));
+                                let ptr = ((*agg).dtada_data).offset(rec.dtrd_offset as isize);
+                                match rec.dtrd_size {
+                                    1 => vals.push(*(ptr as *const u8) as u64),
+                                    2 => vals.push(*(ptr as *const u16) as u64),
+                                    4 => vals.push(*(ptr as *const u32) as u64),
+                                    8 => vals.push(*(ptr as *const u64)),
+                                    _ => error!("dtrace agg: unhandled size: {}", rec.dtrd_size),
+                                }
                             }
-                            trace!("dtrace agg vals: {:?}", vals);
+                            let aggname = CStr::from_ptr(desc.dtagd_name).to_str().unwrap();
+                            //trace!("dtrace agg {} vals: {:?}", aggname, vals);
                             if vals[2] != 0 {
-                                syscall_number = vals[1];
+                                match aggname {
+                                    "r0" => regs[0] = vals[1],
+                                    "r1" => regs[1] = vals[1],
+                                    _ => error!("dtrace agg: unhandled name: {}", aggname),
+                                }
                             }
-                            //dtrace::DTRACE_AGGWALK_REMOVE as i32
                             dtrace::DTRACE_AGGWALK_NEXT as i32
                         };
                         dtrace_aggregate_walk_cb(dtrace_handle, closure);
                         dtrace::dtrace_aggregate_clear(dtrace_handle);
                     }
 
-                    trace!("syscall number {}", syscall_number);
-                    record_syscall(syscall_number, task_port, thread_port);
+                    record_syscall(task_port, thread_port, regs);
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", codes);
@@ -377,8 +390,7 @@ fn main() {
                 // x16 is the syscall number
                 // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/systrace.c#L156
                 let program = CString::new(format!(
-                    "syscall:::entry /pid == {}/ {{ @counts[uregs[16]] = count(); raise(SIGSTOP); }}",
-                    //"syscall:::entry /pid == {}/ {{ @counts[probefunc] = count(); raise(SIGSTOP); }}",
+                    "syscall:::entry /pid == {}/ {{ @r0[uregs[0]] = count(); @r1[uregs[1]] = count();raise(SIGSTOP); }}",
                     child
                 )).unwrap();
                 trace!("DTrace program: {}", program.to_str().unwrap());

@@ -4,10 +4,10 @@ use nix::libc;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use serde::{Serialize, Deserialize};
-use std::boxed::Box;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
+use std::io::Write;
 
 const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
 
@@ -77,7 +77,7 @@ extern "C" fn dtrace_agg_walk_handler(agg: *const dtrace::dtrace_aggdata_t, arg:
     closure(agg) as libc::c_int
 }
 
-pub fn dtrace_aggregate_walk_cb<F>(handle: *mut dtrace::dtrace_hdl, mut callback: F) -> libc::c_int
+fn dtrace_aggregate_walk_cb<F>(handle: *mut dtrace::dtrace_hdl, mut callback: F) -> libc::c_int
     where F: FnMut(*const dtrace::dtrace_aggdata_t) -> libc::c_int
 {
     let mut cb: &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> libc::c_int = &mut callback;
@@ -87,27 +87,23 @@ pub fn dtrace_aggregate_walk_cb<F>(handle: *mut dtrace::dtrace_hdl, mut callback
     }
 }
 
-static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
-static mut dtrace_handle: *mut dtrace::dtrace_hdl = std::ptr::null_mut();
-static mut output: Option<Box<dyn std::io::Write>> = None;
-
 #[no_mangle]
-pub extern "C" fn catch_mach_exception_raise(
-    exception_port: mach::mach_port_t,
+fn catch_mach_exception_raise(
+    dtrace_handle: *mut dtrace::dtrace_hdl,
+    output: &mut dyn std::io::Write,
+    _exception_port: mach::mach_port_t,
     thread_port: mach::mach_port_t,
     task_port: mach::mach_port_t,
     exception: mach::exception_type_t,
     code: [i64; 2], // mach::exception_data_t,
-    code_count: mach::mach_msg_type_number_t,
 ) -> mach::kern_return_t {
     // trace!(
-    //     "mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?}",
+    //     "mach_exception_raise: {:?} {:?} {:?} {:?} {:?}",
     //     exception_port,
     //     thread_port,
     //     task_port,
     //     exception,
     //     code
-    //     code_count,
     // );
 
     const EXC_SOFT_SIGNAL64: i64 = mach::EXC_SOFT_SIGNAL as i64;
@@ -156,10 +152,8 @@ pub extern "C" fn catch_mach_exception_raise(
 
                     if let Some(sc) = syscall::record_syscall(task_port, thread_port, regs) {
                         trace!("syscall: {:?}", sc);
-                        unsafe {
-                            serde_json::to_writer(output.as_mut().unwrap(), &sc).unwrap();
-                            output.as_mut().unwrap().write_all(b"\n").unwrap();
-                        }
+                        serde_json::to_writer(&mut *output, &sc).unwrap();
+                        output.write_all(b"\n").unwrap();
                     };
 
 
@@ -168,15 +162,12 @@ pub extern "C" fn catch_mach_exception_raise(
                     info!("Unhandled EXC_SOFTWARE code: {:?}", code);
                 }
             }
-            // unsafe {
-            //     ptrace_thupdate(global_child, thread_port, codes[1] as i32).unwrap();
-            // }
         }
         _ => {
             info!("Unhandled exception type: {}", exception);
         }
     };
-    // Does returning here implicitly continue?
+    // I guess returning here implicitly continues?
     return mach::KERN_SUCCESS;
 }
 
@@ -194,16 +185,14 @@ fn main() {
         .filter_level(args.verbose.log_level_filter())
         .init();
     
-    unsafe {
-        output = Some(Box::new(File::create(args.output_filename).unwrap()));
+    let mut output = File::create(args.output_filename).unwrap();
 
-        serde_json::to_writer(output.as_mut().unwrap(), &Target{
-            executable: args.executable.clone(),
-            args: args.arguments.clone(),
-            environment: vec![],
-        }).unwrap();
-        output.as_mut().unwrap().write_all(b"\n").unwrap();
-    }
+    serde_json::to_writer(&mut output, &Target{
+        executable: args.executable.clone(),
+        args: args.arguments.clone(),
+        environment: vec![],
+    }).unwrap();
+    output.write_all(b"\n").unwrap();
 
     let child = unsafe {
         let mut pid: libc::pid_t = 0;
@@ -244,14 +233,11 @@ fn main() {
         nix::unistd::Pid::from_raw(pid)
     };
 
-    unsafe {
-        global_child = child;
-    }
     info!("Child pid {}", child);
 
-    unsafe {
+    let dtrace_handle = unsafe {
         let mut err: i32 = 0;
-        dtrace_handle = dtrace::dtrace_open(3, 0, &mut err); 
+        let dtrace_handle = dtrace::dtrace_open(3, 0, &mut err); 
         if dtrace_handle.is_null() {
             panic!("dtrace_open failed: {}", err);
         }
@@ -318,7 +304,9 @@ fn main() {
             let err = dtrace::dtrace_errno(dtrace_handle);
             panic!("dtrace_go failed: {}", err);
         }
-    }
+
+        dtrace_handle
+    };
 
     // https://www.spaceflint.com/?p=150
     // https://sourcegraph.com/github.com/hhhaiai/decompile/-/blob/bin/radareorg_radare2/libr/debug/p/native/xnu/xnu_excthreads.c?L455:23
@@ -409,12 +397,13 @@ fn main() {
                     let exception_request = *(request_header as *const _ as *const mig::__Request__mach_exception_raise_t);
                     let mut exception_reply = &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
                     (*exception_reply).RetCode = catch_mach_exception_raise(
+                        dtrace_handle,
+                        &mut output,
                         exception_request.Head.msgh_local_port,
                         exception_request.thread.name,
                         exception_request.task.name,
                         exception_request.exception,
                         exception_request.code,
-                        exception_request.codeCnt,
                     );
                     (*exception_reply).NDR = mig::NDR_record;
                 }

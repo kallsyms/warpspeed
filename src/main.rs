@@ -2,11 +2,9 @@ use clap::Parser;
 use log::{debug, error, info, trace, warn};
 use nix::libc;
 use nix::sys::ptrace;
-use nix::sys::signal::{kill, Signal};
-use nix::sys::wait::waitpid;
-use nix::unistd::{execve, fork, getpid, sleep, ForkResult};
+use nix::sys::signal::Signal;
+use serde::{Serialize, Deserialize};
 use std::boxed::Box;
-use std::default;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
@@ -97,28 +95,6 @@ pub fn dtrace_aggregate_walk_cb<F>(handle: *mut dtrace::dtrace_hdl, mut callback
     }
 }
 
-fn target(executable: &str, args: &Vec<String>) -> ! {
-    sleep(1);
-
-    let executable = CString::new(executable.as_bytes()).unwrap();
-    let mut cargs_owned: Vec<CString> = vec![CString::new(executable.as_bytes()).unwrap()];
-    cargs_owned.extend(args.iter().map(|s| CString::new(s.as_bytes()).unwrap()));
-    let args: Vec<&CStr> = cargs_owned.iter().map(|s| s.as_c_str()).collect();
-    let env: Vec<&CStr> = vec![]; // TODO
-
-    debug!("Executing target: {:?} {:?}", executable, args);
-
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s).unwrap();
-    panic!("bye");
-
-    // if execve(&executable, &args, &env).is_err() {
-    //     warn!("Failed to execve");
-    // }
-
-    // panic!("Return from execve");
-}
-
 static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
 static mut dtrace_handle: *mut dtrace::dtrace_hdl = std::ptr::null_mut();
 static mut output: Option<Box<dyn std::io::Write>> = None;
@@ -148,10 +124,7 @@ pub extern "C" fn catch_mach_exception_raise(
         mach::EXC_SOFTWARE => {
             match codes {
                 [mach::EXC_SOFT_SIGNAL, _, signum] => {
-                    let signal: Signal;
-                    unsafe {
-                        signal = std::mem::transmute(*signum);
-                    }
+                    let signal: Signal = unsafe { std::mem::transmute(*signum) };
                     trace!("EXC_SOFT_SIGNAL: {}", signal);
 
                     let mut regs: [u64; 2] = [0; 2];
@@ -192,7 +165,8 @@ pub extern "C" fn catch_mach_exception_raise(
                     if let Some(sc) = syscall::record_syscall(task_port, thread_port, regs) {
                         trace!("syscall: {:?}", sc);
                         unsafe {
-                            serde_json::to_writer_pretty(output.as_mut().unwrap(), &sc).unwrap();
+                            serde_json::to_writer(output.as_mut().unwrap(), &sc).unwrap();
+                            output.as_mut().unwrap().write_all(b"\n").unwrap();
                         }
                     };
 
@@ -248,6 +222,13 @@ pub extern "C" fn catch_mach_exception_raise_state_identity(
     return mach::MACH_RCV_INVALID_TYPE;
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct Target {
+    executable: String,
+    args: Vec<String>,
+    environment: Vec<String>,
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -257,6 +238,13 @@ fn main() {
     
     unsafe {
         output = Some(Box::new(File::create(args.output_filename).unwrap()));
+
+        serde_json::to_writer(output.as_mut().unwrap(), &Target{
+            executable: args.executable.clone(),
+            args: args.arguments.clone(),
+            environment: vec![],
+        }).unwrap();
+        output.as_mut().unwrap().write_all(b"\n").unwrap();
     }
 
     let child = unsafe {
@@ -265,8 +253,7 @@ fn main() {
         let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
         let res = libc::posix_spawnattr_init(&mut attr);
         if res != 0 {
-            error!("posix_spawnattr_init failed: {}", std::io::Error::last_os_error());
-            return;
+            panic!("posix_spawnattr_init failed: {}", std::io::Error::last_os_error());
         }
 
         let res = libc::posix_spawnattr_setflags(
@@ -274,8 +261,7 @@ fn main() {
             (libc::POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR) as i16,
         );
         if res != 0 {
-            error!("posix_spawnattr_setflags failed: {}", std::io::Error::last_os_error());
-            return;
+            panic!("posix_spawnattr_setflags failed: {}", std::io::Error::last_os_error());
         }
 
         let executable = CString::new(args.executable).unwrap();
@@ -294,8 +280,7 @@ fn main() {
             env.as_ptr(),  // TODO
         );
         if res != 0 {
-            error!("posix_spawn failed: {}", std::io::Error::last_os_error());
-            return;
+            panic!("posix_spawn failed: {}", std::io::Error::last_os_error());
         }
         
         nix::unistd::Pid::from_raw(pid)
@@ -345,8 +330,7 @@ fn main() {
             panic!("dtrace_setopt(destructive) failed: {}", err);
         }
 
-        // x16 is the syscall number
-        // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/systrace.c#L156
+        // arm64 syscalls can return 2 results in x0 and x1
         let program = CString::new(format!(
             "syscall:::entry /pid == {}/ {{ @r0[uregs[0]] = count(); @r1[uregs[1]] = count(); raise(SIGSTOP); }}",
             child
@@ -453,6 +437,7 @@ fn main() {
             //trace!("Got message: {:?}", *req_hdr);
 
             // Will call back into catch_mach_exception_raise
+            // TODO: dispatch this ourselves, so that we don't have to have globals.
             if !mach_exc_server(req_hdr, rpl_hdr) {
                 if (*req_hdr).msgh_id == mach::MACH_NOTIFY_DEAD_NAME {
                     info!("Child died");

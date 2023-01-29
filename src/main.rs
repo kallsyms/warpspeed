@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand, Args};
 use log::{debug, error, info, trace, warn};
 use nix::libc;
 use nix::sys::ptrace;
@@ -18,14 +18,31 @@ mod mig;
 mod syscall;
 
 /// mRR, the macOS Record Replay Debugger
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, trailing_var_arg=true)]
-struct Args {
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
     #[clap(flatten)]
     verbose: clap_verbosity_flag::Verbosity,
 
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Record a trace
+    Record(RecordArgs),
+
+    /// Replay a trace
+    Replay(ReplayArgs),
+}
+
+#[derive(Args)]
+#[command(trailing_var_arg=true)]
+struct RecordArgs {
+    /// Output filename of the trace
     #[clap(required = true)]
-    output_filename: String,
+    trace_filename: String,
 
     /// Target executable
     #[clap(required = true)]
@@ -36,11 +53,24 @@ struct Args {
     arguments: Vec<String>,
 }
 
+#[derive(Args)]
+struct ReplayArgs {
+    /// Input filename of the trace
+    #[clap(required = true)]
+    trace_filename: String,
+}
+
 #[test]
 fn test_args() {
-    let args = Args::parse_from(vec!["mrr", "executable", "--", "-a", "1"]);
-    assert_eq!(args.executable, "executable");
-    assert_eq!(args.arguments, vec!["-a", "1"]);
+    let args = Cli::parse_from(vec!["mrr", "record", "out.log", "executable", "--", "-a", "1"]);
+    match args.command {
+        Command::Record(args) => {
+            assert_eq!(args.trace_filename, "out.log");
+            assert_eq!(args.executable, "executable");
+            assert_eq!(args.arguments, vec!["-a", "1"]);
+        }
+        _ => panic!("unexpected command"),
+    }
 }
 
 fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
@@ -178,14 +208,8 @@ struct Target {
     environment: Vec<String>,
 }
 
-fn main() {
-    let args = Args::parse();
-
-    env_logger::Builder::new()
-        .filter_level(args.verbose.log_level_filter())
-        .init();
-    
-    let mut output = File::create(args.output_filename).unwrap();
+fn record(args: &RecordArgs) {
+    let mut output = File::create(&args.trace_filename).unwrap();
 
     serde_json::to_writer(&mut output, &Target{
         executable: args.executable.clone(),
@@ -211,7 +235,7 @@ fn main() {
             panic!("posix_spawnattr_setflags failed: {}", std::io::Error::last_os_error());
         }
 
-        let executable = CString::new(args.executable).unwrap();
+        let executable = CString::new(args.executable.clone()).unwrap();
         let mut cargs_owned: Vec<CString> = vec![executable.clone()];
         cargs_owned.extend(args.arguments.iter().map(|a| CString::new(a.as_bytes()).unwrap()));
         let mut argv: Vec<*mut i8> = cargs_owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
@@ -432,5 +456,22 @@ fn main() {
     unsafe {
         dtrace::dtrace_stop(dtrace_handle);
         dtrace::dtrace_close(dtrace_handle);
+    }
+}
+
+fn main() {
+    let args = Cli::parse();
+
+    env_logger::Builder::new()
+        .filter_level(args.verbose.log_level_filter())
+        .init();
+    
+    match args.command {
+        Command::Record(args) => {
+            record(&args);
+        }
+        Command::Replay(args) => {
+            todo!();
+        }
     }
 }

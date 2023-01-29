@@ -6,6 +6,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::waitpid;
 use nix::unistd::{execve, fork, getpid, sleep, ForkResult};
 use std::boxed::Box;
+use std::default;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
@@ -17,6 +18,8 @@ extern "C" {
         reply: *mut mach::mach_msg_header_t,
     ) -> bool;
 }
+
+const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
 
 mod dtrace;
 mod mach;
@@ -256,207 +259,232 @@ fn main() {
         output = Some(Box::new(File::create(args.output_filename).unwrap()));
     }
 
-    let f;
+    let child = unsafe {
+        let mut pid: libc::pid_t = 0;
+
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        let res = libc::posix_spawnattr_init(&mut attr);
+        if res != 0 {
+            error!("posix_spawnattr_init failed: {}", std::io::Error::last_os_error());
+            return;
+        }
+
+        let res = libc::posix_spawnattr_setflags(
+            &mut attr,
+            (libc::POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR) as i16,
+        );
+        if res != 0 {
+            error!("posix_spawnattr_setflags failed: {}", std::io::Error::last_os_error());
+            return;
+        }
+
+        let executable = CString::new(args.executable).unwrap();
+        let mut cargs_owned: Vec<CString> = vec![executable.clone()];
+        cargs_owned.extend(args.arguments.iter().map(|a| CString::new(a.as_bytes()).unwrap()));
+        let mut argv: Vec<*mut i8> = cargs_owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
+        argv.push(std::ptr::null_mut());
+        let env: Vec<*mut i8> = vec![std::ptr::null_mut()]; // TODO
+
+        let res = libc::posix_spawn(
+            &mut pid,
+            executable.as_ptr(),
+            std::ptr::null(),
+            &attr,
+            argv.as_ptr(),
+            env.as_ptr(),  // TODO
+        );
+        if res != 0 {
+            error!("posix_spawn failed: {}", std::io::Error::last_os_error());
+            return;
+        }
+        
+        nix::unistd::Pid::from_raw(pid)
+    };
+
     unsafe {
-        // TODO: use posix_spawn instead
-        // https://github.com/headcrab-rs/headcrab/blob/master/src/target/macos.rs#L150
-        f = fork().unwrap();
+        global_child = child;
+    }
+    info!("Child pid {}", child);
+
+    unsafe {
+        let mut err: i32 = 0;
+        dtrace_handle = dtrace::dtrace_open(3, 0, &mut err); 
+        if dtrace_handle.is_null() {
+            panic!("dtrace_open failed: {}", err);
+        }
+
+        // Option reference: https://docs.oracle.com/cd/E23824_01/html/E22973/gkzhi.html#scrolltoc
+        let opt = CString::new("bufsize").unwrap();
+        let val = CString::new("4096").unwrap();
+        if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
+            let err = dtrace::dtrace_errno(dtrace_handle);
+            panic!("dtrace_setopt(bufsize) failed: {}", err);
+        }
+
+        let opt = CString::new("aggsize").unwrap();
+        let val = CString::new("4096").unwrap();
+        if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
+            let err = dtrace::dtrace_errno(dtrace_handle);
+            panic!("dtrace_setopt(bufsize) failed: {}", err);
+        }
+
+        // Set an aggregate interval of 1ns, so that snapshot and aggregate walking
+        // always fetch new data.
+        // https://github.com/apple-oss-distributions/dtrace/blob/05b1f5b12ead47eb14e4712e24a1b1a981498020/lib/libdtrace/common/dt_aggregate.c#L733
+        let opt = CString::new("aggrate").unwrap();
+        let val = CString::new("1ns").unwrap();
+        if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
+            let err = dtrace::dtrace_errno(dtrace_handle);
+            panic!("dtrace_setopt(bufsize) failed: {}", err);
+        }
+
+        // Needed for raise() to work
+        let opt = CString::new("destructive").unwrap();
+        if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), std::ptr::null()) != 0 {
+            let err = dtrace::dtrace_errno(dtrace_handle);
+            panic!("dtrace_setopt(destructive) failed: {}", err);
+        }
+
+        // x16 is the syscall number
+        // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/systrace.c#L156
+        let program = CString::new(format!(
+            "syscall:::entry /pid == {}/ {{ @r0[uregs[0]] = count(); @r1[uregs[1]] = count(); raise(SIGSTOP); }}",
+            child
+        )).unwrap();
+        trace!("DTrace program: {}", program.to_str().unwrap());
+
+        let prog = dtrace::dtrace_program_strcompile(
+            dtrace_handle,
+            program.as_ptr(),
+            dtrace::dtrace_probespec_DTRACE_PROBESPEC_NAME,
+            0,
+            0,
+            std::ptr::null(),
+        );
+        if prog.is_null() {
+            let err = dtrace::dtrace_errno(dtrace_handle);
+            panic!("dtrace_program_strcompile failed: {}", err);
+        }
+
+        let mut pip: dtrace::dtrace_proginfo_t = std::mem::zeroed();
+        if dtrace::dtrace_program_exec(dtrace_handle, prog, &mut pip) != 0 {
+            let err = dtrace::dtrace_errno(dtrace_handle);
+            panic!("dtrace_program_exec failed: {}", err);
+        }
+
+        if dtrace::dtrace_go(dtrace_handle) != 0 {
+            let err = dtrace::dtrace_errno(dtrace_handle);
+            panic!("dtrace_go failed: {}", err);
+        }
     }
 
-    match f {
-        ForkResult::Parent { child, .. } => {
-            unsafe {
-                global_child = child;
-            }
-            info!("Child pid {}", child);
+    // https://www.spaceflint.com/?p=150
+    // https://sourcegraph.com/github.com/hhhaiai/decompile/-/blob/bin/radareorg_radare2/libr/debug/p/native/xnu/xnu_excthreads.c?L455:23
+    let mut task_port: mach::task_t = 0;
+    let mut exception_port: mach::mach_port_name_t = 0;
+    unsafe {
+        mach::mach_check_return(mach::task_for_pid(
+            mach::mach_task_self(),
+            child.into(),
+            &mut task_port,
+        ))
+        .unwrap();
+        trace!("task_port: {}", task_port);
 
-            // trace!("Waiting for child STOP");
-            // trace!("{:?}", waitpid(child, None).unwrap());
+        mach::mach_check_return(mach::mach_port_allocate(
+            mach::mach_task_self(),
+            mach::MACH_PORT_RIGHT_RECEIVE,
+            &mut exception_port,
+        ))
+        .unwrap();
+        trace!("exception_port: {}", exception_port);
 
-            unsafe {
-                let mut err: i32 = 0;
-                dtrace_handle = dtrace::dtrace_open(3, 0, &mut err); 
-                if dtrace_handle.is_null() {
-                    panic!("dtrace_open failed: {}", err);
+        mach::mach_check_return(mach::mach_port_insert_right(
+            mach::mach_task_self(),
+            exception_port,
+            exception_port,
+            mach::MACH_MSG_TYPE_MAKE_SEND,
+        ))
+        .unwrap();
+        mach::mach_check_return(mach::task_set_exception_ports(
+            task_port,
+            mach::EXC_MASK_ALL,
+            exception_port,
+            (mach::EXCEPTION_DEFAULT
+                | mach::MACH_EXCEPTION_CODES) as i32,
+            mach::THREAD_STATE_NONE,  // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
+        ))
+        .unwrap();
+        trace!("set exception port");
+
+        let mut req_port: mach::mach_port_t = 0;
+        mach::mach_check_return(mach::mach_port_request_notification(
+            mach::mach_task_self(),
+            task_port,
+            mach::MACH_NOTIFY_DEAD_NAME,
+            0,
+            exception_port,
+            mach::MACH_MSG_TYPE_MAKE_SEND_ONCE,
+            &mut req_port,
+        ))
+        .unwrap();
+    }
+
+    ptrace_attachexc(child).unwrap();
+    trace!("Attached");
+
+    loop {
+        let mut req: [u8; 4096] = [0; 4096];
+        let req_hdr = &mut req as *mut _ as *mut mach::mach_msg_header_t;
+        let mut rpl: [u8; 4096] = [0; 4096];
+        let rpl_hdr = &mut rpl as *mut _ as *mut mach::mach_msg_header_t;
+
+        unsafe {
+            mach::mach_check_return(mach::mach_msg(
+                req_hdr,
+                mach::MACH_RCV_MSG,
+                0,
+                4096,
+                exception_port,
+                mach::MACH_MSG_TIMEOUT_NONE,
+                mach::MACH_PORT_NULL,
+            ))
+            .unwrap();
+            //trace!("Got message: {:?}", *req_hdr);
+
+            // Will call back into catch_mach_exception_raise
+            if !mach_exc_server(req_hdr, rpl_hdr) {
+                if (*req_hdr).msgh_id == mach::MACH_NOTIFY_DEAD_NAME {
+                    info!("Child died");
+                    break;
                 }
 
-                // Option reference: https://docs.oracle.com/cd/E23824_01/html/E22973/gkzhi.html#scrolltoc
-                let opt = CString::new("bufsize").unwrap();
-                let val = CString::new("4096").unwrap();
-                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
-                    let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_setopt(bufsize) failed: {}", err);
-                }
-
-                let opt = CString::new("aggsize").unwrap();
-                let val = CString::new("4096").unwrap();
-                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
-                    let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_setopt(bufsize) failed: {}", err);
-                }
-
-                // Set an aggregate interval of 1ns, so that snapshot and aggregate walking
-                // always fetch new data.
-                // https://github.com/apple-oss-distributions/dtrace/blob/05b1f5b12ead47eb14e4712e24a1b1a981498020/lib/libdtrace/common/dt_aggregate.c#L733
-                let opt = CString::new("aggrate").unwrap();
-                let val = CString::new("1ns").unwrap();
-                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), val.as_ptr()) != 0 {
-                    let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_setopt(bufsize) failed: {}", err);
-                }
-
-                // Needed for raise() to work
-                let opt = CString::new("destructive").unwrap();
-                if dtrace::dtrace_setopt(dtrace_handle, opt.as_ptr(), std::ptr::null()) != 0 {
-                    let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_setopt(destructive) failed: {}", err);
-                }
-
-                // x16 is the syscall number
-                // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/dtrace/systrace.c#L156
-                let program = CString::new(format!(
-                    "syscall:::entry /pid == {}/ {{ @r0[uregs[0]] = count(); @r1[uregs[1]] = count();raise(SIGSTOP); }}",
-                    child
-                )).unwrap();
-                trace!("DTrace program: {}", program.to_str().unwrap());
-
-                let prog = dtrace::dtrace_program_strcompile(
-                    dtrace_handle,
-                    program.as_ptr(),
-                    dtrace::dtrace_probespec_DTRACE_PROBESPEC_NAME,
-                    0,
-                    0,
-                    std::ptr::null(),
+                warn!(
+                    "mach_exc_server failed: {}",
+                    mach::r_mach_error_string(
+                        (*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode
+                    )
                 );
-                if prog.is_null() {
-                    let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_program_strcompile failed: {}", err);
-                }
-
-                let mut pip: dtrace::dtrace_proginfo_t = std::mem::zeroed();
-                if dtrace::dtrace_program_exec(dtrace_handle, prog, &mut pip) != 0 {
-                    let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_program_exec failed: {}", err);
-                }
-
-                if dtrace::dtrace_go(dtrace_handle) != 0 {
-                    let err = dtrace::dtrace_errno(dtrace_handle);
-                    panic!("dtrace_go failed: {}", err);
-                }
             }
 
-            // https://www.spaceflint.com/?p=150
-            // https://sourcegraph.com/github.com/hhhaiai/decompile/-/blob/bin/radareorg_radare2/libr/debug/p/native/xnu/xnu_excthreads.c?L455:23
-            let mut task_port: mach::task_t = 0;
-            let mut exception_port: mach::mach_port_name_t = 0;
-            unsafe {
-                mach::mach_check_return(mach::task_for_pid(
-                    mach::mach_task_self(),
-                    child.into(),
-                    &mut task_port,
-                ))
-                .unwrap();
-                trace!("task_port: {}", task_port);
-
-                mach::mach_check_return(mach::mach_port_allocate(
-                    mach::mach_task_self(),
-                    mach::MACH_PORT_RIGHT_RECEIVE,
-                    &mut exception_port,
-                ))
-                .unwrap();
-                trace!("exception_port: {}", exception_port);
-
-                mach::mach_check_return(mach::mach_port_insert_right(
-                    mach::mach_task_self(),
-                    exception_port,
-                    exception_port,
-                    mach::MACH_MSG_TYPE_MAKE_SEND,
-                ))
-                .unwrap();
-                mach::mach_check_return(mach::task_set_exception_ports(
-                    task_port,
-                    mach::EXC_MASK_ALL,
-                    exception_port,
-                    (mach::EXCEPTION_DEFAULT
-                        | mach::MACH_EXCEPTION_CODES) as i32,
-                    mach::THREAD_STATE_NONE,  // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
-                ))
-                .unwrap();
-                trace!("set exception port");
-
-                let mut req_port: mach::mach_port_t = 0;
-                mach::mach_check_return(mach::mach_port_request_notification(
-                    mach::mach_task_self(),
-                    task_port,
-                    mach::MACH_NOTIFY_DEAD_NAME,
-                    0,
-                    exception_port,
-                    mach::MACH_MSG_TYPE_MAKE_SEND_ONCE,
-                    &mut req_port,
-                ))
-                .unwrap();
-            }
-
-            ptrace_attachexc(child).unwrap();
-            trace!("Attached");
-
-            loop {
-                let mut req: [u8; 4096] = [0; 4096];
-                let req_hdr = &mut req as *mut _ as *mut mach::mach_msg_header_t;
-                let mut rpl: [u8; 4096] = [0; 4096];
-                let rpl_hdr = &mut rpl as *mut _ as *mut mach::mach_msg_header_t;
-
-                unsafe {
-                    mach::mach_check_return(mach::mach_msg(
-                        req_hdr,
-                        mach::MACH_RCV_MSG,
-                        0,
-                        4096,
-                        exception_port,
-                        mach::MACH_MSG_TIMEOUT_NONE,
-                        mach::MACH_PORT_NULL,
-                    ))
-                    .unwrap();
-                    //trace!("Got message: {:?}", *req_hdr);
-
-                    // Will call back into catch_mach_exception_raise
-                    if !mach_exc_server(req_hdr, rpl_hdr) {
-                        if (*req_hdr).msgh_id == mach::MACH_NOTIFY_DEAD_NAME {
-                            info!("Child died");
-                            break;
-                        }
-
-                        warn!(
-                            "mach_exc_server failed: {}",
-                            mach::r_mach_error_string(
-                                (*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode
-                            )
-                        );
-                    }
-
-                    mach::mach_check_return(mach::mach_msg(
-                        rpl_hdr,
-                        mach::MACH_SEND_MSG,
-                        (*rpl_hdr).msgh_size,
-                        0,
-                        mach::MACH_PORT_NULL,
-                        mach::MACH_MSG_TIMEOUT_NONE,
-                        mach::MACH_PORT_NULL,
-                    ))
-                    .unwrap();
-                }
-            }
-
-            trace!("Cleaning up");
-
-            // TODO: close down ports
-            unsafe {
-                dtrace::dtrace_stop(dtrace_handle);
-                dtrace::dtrace_close(dtrace_handle);
-            }
+            mach::mach_check_return(mach::mach_msg(
+                rpl_hdr,
+                mach::MACH_SEND_MSG,
+                (*rpl_hdr).msgh_size,
+                0,
+                mach::MACH_PORT_NULL,
+                mach::MACH_MSG_TIMEOUT_NONE,
+                mach::MACH_PORT_NULL,
+            ))
+            .unwrap();
         }
-        ForkResult::Child => {
-            target(&args.executable, &args.arguments);
-        }
+    }
+
+    trace!("Cleaning up");
+
+    // TODO: close down ports
+    unsafe {
+        dtrace::dtrace_stop(dtrace_handle);
+        dtrace::dtrace_close(dtrace_handle);
     }
 }

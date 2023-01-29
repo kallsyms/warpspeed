@@ -204,13 +204,13 @@ fn inject_breakpoint(
     pc: u64,
 ) {
     unsafe {
+        // RWX pages aren't allowed, so have to make it RW, write, then RX again
         mach_check_return(mach::mach_vm_protect(
             task_port,
             pc,
             4,
             0,
-            7, // RWX
-            // mach::VM_PROT_READ | mach::VM_PROT_WRITE | mach::VM_PROT_EXECUTE,
+            0x1 | 0x2 | 0x10, // VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY
         )).unwrap();
         const BREAKPOINT_INSTRUCTION: [u8; 4] = [0x00, 0x00, 0x20, 0xd4];
         mach_check_return(mach::mach_vm_write(
@@ -218,6 +218,13 @@ fn inject_breakpoint(
             pc,
             BREAKPOINT_INSTRUCTION.as_ptr() as mach::vm_offset_t,
             4,
+        )).unwrap();
+        mach_check_return(mach::mach_vm_protect(
+            task_port,
+            pc,
+            4,
+            0,
+            0x1 | 0x4, // VM_PROT_READ | VM_PROT_EXECUTE
         )).unwrap();
     };
 }
@@ -231,19 +238,31 @@ fn handle_replay_mach_exception_raise(
     exception: mach::exception_type_t,
     code: [i64; 2],
 ) {
+    trace!("handle_replay_mach_exception_raise: exception: {}, code: {:?}", exception, code);
     match exception {
+        mach::EXC_BREAKPOINT => {
+            match expected_log {
+                TraceLogEntry::Syscall(expected_syscall) => {
+                    syscall::replay_syscall(task_port, thread_port, &expected_syscall);
+                }
+                _ => panic!("Unexpected log entry: {:?}", expected_log),
+            }
+
+            // lay down a breakpoint at the next log's pc
+            match next_log {
+                Some(TraceLogEntry::Syscall(next_syscall)) => {
+                    let pc = next_syscall.pc;
+                    inject_breakpoint(task_port, pc);
+                }
+                _ => panic!("Unexpected log entry: {:?}", next_log),
+            }
+        }
         mach::EXC_SOFTWARE => {
             match code {
                 [mach::EXC_SOFT_SIGNAL64, signum] => {
+                    // only hit on first entry (when we're stopped at entry)?
                     let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
-                    // TODO: if signal != SIGTRAP, die?
-
-                    match expected_log {
-                        TraceLogEntry::Syscall(expected_syscall) => {
-                            syscall::replay_syscall(task_port, thread_port, &expected_syscall);
-                        }
-                        _ => panic!("Unexpected log entry: {:?}", expected_log),
-                    }
+                    // TODO: if signal != SIGSTOP, die?
 
                     // lay down a breakpoint at the next log's pc
                     match next_log {

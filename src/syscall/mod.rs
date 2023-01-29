@@ -34,6 +34,7 @@ pub fn record_syscall(
 
     regs.__x[0] = clobbered_regs[0];
     regs.__x[1] = clobbered_regs[1];
+    regs.__pc -= 4;
 
     trace!("regs {:x?}", regs);
 
@@ -72,6 +73,18 @@ pub fn record_syscall(
                 data: SyscallData::ReturnOnly {
                     ret_vals,
                 },
+            }
+        }
+        0 => {
+            // HACK HACK HACK
+            // FIXME: when we first start, we get STOP'd _before_ the first instruction has run
+            // unlike every other time when we stop after PC has been adjusted forward.
+            // This readjusts PC back forwards, but will need to be fixed properly (upstream?)
+            // since syscall "0" is a valid syscall (indirect syscall).
+            Syscall{
+                pc: regs.__pc + 4,
+                syscall_number,
+                data: SyscallData::Unhandled,
             }
         }
         _ => {
@@ -117,6 +130,7 @@ pub fn replay_syscall(
         }
         SyscallData::Unhandled => {
             warn!("Unhandled syscall {}, not intercepting", syscall.syscall_number);
+            // TODO: restore original instruction which SVC overwrote
             return;
         }
     }

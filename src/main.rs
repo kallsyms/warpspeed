@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand, Args};
 use log::{debug, error, info, trace, warn};
+use mach::mach_check_return;
 use nix::libc;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
@@ -73,6 +74,20 @@ fn test_args() {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+enum TraceLogEntry {
+    Target(Target),
+    Syscall(syscall::Syscall),
+    MachSyscall(syscall::MachSyscall),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Target {
+    executable: String,
+    arguments: Vec<String>,
+    environment: Vec<String>,
+}
+
 fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
     unsafe {
         nix::errno::Errno::result(libc::ptrace(
@@ -117,35 +132,24 @@ fn dtrace_aggregate_walk_cb<F>(handle: *mut dtrace::dtrace_hdl, mut callback: F)
     }
 }
 
-#[no_mangle]
-fn catch_mach_exception_raise(
+fn handle_record_mach_exception_raise(
     dtrace_handle: *mut dtrace::dtrace_hdl,
-    output: &mut dyn std::io::Write,
     _exception_port: mach::mach_port_t,
     thread_port: mach::mach_port_t,
     task_port: mach::mach_port_t,
     exception: mach::exception_type_t,
-    code: [i64; 2], // mach::exception_data_t,
-) -> mach::kern_return_t {
-    // trace!(
-    //     "mach_exception_raise: {:?} {:?} {:?} {:?} {:?}",
-    //     exception_port,
-    //     thread_port,
-    //     task_port,
-    //     exception,
-    //     code
-    // );
-
-    const EXC_SOFT_SIGNAL64: i64 = mach::EXC_SOFT_SIGNAL as i64;
-
+    code: [i64; 2],
+) -> Option<TraceLogEntry> {
     match exception {
         mach::EXC_SOFTWARE => {
             match code {
-                [EXC_SOFT_SIGNAL64, signum] => {
+                [mach::EXC_SOFT_SIGNAL64, signum] => {
                     let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
                     trace!("EXC_SOFT_SIGNAL: {}", signal);
 
-                    let mut regs: [u64; 2] = [0; 2];
+                    // TODO: if signal != SIGSTOP, record
+
+                    let mut clobbered_regs: [u64; 2] = [0; 2];
 
                     unsafe {
                         if dtrace::dtrace_aggregate_snap(dtrace_handle) == -1 {
@@ -169,8 +173,8 @@ fn catch_mach_exception_raise(
                             //trace!("dtrace agg {} vals: {:?}", aggname, vals);
                             if vals[2] != 0 {
                                 match aggname {
-                                    "r0" => regs[0] = vals[1],
-                                    "r1" => regs[1] = vals[1],
+                                    "r0" => clobbered_regs[0] = vals[1],
+                                    "r1" => clobbered_regs[1] = vals[1],
                                     _ => error!("dtrace agg: unhandled name: {}", aggname),
                                 }
                             }
@@ -180,13 +184,7 @@ fn catch_mach_exception_raise(
                         dtrace::dtrace_aggregate_clear(dtrace_handle);
                     }
 
-                    if let Some(sc) = syscall::record_syscall(task_port, thread_port, regs) {
-                        trace!("syscall: {:?}", sc);
-                        serde_json::to_writer(&mut *output, &sc).unwrap();
-                        output.write_all(b"\n").unwrap();
-                    };
-
-
+                    return Some(TraceLogEntry::Syscall(syscall::record_syscall(task_port, thread_port, clobbered_regs)));
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", code);
@@ -197,28 +195,87 @@ fn catch_mach_exception_raise(
             info!("Unhandled exception type: {}", exception);
         }
     };
-    // I guess returning here implicitly continues?
-    return mach::KERN_SUCCESS;
+
+    None
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct Target {
-    executable: String,
-    args: Vec<String>,
-    environment: Vec<String>,
+fn inject_breakpoint(
+    task_port: mach::mach_port_t,
+    pc: u64,
+) {
+    unsafe {
+        mach_check_return(mach::mach_vm_protect(
+            task_port,
+            pc,
+            4,
+            0,
+            7, // RWX
+            // mach::VM_PROT_READ | mach::VM_PROT_WRITE | mach::VM_PROT_EXECUTE,
+        )).unwrap();
+        const BREAKPOINT_INSTRUCTION: [u8; 4] = [0x00, 0x00, 0x20, 0xd4];
+        mach_check_return(mach::mach_vm_write(
+            task_port,
+            pc,
+            BREAKPOINT_INSTRUCTION.as_ptr() as mach::vm_offset_t,
+            4,
+        )).unwrap();
+    };
 }
 
-fn record(args: &RecordArgs) {
-    let mut output = File::create(&args.trace_filename).unwrap();
+fn handle_replay_mach_exception_raise(
+    expected_log: &TraceLogEntry,
+    next_log: &Option<TraceLogEntry>,
+    _exception_port: mach::mach_port_t,
+    thread_port: mach::mach_port_t,
+    task_port: mach::mach_port_t,
+    exception: mach::exception_type_t,
+    code: [i64; 2],
+) {
+    match exception {
+        mach::EXC_SOFTWARE => {
+            match code {
+                [mach::EXC_SOFT_SIGNAL64, signum] => {
+                    let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
+                    // TODO: if signal != SIGTRAP, die?
 
-    serde_json::to_writer(&mut output, &Target{
-        executable: args.executable.clone(),
-        args: args.arguments.clone(),
-        environment: vec![],
-    }).unwrap();
-    output.write_all(b"\n").unwrap();
+                    match expected_log {
+                        TraceLogEntry::Syscall(expected_syscall) => {
+                            syscall::replay_syscall(task_port, thread_port, &expected_syscall);
+                        }
+                        _ => panic!("Unexpected log entry: {:?}", expected_log),
+                    }
 
-    let child = unsafe {
+                    // lay down a breakpoint at the next log's pc
+                    match next_log {
+                        Some(TraceLogEntry::Syscall(next_syscall)) => {
+                            let pc = next_syscall.pc;
+                            inject_breakpoint(task_port, pc);
+                        }
+                        _ => panic!("Unexpected log entry: {:?}", next_log),
+                    }
+                }
+                _ => {
+                    info!("Unhandled EXC_SOFTWARE code: {:?}", code);
+                }
+            }
+        }
+        _ => {
+            info!("Unhandled exception type: {}", exception);
+        }
+    }
+}
+
+/// Convert a vector of strings to a vector of C strings, including a null terminator.
+fn to_c_string_array(strings: &Vec<String>) -> Vec<*mut i8> {
+    let owned = strings.iter().map(|a| CString::new(a.as_bytes()).unwrap()).collect::<Vec<_>>();
+    let mut pointers: Vec<*mut i8> = owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
+    pointers.push(std::ptr::null_mut());
+
+    pointers
+}
+
+fn spawn_target(target: &Target) -> nix::unistd::Pid {
+    unsafe {
         let mut pid: libc::pid_t = 0;
 
         let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
@@ -235,12 +292,11 @@ fn record(args: &RecordArgs) {
             panic!("posix_spawnattr_setflags failed: {}", std::io::Error::last_os_error());
         }
 
-        let executable = CString::new(args.executable.clone()).unwrap();
-        let mut cargs_owned: Vec<CString> = vec![executable.clone()];
-        cargs_owned.extend(args.arguments.iter().map(|a| CString::new(a.as_bytes()).unwrap()));
-        let mut argv: Vec<*mut i8> = cargs_owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
-        argv.push(std::ptr::null_mut());
-        let env: Vec<*mut i8> = vec![std::ptr::null_mut()]; // TODO
+        let executable = CString::new(target.executable.clone()).unwrap();
+        let mut all_args = vec![target.executable.clone()];
+        all_args.extend(target.arguments.clone());
+        let argv = to_c_string_array(&all_args);
+        let env = to_c_string_array(&target.environment);
 
         let res = libc::posix_spawn(
             &mut pid,
@@ -253,11 +309,25 @@ fn record(args: &RecordArgs) {
         if res != 0 {
             panic!("posix_spawn failed: {}", std::io::Error::last_os_error());
         }
-        
+    
         nix::unistd::Pid::from_raw(pid)
+    }
+}
+
+fn record(args: &RecordArgs) {
+    let mut output = File::create(&args.trace_filename).unwrap();
+
+    let target = Target{
+        executable: args.executable.clone(),
+        arguments: args.arguments.clone(),
+        environment: vec![],  // TODO
     };
 
+    let child = spawn_target(&target);
     info!("Child pid {}", child);
+
+    serde_json::to_writer(&mut output, &TraceLogEntry::Target(target)).unwrap();
+    output.write_all(b"\n").unwrap();
 
     let dtrace_handle = unsafe {
         let mut err: i32 = 0;
@@ -332,57 +402,101 @@ fn record(args: &RecordArgs) {
         dtrace_handle
     };
 
-    // https://www.spaceflint.com/?p=150
-    // https://sourcegraph.com/github.com/hhhaiai/decompile/-/blob/bin/radareorg_radare2/libr/debug/p/native/xnu/xnu_excthreads.c?L455:23
-    let mut task_port: mach::task_t = 0;
-    let mut exception_port: mach::mach_port_name_t = 0;
-    unsafe {
-        mach::mach_check_return(mach::task_for_pid(
-            mach::mach_task_self(),
-            child.into(),
-            &mut task_port,
-        ))
-        .unwrap();
-        trace!("task_port: {}", task_port);
+    let (_task_port, exception_port) = mach::mrr_set_exception_port(child);
 
-        mach::mach_check_return(mach::mach_port_allocate(
-            mach::mach_task_self(),
-            mach::MACH_PORT_RIGHT_RECEIVE,
-            &mut exception_port,
-        ))
-        .unwrap();
-        trace!("exception_port: {}", exception_port);
+    ptrace_attachexc(child).unwrap();
+    trace!("Attached");
 
-        mach::mach_check_return(mach::mach_port_insert_right(
-            mach::mach_task_self(),
-            exception_port,
-            exception_port,
-            mach::MACH_MSG_TYPE_MAKE_SEND,
-        ))
-        .unwrap();
-        mach::mach_check_return(mach::task_set_exception_ports(
-            task_port,
-            mach::EXC_MASK_ALL,
-            exception_port,
-            (mach::EXCEPTION_DEFAULT
-                | mach::MACH_EXCEPTION_CODES) as i32,
-            mach::THREAD_STATE_NONE,  // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
-        ))
-        .unwrap();
-        trace!("set exception port");
+    // TODO: make this into a struct/trait callback to dedup with replay?
+    loop {
+        let mut req_buf: [u8; 4096] = [0; 4096];
+        let request_header = &mut req_buf as *mut _ as *mut mach::mach_msg_header_t;
+        let mut rpl_buf: [u8; 4096] = [0; 4096];
+        let reply_header = &mut rpl_buf as *mut _ as *mut mach::mach_msg_header_t;
 
-        let mut req_port: mach::mach_port_t = 0;
-        mach::mach_check_return(mach::mach_port_request_notification(
-            mach::mach_task_self(),
-            task_port,
-            mach::MACH_NOTIFY_DEAD_NAME,
-            0,
-            exception_port,
-            mach::MACH_MSG_TYPE_MAKE_SEND_ONCE,
-            &mut req_port,
-        ))
-        .unwrap();
+        unsafe {
+            mach::mach_check_return(mach::mach_msg(
+                request_header,
+                mach::MACH_RCV_MSG,
+                0,
+                4096,
+                exception_port,
+                mach::MACH_MSG_TIMEOUT_NONE,
+                mach::MACH_PORT_NULL,
+            ))
+            .unwrap();
+
+            match (*request_header).msgh_id {
+                mach::MACH_NOTIFY_DEAD_NAME => {
+                    info!("Child died");
+                    break;
+                }
+                mig::MACH_EXCEPTION_RAISE => {
+                    (*reply_header).msgh_bits = (*request_header).msgh_bits & mig::MACH_MSGH_BITS_REMOTE_MASK;
+                    (*reply_header).msgh_remote_port = (*request_header).msgh_remote_port;
+                    (*reply_header).msgh_size = std::mem::size_of::<mig::__Reply__mach_exception_raise_t>() as u32;
+                    (*reply_header).msgh_local_port = mach::MACH_PORT_NULL;
+                    (*reply_header).msgh_id = (*request_header).msgh_id + 100;
+                    (*reply_header).msgh_voucher_port = 0;
+
+                    let exception_request = *(request_header as *const _ as *const mig::__Request__mach_exception_raise_t);
+                    let log_entry = handle_record_mach_exception_raise(
+                        dtrace_handle,
+                        exception_request.Head.msgh_local_port,
+                        exception_request.thread.name,
+                        exception_request.task.name,
+                        exception_request.exception,
+                        exception_request.code,
+                    );
+                    serde_json::to_writer(&mut output, &log_entry).unwrap();
+                    output.write_all(b"\n").unwrap();
+
+                    let mut exception_reply = &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
+                    (*exception_reply).RetCode = mach::KERN_SUCCESS;
+                    (*exception_reply).NDR = mig::NDR_record;
+                }
+                x => {
+                    error!("unexpected mach_msg number: {}", x);
+                    break;
+                }
+            }
+
+            mach::mach_check_return(mach::mach_msg(
+                reply_header,
+                mach::MACH_SEND_MSG,
+                (*reply_header).msgh_size,
+                0,
+                mach::MACH_PORT_NULL,
+                mach::MACH_MSG_TIMEOUT_NONE,
+                mach::MACH_PORT_NULL,
+            ))
+            .unwrap();
+        }
     }
+
+    trace!("Cleaning up");
+
+    // TODO: close down ports
+    unsafe {
+        dtrace::dtrace_stop(dtrace_handle);
+        dtrace::dtrace_close(dtrace_handle);
+    }
+}
+
+fn replay(args: &ReplayArgs) {
+    let mut trace = serde_json::Deserializer::from_reader(File::open(&args.trace_filename).unwrap()).into_iter::<TraceLogEntry>().map(|x| x.unwrap());
+    let target = match trace.next().unwrap() {
+        TraceLogEntry::Target(target) => target,
+        _ => panic!("First entry in trace must be Target"),
+    };
+
+    let mut this_entry = trace.next().unwrap();
+    let mut next_entry = trace.next();
+
+    let child = spawn_target(&target);
+    info!("Child pid {}", child);
+
+    let (task_port, exception_port) = mach::mrr_set_exception_port(child);
 
     ptrace_attachexc(child).unwrap();
     trace!("Attached");
@@ -419,16 +533,18 @@ fn record(args: &RecordArgs) {
                     (*reply_header).msgh_voucher_port = 0;
 
                     let exception_request = *(request_header as *const _ as *const mig::__Request__mach_exception_raise_t);
-                    let mut exception_reply = &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
-                    (*exception_reply).RetCode = catch_mach_exception_raise(
-                        dtrace_handle,
-                        &mut output,
+                    handle_replay_mach_exception_raise(
+                        &this_entry,
+                        &next_entry,
                         exception_request.Head.msgh_local_port,
                         exception_request.thread.name,
                         exception_request.task.name,
                         exception_request.exception,
                         exception_request.code,
                     );
+
+                    let mut exception_reply = &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
+                    (*exception_reply).RetCode = mach::KERN_SUCCESS;
                     (*exception_reply).NDR = mig::NDR_record;
                 }
                 x => {
@@ -448,15 +564,12 @@ fn record(args: &RecordArgs) {
             ))
             .unwrap();
         }
+
+        this_entry = next_entry.unwrap();
+        next_entry = trace.next();
     }
 
     trace!("Cleaning up");
-
-    // TODO: close down ports
-    unsafe {
-        dtrace::dtrace_stop(dtrace_handle);
-        dtrace::dtrace_close(dtrace_handle);
-    }
 }
 
 fn main() {
@@ -471,7 +584,7 @@ fn main() {
             record(&args);
         }
         Command::Replay(args) => {
-            todo!();
+            replay(&args);
         }
     }
 }

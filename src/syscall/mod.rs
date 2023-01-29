@@ -102,7 +102,7 @@ pub fn replay_syscall(
     task_port: mach::mach_port_t,
     thread_port: mach::mach_port_t,
     syscall: &Syscall,
-) {
+) -> bool {
     let mut regs = mach::mrr_get_regs(thread_port);
 
     if regs.__pc != syscall.pc {
@@ -131,12 +131,14 @@ pub fn replay_syscall(
         SyscallData::Unhandled => {
             warn!("Unhandled syscall {}, not intercepting", syscall.syscall_number);
             // TODO: restore original instruction which SVC overwrote
-            return;
+            return false;
         }
     }
 
     regs.__pc += 4;
     mach::mrr_set_regs(thread_port, regs);
+
+    true
 }
 
 // TODO

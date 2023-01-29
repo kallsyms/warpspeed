@@ -2,12 +2,15 @@ use clap::{Parser, Subcommand, Args};
 use log::{debug, error, info, trace, warn};
 use mach::mach_check_return;
 use nix::libc;
+use nix::sys;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
+use std::hash::Hash;
 use std::io::Write;
 
 const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
@@ -199,10 +202,19 @@ fn handle_record_mach_exception_raise(
     None
 }
 
-fn inject_breakpoint(
+const BREAKPOINT_INSTRUCTION: [u8; 4] = [0x00, 0x00, 0x20, 0xd4];
+
+#[derive(Debug)]
+struct Breakpoint {
+    orig_bytes: Vec<u8>,
+    single_step: bool,
+}
+
+fn inject_code(
     task_port: mach::mach_port_t,
     pc: u64,
-) {
+    new_bytes: &[u8],
+) -> Vec<u8> {
     unsafe {
         // RWX pages aren't allowed, so have to make it RW, write, then RX again
         mach_check_return(mach::mach_vm_protect(
@@ -212,11 +224,24 @@ fn inject_breakpoint(
             0,
             0x1 | 0x2 | 0x10, // VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY
         )).unwrap();
-        const BREAKPOINT_INSTRUCTION: [u8; 4] = [0x00, 0x00, 0x20, 0xd4];
+
+        let mut orig_bytes: Vec<u8> = vec![0; 4];
+        let mut copy_size: mach::mach_vm_size_t = 4;
+        
+        unsafe {
+            mach::mach_check_return(mach::mach_vm_read_overwrite(
+                task_port,
+                pc,
+                4,
+                orig_bytes.as_mut_ptr() as mach::mach_vm_address_t,
+                &mut copy_size,
+            )).unwrap();
+        }
+
         mach_check_return(mach::mach_vm_write(
             task_port,
             pc,
-            BREAKPOINT_INSTRUCTION.as_ptr() as mach::vm_offset_t,
+            new_bytes.as_ptr() as mach::vm_offset_t,
             4,
         )).unwrap();
         mach_check_return(mach::mach_vm_protect(
@@ -226,35 +251,84 @@ fn inject_breakpoint(
             0,
             0x1 | 0x4, // VM_PROT_READ | VM_PROT_EXECUTE
         )).unwrap();
-    };
+
+        orig_bytes
+    }
 }
 
 fn handle_replay_mach_exception_raise(
     expected_log: &TraceLogEntry,
     next_log: &Option<TraceLogEntry>,
+    breakpoints: &mut HashMap<u64, Breakpoint>,
     _exception_port: mach::mach_port_t,
     thread_port: mach::mach_port_t,
     task_port: mach::mach_port_t,
     exception: mach::exception_type_t,
     code: [i64; 2],
-) {
+) -> bool {
     trace!("handle_replay_mach_exception_raise: exception: {}, code: {:?}", exception, code);
     match exception {
         mach::EXC_BREAKPOINT => {
-            match expected_log {
-                TraceLogEntry::Syscall(expected_syscall) => {
-                    syscall::replay_syscall(task_port, thread_port, &expected_syscall);
+            let pc = code[1] as u64;
+
+            //trace!("breakpoints: {:?}", breakpoints);
+            if let Some(bp) = breakpoints.get(&pc) {
+                if bp.single_step {
+                    trace!("continuing after single step");
+                    inject_code(task_port, pc, &bp.orig_bytes);
+                    breakpoints.remove(&pc);
+
+                    // lay down a breakpoint at the next log's pc
+                    match next_log {
+                        None => {}
+                        Some(TraceLogEntry::Syscall(next_syscall)) => {
+                            let next_pc = next_syscall.pc;
+                            let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
+                            breakpoints.insert(next_pc, Breakpoint {
+                                orig_bytes,
+                                single_step: false,
+                            });
+                        }
+                        _ => panic!("Unexpected log entry: {:?}", next_log),
+                    }
+
+                    return true;
                 }
-                _ => panic!("Unexpected log entry: {:?}", expected_log),
             }
 
-            // lay down a breakpoint at the next log's pc
-            match next_log {
-                Some(TraceLogEntry::Syscall(next_syscall)) => {
-                    let pc = next_syscall.pc;
-                    inject_breakpoint(task_port, pc);
+            let syscall_handled = match expected_log {
+                TraceLogEntry::Syscall(expected_syscall) => {
+                    syscall::replay_syscall(task_port, thread_port, &expected_syscall)
                 }
-                _ => panic!("Unexpected log entry: {:?}", next_log),
+                _ => panic!("Unexpected log entry: {:?}", expected_log),
+            };
+
+            if syscall_handled {
+                // lay down a breakpoint at the next log's pc
+                match next_log {
+                    None => {}
+                    Some(TraceLogEntry::Syscall(next_syscall)) => {
+                        let next_pc = next_syscall.pc;
+                        let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
+                        breakpoints.insert(next_pc, Breakpoint {
+                            orig_bytes,
+                            single_step: false,
+                        });
+                    }
+                    _ => panic!("Unexpected log entry: {:?}", next_log),
+                }
+            } else {
+                // restore this (syscall) instruction, break at next instruction, then restore it and continue
+                // basically single step
+                let orig = &breakpoints[&pc];
+                inject_code(task_port, pc, orig.orig_bytes.as_slice());
+                trace!("adding breakpoint for single step at pc: {:x}", pc + 4);
+                let next = inject_code(task_port, pc + 4, &BREAKPOINT_INSTRUCTION);
+                breakpoints.insert(pc + 4, Breakpoint {
+                    orig_bytes: next,
+                    single_step: true,
+                });
+                return false;
             }
         }
         mach::EXC_SOFTWARE => {
@@ -267,8 +341,12 @@ fn handle_replay_mach_exception_raise(
                     // lay down a breakpoint at the next log's pc
                     match next_log {
                         Some(TraceLogEntry::Syscall(next_syscall)) => {
-                            let pc = next_syscall.pc;
-                            inject_breakpoint(task_port, pc);
+                            let next_pc = next_syscall.pc;
+                            let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
+                            breakpoints.insert(next_pc, Breakpoint {
+                                orig_bytes,
+                                single_step: false,
+                            });
                         }
                         _ => panic!("Unexpected log entry: {:?}", next_log),
                     }
@@ -282,6 +360,8 @@ fn handle_replay_mach_exception_raise(
             info!("Unhandled exception type: {}", exception);
         }
     }
+
+    true
 }
 
 /// Convert a vector of strings to a vector of C strings, including a null terminator.
@@ -520,7 +600,11 @@ fn replay(args: &ReplayArgs) {
     ptrace_attachexc(child).unwrap();
     trace!("Attached");
 
+    let mut breakpoints = HashMap::new();
+
     loop {
+        let advance;
+
         let mut req_buf: [u8; 4096] = [0; 4096];
         let request_header = &mut req_buf as *mut _ as *mut mach::mach_msg_header_t;
         let mut rpl_buf: [u8; 4096] = [0; 4096];
@@ -552,9 +636,10 @@ fn replay(args: &ReplayArgs) {
                     (*reply_header).msgh_voucher_port = 0;
 
                     let exception_request = *(request_header as *const _ as *const mig::__Request__mach_exception_raise_t);
-                    handle_replay_mach_exception_raise(
+                    advance = handle_replay_mach_exception_raise(
                         &this_entry,
                         &next_entry,
+                        &mut breakpoints,
                         exception_request.Head.msgh_local_port,
                         exception_request.thread.name,
                         exception_request.task.name,
@@ -584,8 +669,14 @@ fn replay(args: &ReplayArgs) {
             .unwrap();
         }
 
-        this_entry = next_entry.unwrap();
-        next_entry = trace.next();
+        if advance {
+            if next_entry.is_none() {
+                break;
+            }
+
+            this_entry = next_entry.unwrap();
+            next_entry = trace.next();
+        }
     }
 
     trace!("Cleaning up");

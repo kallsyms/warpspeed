@@ -5,13 +5,30 @@ use std::env;
 #[derive(Debug)]
 struct MachParseCallbacks;
 
+static MACRO_PREFIX_TYPES: &'static [(&'static str, bindgen::callbacks::IntKind)] = &[
+    // N.B. ordering
+    ("EXC_MASK_", bindgen::callbacks::IntKind::U32),
+    ("EXC_", bindgen::callbacks::IntKind::I32),
+
+    ("KERN_", bindgen::callbacks::IntKind::I32),
+    ("MACH_RCV_", bindgen::callbacks::IntKind::I32),
+    ("MACH_SEND_", bindgen::callbacks::IntKind::I32),
+    ("MACH_NOTIFY_", bindgen::callbacks::IntKind::I32),
+    ("THREAD_STATE", bindgen::callbacks::IntKind::I32),
+    ("ARM_THREAD_STATE", bindgen::callbacks::IntKind::I32),
+
+    ("EXCEPTION_", bindgen::callbacks::IntKind::U32),
+    ("MACH_EXCEPTION_", bindgen::callbacks::IntKind::U32),
+    ("MACH_PORT_", bindgen::callbacks::IntKind::U32),
+    ("MACH_MSG_", bindgen::callbacks::IntKind::U32),
+];
+
 impl bindgen::callbacks::ParseCallbacks for MachParseCallbacks {
     fn int_macro(&self, name: &str, _value: i64) -> Option<bindgen::callbacks::IntKind> {
-        // kern_return_t's and mach_msg_option_t's are ints
-        if name.starts_with("KERN_") || name.starts_with("MACH_RCV_") || name.starts_with("MACH_SEND_") {
-            return Some(bindgen::callbacks::IntKind::I32);
-        } else if name.starts_with("EXC_") || name.starts_with("MACH_PORT_")  || name.starts_with("MACH_MSG_") {
-            return Some(bindgen::callbacks::IntKind::U32);
+        for &(prefix, kind) in MACRO_PREFIX_TYPES {
+            if name.starts_with(prefix) {
+                return Some(kind);
+            }
         }
 
         Some(bindgen::callbacks::IntKind::U64)
@@ -65,6 +82,15 @@ fn main() {
         .expect("Unable to generate mach bindings")
         .write_to_file(out_dir.join("mach.rs"))
         .expect("Couldn't write mach bindings");
+
+    // Syscall numbers
+    bindgen::Builder::default()
+        .header(sdkroot.join("usr/include/sys/syscall.h").to_str().unwrap())
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .generate()
+        .expect("Unable to generate syscall bindings")
+        .write_to_file(out_dir.join("sysno.rs"))
+        .expect("Couldn't write syscall bindings");
 
     // DTrace
     bindgen::Builder::default()

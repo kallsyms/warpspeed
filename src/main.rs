@@ -5,8 +5,10 @@ use nix::sys::ptrace;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::waitpid;
 use nix::unistd::{execve, fork, getpid, sleep, ForkResult};
+use std::boxed::Box;
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::fs::File;
 
 #[link(name = "mach_excServer", kind = "static")]
 extern "C" {
@@ -28,6 +30,9 @@ mod syscall;
 struct Args {
     #[clap(flatten)]
     verbose: clap_verbosity_flag::Verbosity,
+
+    #[clap(required = true)]
+    output_filename: String,
 
     /// Target executable
     #[clap(required = true)]
@@ -113,6 +118,7 @@ fn target(executable: &str, args: &Vec<String>) -> ! {
 
 static mut global_child: nix::unistd::Pid = nix::unistd::Pid::from_raw(0);
 static mut dtrace_handle: *mut dtrace::dtrace_hdl = std::ptr::null_mut();
+static mut output: Option<Box<dyn std::io::Write>> = None;
 
 #[no_mangle]
 pub extern "C" fn catch_mach_exception_raise(
@@ -120,7 +126,7 @@ pub extern "C" fn catch_mach_exception_raise(
     thread_port: mach::mach_port_t,
     task_port: mach::mach_port_t,
     exception: mach::exception_type_t,
-    code: *mut u32, //mach::exception_data_t,
+    code: mach::exception_data_t,
     code_count: mach::mach_msg_type_number_t,
 ) -> mach::kern_return_t {
     let codes = unsafe { std::slice::from_raw_parts(code, (code_count + 1) as usize) };
@@ -135,7 +141,7 @@ pub extern "C" fn catch_mach_exception_raise(
     //     codes
     // );
 
-    match exception as u32 {
+    match exception {
         mach::EXC_SOFTWARE => {
             match codes {
                 [mach::EXC_SOFT_SIGNAL, _, signum] => {
@@ -180,8 +186,14 @@ pub extern "C" fn catch_mach_exception_raise(
                         dtrace::dtrace_aggregate_clear(dtrace_handle);
                     }
 
-                    let sc = syscall::record_syscall(task_port, thread_port, regs);
-                    trace!("syscall: {:?}", sc);
+                    if let Some(sc) = syscall::record_syscall(task_port, thread_port, regs) {
+                        trace!("syscall: {:?}", sc);
+                        unsafe {
+                            serde_json::to_writer_pretty(output.as_mut().unwrap(), &sc).unwrap();
+                        }
+                    };
+
+
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", codes);
@@ -239,6 +251,10 @@ fn main() {
     env_logger::Builder::new()
         .filter_level(args.verbose.log_level_filter())
         .init();
+    
+    unsafe {
+        output = Some(Box::new(File::create(args.output_filename).unwrap()));
+    }
 
     let f;
     unsafe {
@@ -363,10 +379,7 @@ fn main() {
                     exception_port,
                     (mach::EXCEPTION_DEFAULT
                         | mach::MACH_EXCEPTION_CODES) as i32,
-                    //mach::THREAD_STATE_NONE,  // causes invalid arg?
-                    //mach::x86_THREAD_STATE64,
-                    //1,
-                    5,  //https://github.com/apple/darwin-xnu/blob/main/osfmk/mach/arm/thread_status.h#L55
+                    mach::THREAD_STATE_NONE,  // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
                 ))
                 .unwrap();
                 trace!("set exception port");
@@ -375,7 +388,7 @@ fn main() {
                 mach::mach_check_return(mach::mach_port_request_notification(
                     mach::mach_task_self(),
                     task_port,
-                    mach::MACH_NOTIFY_DEAD_NAME as i32,
+                    mach::MACH_NOTIFY_DEAD_NAME,
                     0,
                     exception_port,
                     mach::MACH_MSG_TYPE_MAKE_SEND_ONCE,
@@ -404,11 +417,11 @@ fn main() {
                         mach::MACH_PORT_NULL,
                     ))
                     .unwrap();
-                    trace!("Got message: {:?}", *req_hdr);
+                    //trace!("Got message: {:?}", *req_hdr);
 
                     // Will call back into catch_mach_exception_raise
                     if !mach_exc_server(req_hdr, rpl_hdr) {
-                        if (*req_hdr).msgh_id == mach::MACH_NOTIFY_DEAD_NAME as i32 {
+                        if (*req_hdr).msgh_id == mach::MACH_NOTIFY_DEAD_NAME {
                             info!("Child died");
                             break;
                         }

@@ -9,14 +9,6 @@ use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
 
-#[link(name = "mach_excServer", kind = "static")]
-extern "C" {
-    fn mach_exc_server(
-        request: *mut mach::mach_msg_header_t,
-        reply: *mut mach::mach_msg_header_t,
-    ) -> bool;
-}
-
 const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
 
 mod dtrace;
@@ -105,26 +97,26 @@ pub extern "C" fn catch_mach_exception_raise(
     thread_port: mach::mach_port_t,
     task_port: mach::mach_port_t,
     exception: mach::exception_type_t,
-    code: mach::exception_data_t,
+    code: [i64; 2], // mach::exception_data_t,
     code_count: mach::mach_msg_type_number_t,
 ) -> mach::kern_return_t {
-    let codes = unsafe { std::slice::from_raw_parts(code, (code_count + 1) as usize) };
     // trace!(
-    //     "mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?} ({:?})",
+    //     "mach_exception_raise: {:?} {:?} {:?} {:?} {:?} {:?}",
     //     exception_port,
     //     thread_port,
     //     task_port,
     //     exception,
-    //     code,
+    //     code
     //     code_count,
-    //     codes
     // );
+
+    const EXC_SOFT_SIGNAL64: i64 = mach::EXC_SOFT_SIGNAL as i64;
 
     match exception {
         mach::EXC_SOFTWARE => {
-            match codes {
-                [mach::EXC_SOFT_SIGNAL, _, signum] => {
-                    let signal: Signal = unsafe { std::mem::transmute(*signum) };
+            match code {
+                [EXC_SOFT_SIGNAL64, signum] => {
+                    let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
                     trace!("EXC_SOFT_SIGNAL: {}", signal);
 
                     let mut regs: [u64; 2] = [0; 2];
@@ -173,7 +165,7 @@ pub extern "C" fn catch_mach_exception_raise(
 
                 }
                 _ => {
-                    info!("Unhandled EXC_SOFTWARE code: {:?}", codes);
+                    info!("Unhandled EXC_SOFTWARE code: {:?}", code);
                 }
             }
             // unsafe {
@@ -186,40 +178,6 @@ pub extern "C" fn catch_mach_exception_raise(
     };
     // Does returning here implicitly continue?
     return mach::KERN_SUCCESS;
-}
-
-#[no_mangle]
-pub extern "C" fn catch_mach_exception_raise_state(
-    _exception_port: mach::mach_port_t,
-    _exception: mach::exception_type_t,
-    _code: mach::exception_data_t,
-    _code_count: mach::mach_msg_type_number_t,
-    _flavor: *mut mach::thread_state_flavor_t,
-    _old_state: mach::thread_state_t,
-    _old_state_count: mach::mach_msg_type_number_t,
-    _new_state: mach::thread_state_t,
-    _new_state_count: *mut mach::mach_msg_type_number_t,
-) -> mach::kern_return_t {
-    error!("Unexpected mach_exception_raise_state");
-    return mach::MACH_RCV_INVALID_TYPE;
-}
-
-#[no_mangle]
-pub extern "C" fn catch_mach_exception_raise_state_identity(
-    _exception_port: mach::mach_port_t,
-    _thread_port: mach::mach_port_t,
-    _task_port: mach::mach_port_t,
-    _exception: mach::exception_type_t,
-    _code: mach::exception_data_t,
-    _code_count: mach::mach_msg_type_number_t,
-    _flavor: *mut mach::thread_state_flavor_t,
-    _old_state: mach::thread_state_t,
-    _old_state_count: mach::mach_msg_type_number_t,
-    _new_state: mach::thread_state_t,
-    _new_state_count: *mut mach::mach_msg_type_number_t,
-) -> mach::kern_return_t {
-    error!("Unexpected mach_exception_raise_state_identity");
-    return mach::MACH_RCV_INVALID_TYPE;
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -418,14 +376,14 @@ fn main() {
     trace!("Attached");
 
     loop {
-        let mut req: [u8; 4096] = [0; 4096];
-        let req_hdr = &mut req as *mut _ as *mut mach::mach_msg_header_t;
-        let mut rpl: [u8; 4096] = [0; 4096];
-        let rpl_hdr = &mut rpl as *mut _ as *mut mach::mach_msg_header_t;
+        let mut req_buf: [u8; 4096] = [0; 4096];
+        let request_header = &mut req_buf as *mut _ as *mut mach::mach_msg_header_t;
+        let mut rpl_buf: [u8; 4096] = [0; 4096];
+        let reply_header = &mut rpl_buf as *mut _ as *mut mach::mach_msg_header_t;
 
         unsafe {
             mach::mach_check_return(mach::mach_msg(
-                req_hdr,
+                request_header,
                 mach::MACH_RCV_MSG,
                 0,
                 4096,
@@ -434,28 +392,42 @@ fn main() {
                 mach::MACH_PORT_NULL,
             ))
             .unwrap();
-            //trace!("Got message: {:?}", *req_hdr);
 
-            // Will call back into catch_mach_exception_raise
-            // TODO: dispatch this ourselves, so that we don't have to have globals.
-            if !mach_exc_server(req_hdr, rpl_hdr) {
-                if (*req_hdr).msgh_id == mach::MACH_NOTIFY_DEAD_NAME {
+            match (*request_header).msgh_id {
+                mach::MACH_NOTIFY_DEAD_NAME => {
                     info!("Child died");
                     break;
                 }
+                mig::MACH_EXCEPTION_RAISE => {
+                    (*reply_header).msgh_bits = (*request_header).msgh_bits & mig::MACH_MSGH_BITS_REMOTE_MASK;
+                    (*reply_header).msgh_remote_port = (*request_header).msgh_remote_port;
+                    (*reply_header).msgh_size = std::mem::size_of::<mig::__Reply__mach_exception_raise_t>() as u32;
+                    (*reply_header).msgh_local_port = mach::MACH_PORT_NULL;
+                    (*reply_header).msgh_id = (*request_header).msgh_id + 100;
+                    (*reply_header).msgh_voucher_port = 0;
 
-                warn!(
-                    "mach_exc_server failed: {}",
-                    mach::r_mach_error_string(
-                        (*(&mut rpl as *mut _ as *mut mig::mig_reply_error_t)).RetCode
-                    )
-                );
+                    let exception_request = *(request_header as *const _ as *const mig::__Request__mach_exception_raise_t);
+                    let mut exception_reply = &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
+                    (*exception_reply).RetCode = catch_mach_exception_raise(
+                        exception_request.Head.msgh_local_port,
+                        exception_request.thread.name,
+                        exception_request.task.name,
+                        exception_request.exception,
+                        exception_request.code,
+                        exception_request.codeCnt,
+                    );
+                    (*exception_reply).NDR = mig::NDR_record;
+                }
+                x => {
+                    error!("unexpected mach_msg number: {}", x);
+                    break;
+                }
             }
 
             mach::mach_check_return(mach::mach_msg(
-                rpl_hdr,
+                reply_header,
                 mach::MACH_SEND_MSG,
-                (*rpl_hdr).msgh_size,
+                (*reply_header).msgh_size,
                 0,
                 mach::MACH_PORT_NULL,
                 mach::MACH_MSG_TIMEOUT_NONE,

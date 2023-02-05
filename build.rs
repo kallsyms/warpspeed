@@ -5,7 +5,7 @@ use std::env;
 #[derive(Debug)]
 struct MachParseCallbacks;
 
-static MACRO_PREFIX_TYPES: &'static [(&'static str, bindgen::callbacks::IntKind)] = &[
+static MACRO_PREFIX_TYPES: &[(&str, bindgen::callbacks::IntKind)] = &[
     // N.B. ordering
     ("EXC_MASK_", bindgen::callbacks::IntKind::U32),
     ("EXC_", bindgen::callbacks::IntKind::I32),

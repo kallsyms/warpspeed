@@ -1,24 +1,22 @@
-use clap::{Parser, Subcommand, Args};
-use log::{debug, error, info, trace, warn};
+use clap::{Args, Parser, Subcommand};
+use log::{error, info, trace, warn};
 use mach::mach_check_return;
 use nix::libc;
-use nix::sys;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fs::File;
-use std::hash::Hash;
 use std::io::Write;
+
+use crate::mach::mig;
 
 const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
 
 mod dtrace;
 mod mach;
-mod mig;
-
 mod syscall;
 
 /// mRR, the macOS Record Replay Debugger
@@ -42,7 +40,7 @@ enum Command {
 }
 
 #[derive(Args)]
-#[command(trailing_var_arg=true)]
+#[command(trailing_var_arg = true)]
 struct RecordArgs {
     /// Output filename of the trace
     #[clap(required = true)]
@@ -66,7 +64,15 @@ struct ReplayArgs {
 
 #[test]
 fn test_args() {
-    let args = Cli::parse_from(vec!["mrr", "record", "out.log", "executable", "--", "-a", "1"]);
+    let args = Cli::parse_from(vec![
+        "mrr",
+        "record",
+        "out.log",
+        "executable",
+        "--",
+        "-a",
+        "1",
+    ]);
     match args.command {
         Command::Record(args) => {
             assert_eq!(args.trace_filename, "out.log");
@@ -103,35 +109,28 @@ fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
     }
 }
 
-fn ptrace_thupdate(
-    pid: nix::unistd::Pid,
-    port: mach::mach_port_t,
-    signal: i32,
-) -> nix::Result<()> {
-    unsafe {
-        nix::errno::Errno::result(libc::ptrace(
-            ptrace::Request::PT_THUPDATE as ptrace::RequestType,
-            pid.into(),
-            port as *mut i8,
-            signal,
-        ))
-        .map(|_| ())
-    }
-}
-
 // https://stackoverflow.com/a/32270215
-extern "C" fn dtrace_agg_walk_handler(agg: *const dtrace::dtrace_aggdata_t, arg: *mut libc::c_void) -> libc::c_int {
-    let closure: &mut &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> bool = unsafe { std::mem::transmute(arg) };
+extern "C" fn dtrace_agg_walk_handler(
+    agg: *const dtrace::dtrace_aggdata_t,
+    arg: *mut libc::c_void,
+) -> libc::c_int {
+    let closure: &mut &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> bool =
+        unsafe { &mut *(arg as *mut &mut dyn std::ops::FnMut(*const dtrace::dtrace_aggdata) -> bool) };
     closure(agg) as libc::c_int
 }
 
 fn dtrace_aggregate_walk_cb<F>(handle: *mut dtrace::dtrace_hdl, mut callback: F) -> libc::c_int
-    where F: FnMut(*const dtrace::dtrace_aggdata_t) -> libc::c_int
+where
+    F: FnMut(*const dtrace::dtrace_aggdata_t) -> libc::c_int,
 {
     let mut cb: &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> libc::c_int = &mut callback;
     let cb = &mut cb;
     unsafe {
-        dtrace::dtrace_aggregate_walk(handle, Some(dtrace_agg_walk_handler), cb as *mut _ as *mut libc::c_void)
+        dtrace::dtrace_aggregate_walk(
+            handle,
+            Some(dtrace_agg_walk_handler),
+            cb as *mut _ as *mut libc::c_void,
+        )
     }
 }
 
@@ -156,11 +155,22 @@ fn handle_record_mach_exception_raise(
 
                     unsafe {
                         if dtrace::dtrace_aggregate_snap(dtrace_handle) == -1 {
-                            warn!("dtrace_aggregate_snap failed: {}", CStr::from_ptr(dtrace::dtrace_errmsg(dtrace_handle, dtrace::dtrace_errno(dtrace_handle))).to_str().unwrap());
+                            warn!(
+                                "dtrace_aggregate_snap failed: {}",
+                                CStr::from_ptr(dtrace::dtrace_errmsg(
+                                    dtrace_handle,
+                                    dtrace::dtrace_errno(dtrace_handle)
+                                ))
+                                .to_str()
+                                .unwrap()
+                            );
                         }
                         let closure = |agg: *const dtrace::dtrace_aggdata_t| {
                             let desc = *((*agg).dtada_desc);
-                            let records: &[dtrace::dtrace_recdesc] = std::slice::from_raw_parts(&(*(*agg).dtada_desc).dtagd_rec as *const dtrace::dtrace_recdesc_t, (desc.dtagd_nrecs) as usize);
+                            let records: &[dtrace::dtrace_recdesc] = std::slice::from_raw_parts(
+                                &(*(*agg).dtada_desc).dtagd_rec as *const dtrace::dtrace_recdesc_t,
+                                (desc.dtagd_nrecs) as usize,
+                            );
                             let mut vals: Vec<u64> = vec![];
                             for rec in records {
                                 let ptr = ((*agg).dtada_data).offset(rec.dtrd_offset as isize);
@@ -187,7 +197,11 @@ fn handle_record_mach_exception_raise(
                         dtrace::dtrace_aggregate_clear(dtrace_handle);
                     }
 
-                    return Some(TraceLogEntry::Syscall(syscall::record_syscall(task_port, thread_port, clobbered_regs)));
+                    return Some(TraceLogEntry::Syscall(syscall::record_syscall(
+                        task_port,
+                        thread_port,
+                        clobbered_regs,
+                    )));
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", code);
@@ -210,11 +224,7 @@ struct Breakpoint {
     single_step: bool,
 }
 
-fn inject_code(
-    task_port: mach::mach_port_t,
-    pc: u64,
-    new_bytes: &[u8],
-) -> Vec<u8> {
+fn inject_code(task_port: mach::mach_port_t, pc: u64, new_bytes: &[u8]) -> Vec<u8> {
     unsafe {
         // RWX pages aren't allowed, so have to make it RW, write, then RX again
         mach_check_return(mach::mach_vm_protect(
@@ -223,34 +233,36 @@ fn inject_code(
             4,
             0,
             0x1 | 0x2 | 0x10, // VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY
-        )).unwrap();
+        ))
+        .unwrap();
 
         let mut orig_bytes: Vec<u8> = vec![0; 4];
         let mut copy_size: mach::mach_vm_size_t = 4;
-        
-        unsafe {
-            mach::mach_check_return(mach::mach_vm_read_overwrite(
-                task_port,
-                pc,
-                4,
-                orig_bytes.as_mut_ptr() as mach::mach_vm_address_t,
-                &mut copy_size,
-            )).unwrap();
-        }
+
+        mach::mach_check_return(mach::mach_vm_read_overwrite(
+            task_port,
+            pc,
+            4,
+            orig_bytes.as_mut_ptr() as mach::mach_vm_address_t,
+            &mut copy_size,
+        ))
+        .unwrap();
 
         mach_check_return(mach::mach_vm_write(
             task_port,
             pc,
             new_bytes.as_ptr() as mach::vm_offset_t,
             4,
-        )).unwrap();
+        ))
+        .unwrap();
         mach_check_return(mach::mach_vm_protect(
             task_port,
             pc,
             4,
             0,
             0x1 | 0x4, // VM_PROT_READ | VM_PROT_EXECUTE
-        )).unwrap();
+        ))
+        .unwrap();
 
         orig_bytes
     }
@@ -260,13 +272,18 @@ fn handle_replay_mach_exception_raise(
     expected_log: &TraceLogEntry,
     next_log: &Option<TraceLogEntry>,
     breakpoints: &mut HashMap<u64, Breakpoint>,
-    _exception_port: mach::mach_port_t,
-    thread_port: mach::mach_port_t,
-    task_port: mach::mach_port_t,
-    exception: mach::exception_type_t,
-    code: [i64; 2],
+    exception_request: &mig::__Request__mach_exception_raise_t,
 ) -> bool {
-    trace!("handle_replay_mach_exception_raise: exception: {}, code: {:?}", exception, code);
+    let thread_port = exception_request.thread.name;
+    let task_port = exception_request.task.name;
+    let exception = exception_request.exception;
+    let code = exception_request.code;
+
+    trace!(
+        "handle_replay_mach_exception_raise: exception: {}, code: {:?}",
+        exception,
+        code
+    );
     match exception {
         mach::EXC_BREAKPOINT => {
             let pc = code[1] as u64;
@@ -283,11 +300,15 @@ fn handle_replay_mach_exception_raise(
                         None => {}
                         Some(TraceLogEntry::Syscall(next_syscall)) => {
                             let next_pc = next_syscall.pc;
-                            let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
-                            breakpoints.insert(next_pc, Breakpoint {
-                                orig_bytes,
-                                single_step: false,
-                            });
+                            let orig_bytes =
+                                inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
+                            breakpoints.insert(
+                                next_pc,
+                                Breakpoint {
+                                    orig_bytes,
+                                    single_step: false,
+                                },
+                            );
                         }
                         _ => panic!("Unexpected log entry: {:?}", next_log),
                     }
@@ -298,7 +319,7 @@ fn handle_replay_mach_exception_raise(
 
             let syscall_handled = match expected_log {
                 TraceLogEntry::Syscall(expected_syscall) => {
-                    syscall::replay_syscall(task_port, thread_port, &expected_syscall)
+                    syscall::replay_syscall(task_port, thread_port, expected_syscall)
                 }
                 _ => panic!("Unexpected log entry: {:?}", expected_log),
             };
@@ -310,10 +331,13 @@ fn handle_replay_mach_exception_raise(
                     Some(TraceLogEntry::Syscall(next_syscall)) => {
                         let next_pc = next_syscall.pc;
                         let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
-                        breakpoints.insert(next_pc, Breakpoint {
-                            orig_bytes,
-                            single_step: false,
-                        });
+                        breakpoints.insert(
+                            next_pc,
+                            Breakpoint {
+                                orig_bytes,
+                                single_step: false,
+                            },
+                        );
                     }
                     _ => panic!("Unexpected log entry: {:?}", next_log),
                 }
@@ -324,10 +348,13 @@ fn handle_replay_mach_exception_raise(
                 inject_code(task_port, pc, orig.orig_bytes.as_slice());
                 trace!("adding breakpoint for single step at pc: {:x}", pc + 4);
                 let next = inject_code(task_port, pc + 4, &BREAKPOINT_INSTRUCTION);
-                breakpoints.insert(pc + 4, Breakpoint {
-                    orig_bytes: next,
-                    single_step: true,
-                });
+                breakpoints.insert(
+                    pc + 4,
+                    Breakpoint {
+                        orig_bytes: next,
+                        single_step: true,
+                    },
+                );
                 return false;
             }
         }
@@ -335,18 +362,22 @@ fn handle_replay_mach_exception_raise(
             match code {
                 [mach::EXC_SOFT_SIGNAL64, signum] => {
                     // only hit on first entry (when we're stopped at entry)?
-                    let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
+                    let _signal: Signal = unsafe { std::mem::transmute(signum as i32) };
                     // TODO: if signal != SIGSTOP, die?
 
                     // lay down a breakpoint at the next log's pc
                     match next_log {
                         Some(TraceLogEntry::Syscall(next_syscall)) => {
                             let next_pc = next_syscall.pc;
-                            let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
-                            breakpoints.insert(next_pc, Breakpoint {
-                                orig_bytes,
-                                single_step: false,
-                            });
+                            let orig_bytes =
+                                inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
+                            breakpoints.insert(
+                                next_pc,
+                                Breakpoint {
+                                    orig_bytes,
+                                    single_step: false,
+                                },
+                            );
                         }
                         _ => panic!("Unexpected log entry: {:?}", next_log),
                     }
@@ -365,8 +396,11 @@ fn handle_replay_mach_exception_raise(
 }
 
 /// Convert a vector of strings to a vector of C strings, including a null terminator.
-fn to_c_string_array(strings: &Vec<String>) -> Vec<*mut i8> {
-    let owned = strings.iter().map(|a| CString::new(a.as_bytes()).unwrap()).collect::<Vec<_>>();
+fn to_c_string_array(strings: &[String]) -> Vec<*mut i8> {
+    let owned = strings
+        .iter()
+        .map(|a| CString::new(a.as_bytes()).unwrap())
+        .collect::<Vec<_>>();
     let mut pointers: Vec<*mut i8> = owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
     pointers.push(std::ptr::null_mut());
 
@@ -380,7 +414,10 @@ fn spawn_target(target: &Target) -> nix::unistd::Pid {
         let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
         let res = libc::posix_spawnattr_init(&mut attr);
         if res != 0 {
-            panic!("posix_spawnattr_init failed: {}", std::io::Error::last_os_error());
+            panic!(
+                "posix_spawnattr_init failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         let res = libc::posix_spawnattr_setflags(
@@ -388,7 +425,10 @@ fn spawn_target(target: &Target) -> nix::unistd::Pid {
             (libc::POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR) as i16,
         );
         if res != 0 {
-            panic!("posix_spawnattr_setflags failed: {}", std::io::Error::last_os_error());
+            panic!(
+                "posix_spawnattr_setflags failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
         let executable = CString::new(target.executable.clone()).unwrap();
@@ -403,12 +443,12 @@ fn spawn_target(target: &Target) -> nix::unistd::Pid {
             std::ptr::null(),
             &attr,
             argv.as_ptr(),
-            env.as_ptr(),  // TODO
+            env.as_ptr(), // TODO
         );
         if res != 0 {
             panic!("posix_spawn failed: {}", std::io::Error::last_os_error());
         }
-    
+
         nix::unistd::Pid::from_raw(pid)
     }
 }
@@ -416,10 +456,10 @@ fn spawn_target(target: &Target) -> nix::unistd::Pid {
 fn record(args: &RecordArgs) {
     let mut output = File::create(&args.trace_filename).unwrap();
 
-    let target = Target{
+    let target = Target {
         executable: args.executable.clone(),
         arguments: args.arguments.clone(),
-        environment: vec![],  // TODO
+        environment: vec![], // TODO
     };
 
     let child = spawn_target(&target);
@@ -430,7 +470,7 @@ fn record(args: &RecordArgs) {
 
     let dtrace_handle = unsafe {
         let mut err: i32 = 0;
-        let dtrace_handle = dtrace::dtrace_open(3, 0, &mut err); 
+        let dtrace_handle = dtrace::dtrace_open(3, 0, &mut err);
         if dtrace_handle.is_null() {
             panic!("dtrace_open failed: {}", err);
         }
@@ -531,14 +571,17 @@ fn record(args: &RecordArgs) {
                     break;
                 }
                 mig::MACH_EXCEPTION_RAISE => {
-                    (*reply_header).msgh_bits = (*request_header).msgh_bits & mig::MACH_MSGH_BITS_REMOTE_MASK;
+                    (*reply_header).msgh_bits =
+                        (*request_header).msgh_bits & mig::MACH_MSGH_BITS_REMOTE_MASK;
                     (*reply_header).msgh_remote_port = (*request_header).msgh_remote_port;
-                    (*reply_header).msgh_size = std::mem::size_of::<mig::__Reply__mach_exception_raise_t>() as u32;
+                    (*reply_header).msgh_size =
+                        std::mem::size_of::<mig::__Reply__mach_exception_raise_t>() as u32;
                     (*reply_header).msgh_local_port = mach::MACH_PORT_NULL;
                     (*reply_header).msgh_id = (*request_header).msgh_id + 100;
                     (*reply_header).msgh_voucher_port = 0;
 
-                    let exception_request = *(request_header as *const _ as *const mig::__Request__mach_exception_raise_t);
+                    let exception_request = *(request_header as *const _
+                        as *const mig::__Request__mach_exception_raise_t);
                     let log_entry = handle_record_mach_exception_raise(
                         dtrace_handle,
                         exception_request.Head.msgh_local_port,
@@ -550,7 +593,8 @@ fn record(args: &RecordArgs) {
                     serde_json::to_writer(&mut output, &log_entry).unwrap();
                     output.write_all(b"\n").unwrap();
 
-                    let mut exception_reply = &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
+                    let mut exception_reply =
+                        &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
                     (*exception_reply).RetCode = mach::KERN_SUCCESS;
                     (*exception_reply).NDR = mig::NDR_record;
                 }
@@ -583,7 +627,10 @@ fn record(args: &RecordArgs) {
 }
 
 fn replay(args: &ReplayArgs) {
-    let mut trace = serde_json::Deserializer::from_reader(File::open(&args.trace_filename).unwrap()).into_iter::<TraceLogEntry>().map(|x| x.unwrap());
+    let mut trace =
+        serde_json::Deserializer::from_reader(File::open(&args.trace_filename).unwrap())
+            .into_iter::<TraceLogEntry>()
+            .map(|x| x.unwrap());
     let target = match trace.next().unwrap() {
         TraceLogEntry::Target(target) => target,
         _ => panic!("First entry in trace must be Target"),
@@ -595,7 +642,7 @@ fn replay(args: &ReplayArgs) {
     let child = spawn_target(&target);
     info!("Child pid {}", child);
 
-    let (task_port, exception_port) = mach::mrr_set_exception_port(child);
+    let (_task_port, exception_port) = mach::mrr_set_exception_port(child);
 
     ptrace_attachexc(child).unwrap();
     trace!("Attached");
@@ -628,26 +675,26 @@ fn replay(args: &ReplayArgs) {
                     break;
                 }
                 mig::MACH_EXCEPTION_RAISE => {
-                    (*reply_header).msgh_bits = (*request_header).msgh_bits & mig::MACH_MSGH_BITS_REMOTE_MASK;
+                    (*reply_header).msgh_bits =
+                        (*request_header).msgh_bits & mig::MACH_MSGH_BITS_REMOTE_MASK;
                     (*reply_header).msgh_remote_port = (*request_header).msgh_remote_port;
-                    (*reply_header).msgh_size = std::mem::size_of::<mig::__Reply__mach_exception_raise_t>() as u32;
+                    (*reply_header).msgh_size =
+                        std::mem::size_of::<mig::__Reply__mach_exception_raise_t>() as u32;
                     (*reply_header).msgh_local_port = mach::MACH_PORT_NULL;
                     (*reply_header).msgh_id = (*request_header).msgh_id + 100;
                     (*reply_header).msgh_voucher_port = 0;
 
-                    let exception_request = *(request_header as *const _ as *const mig::__Request__mach_exception_raise_t);
+                    let exception_request = *(request_header as *const _
+                        as *const mig::__Request__mach_exception_raise_t);
                     advance = handle_replay_mach_exception_raise(
                         &this_entry,
                         &next_entry,
                         &mut breakpoints,
-                        exception_request.Head.msgh_local_port,
-                        exception_request.thread.name,
-                        exception_request.task.name,
-                        exception_request.exception,
-                        exception_request.code,
+                        &exception_request,
                     );
 
-                    let mut exception_reply = &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
+                    let mut exception_reply =
+                        &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
                     (*exception_reply).RetCode = mach::KERN_SUCCESS;
                     (*exception_reply).NDR = mig::NDR_record;
                 }
@@ -688,7 +735,7 @@ fn main() {
     env_logger::Builder::new()
         .filter_level(args.verbose.log_level_filter())
         .init();
-    
+
     match args.command {
         Command::Record(args) => {
             record(&args);

@@ -1,9 +1,9 @@
-#![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, unused)]
-
-use log::{debug, error, info, trace, warn};
+use log::trace;
 use std::ffi::CStr;
 
-include!(concat!(env!("OUT_DIR"), "/mach.rs"));
+mod bindings;
+pub use bindings::*;
+pub mod mig;
 
 // Make destructuring of code easier
 pub const EXC_SOFT_SIGNAL64: i64 = EXC_SOFT_SIGNAL as i64;
@@ -28,9 +28,7 @@ pub fn mach_check_return(r: kern_return_t) -> Result<(), &'static str> {
 
 // Defined as a macro, guessing that's why it's not in the bindings?
 pub fn mach_task_self() -> mach_port_t {
-    unsafe {
-        mach_task_self_
-    }
+    unsafe { mach_task_self_ }
 }
 
 // https://www.spaceflint.com/?p=150
@@ -40,12 +38,7 @@ pub fn mrr_set_exception_port(child: nix::unistd::Pid) -> (task_t, mach_port_nam
     let mut exception_port: mach_port_name_t = 0;
 
     unsafe {
-        mach_check_return(task_for_pid(
-            mach_task_self(),
-            child.into(),
-            &mut task_port,
-        ))
-        .unwrap();
+        mach_check_return(task_for_pid(mach_task_self(), child.into(), &mut task_port)).unwrap();
         trace!("task_port: {}", task_port);
 
         mach_check_return(mach_port_allocate(
@@ -67,9 +60,8 @@ pub fn mrr_set_exception_port(child: nix::unistd::Pid) -> (task_t, mach_port_nam
             task_port,
             EXC_MASK_ALL,
             exception_port,
-            (EXCEPTION_DEFAULT
-                | MACH_EXCEPTION_CODES) as i32,
-            THREAD_STATE_NONE,  // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
+            (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as i32,
+            THREAD_STATE_NONE, // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
         ))
         .unwrap();
         trace!("set exception port");
@@ -97,10 +89,11 @@ pub fn mrr_get_regs(thread_port: mach_port_t) -> arm_thread_state64_t {
         let mut count: u32 = (std::mem::size_of::<arm_thread_state64_t>() / 4) as u32;
         mach_check_return(thread_get_state(
             thread_port,
-            ARM_THREAD_STATE64 as i32,
+            ARM_THREAD_STATE64,
             &mut regs as *mut _ as thread_state_t,
             &mut count,
-        )).unwrap();
+        ))
+        .unwrap();
         regs
     }
 }
@@ -108,12 +101,13 @@ pub fn mrr_get_regs(thread_port: mach_port_t) -> arm_thread_state64_t {
 pub fn mrr_set_regs(thread_port: mach_port_t, regs: arm_thread_state64_t) {
     unsafe {
         // This is still specified in terms of u32's (size=4). Guess it's a legacy thing?
-        let mut count: u32 = (std::mem::size_of::<arm_thread_state64_t>() / 4) as u32;
+        let count: u32 = (std::mem::size_of::<arm_thread_state64_t>() / 4) as u32;
         mach_check_return(thread_set_state(
             thread_port,
-            ARM_THREAD_STATE64 as i32,
+            ARM_THREAD_STATE64,
             &regs as *const _ as thread_state_t,
             count,
-        )).unwrap();
+        ))
+        .unwrap();
     }
 }

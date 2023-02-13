@@ -17,7 +17,7 @@ const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
 
 mod dtrace;
 mod mach;
-mod syscall;
+mod recordable;
 
 /// mRR, the macOS Record Replay Debugger
 #[derive(Parser)]
@@ -86,8 +86,9 @@ fn test_args() {
 #[derive(Serialize, Deserialize, Debug)]
 enum TraceLogEntry {
     Target(Target),
-    Syscall(syscall::Syscall),
-    MachSyscall(syscall::MachSyscall),
+    Syscall(recordable::syscall::Syscall),
+    MachTrap(recordable::mach_trap::MachTrap),
+    Scheduling(recordable::scheduling::Scheduling),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -114,8 +115,9 @@ extern "C" fn dtrace_agg_walk_handler(
     agg: *const dtrace::dtrace_aggdata_t,
     arg: *mut libc::c_void,
 ) -> libc::c_int {
-    let closure: &mut &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> bool =
-        unsafe { &mut *(arg as *mut &mut dyn std::ops::FnMut(*const dtrace::dtrace_aggdata) -> bool) };
+    let closure: &mut &mut dyn FnMut(*const dtrace::dtrace_aggdata_t) -> bool = unsafe {
+        &mut *(arg as *mut &mut dyn std::ops::FnMut(*const dtrace::dtrace_aggdata) -> bool)
+    };
     closure(agg) as libc::c_int
 }
 
@@ -152,7 +154,13 @@ fn handle_record_mach_exception_raise(
                     // TODO: if signal != SIGSTOP, record
 
                     let mut clobbered_regs: [u64; 2] = [0; 2];
+                    let mut provider: String = String::new();
 
+                    // This is entirely a hack.
+                    // Aggregates obviously aren't supposed to be used this way,
+                    // however it's much easier to request getting data from aggregates on-demand
+                    // compared to getting data from the principal buffer.
+                    // This also means we don't have to do any string->int decoding, so that's nice.
                     unsafe {
                         if dtrace::dtrace_aggregate_snap(dtrace_handle) == -1 {
                             warn!(
@@ -184,7 +192,9 @@ fn handle_record_mach_exception_raise(
                             }
                             let aggname = CStr::from_ptr(desc.dtagd_name).to_str().unwrap();
                             //trace!("dtrace agg {} vals: {:?}", aggname, vals);
+                            // Only record aggregate keys which have a value set (i.e. were hit)
                             if vals[2] != 0 {
+                                provider = CStr::from_ptr((*(*agg).dtada_pdesc).dtpd_provider.as_ptr()).to_owned().into_string().unwrap();
                                 match aggname {
                                     "r0" => clobbered_regs[0] = vals[1],
                                     "r1" => clobbered_regs[1] = vals[1],
@@ -197,23 +207,38 @@ fn handle_record_mach_exception_raise(
                         dtrace::dtrace_aggregate_clear(dtrace_handle);
                     }
 
-                    return Some(TraceLogEntry::Syscall(syscall::record_syscall(
-                        task_port,
-                        thread_port,
-                        clobbered_regs,
-                    )));
+                    match provider.as_str() {
+                        "syscall" => {
+                            Some(TraceLogEntry::Syscall(recordable::syscall::record_syscall(
+                                task_port,
+                                thread_port,
+                                clobbered_regs,
+                            )))
+                        }
+                        "mach_trap" => {
+                            Some(TraceLogEntry::MachTrap(recordable::mach_trap::record_mach_trap(
+                                task_port,
+                                thread_port,
+                                clobbered_regs,
+                            )))
+                        }
+                        _ => {
+                            error!("Unexpected dtrace probe provider: '{}'", provider);
+                            None
+                        }
+                    }
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", code);
+                    None
                 }
             }
         }
         _ => {
             info!("Unhandled exception type: {}", exception);
+            None
         }
-    };
-
-    None
+    }
 }
 
 const BREAKPOINT_INSTRUCTION: [u8; 4] = [0x00, 0x00, 0x20, 0xd4];
@@ -319,7 +344,10 @@ fn handle_replay_mach_exception_raise(
 
             let syscall_handled = match expected_log {
                 TraceLogEntry::Syscall(expected_syscall) => {
-                    syscall::replay_syscall(task_port, thread_port, expected_syscall)
+                    recordable::syscall::replay_syscall(task_port, thread_port, expected_syscall)
+                }
+                TraceLogEntry::MachTrap(expected_mach_trap) => {
+                    recordable::mach_trap::replay_mach_trap(task_port, thread_port, expected_mach_trap)
                 }
                 _ => panic!("Unexpected log entry: {:?}", expected_log),
             };
@@ -507,30 +535,98 @@ fn record(args: &RecordArgs) {
             panic!("dtrace_setopt(destructive) failed: {}", err);
         }
 
-        // arm64 syscalls can return 2 results in x0 and x1
-        let program = CString::new(format!(
-            "syscall:::entry /pid == {}/ {{ @r0[uregs[0]] = count(); @r1[uregs[1]] = count(); raise(SIGSTOP); }}",
-            child
-        )).unwrap();
-        trace!("DTrace program: {}", program.to_str().unwrap());
+        // Syscalls
+        {
+            // arm64 syscalls can return 2 results in x0 and x1
+            // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/arm/systemcalls.c#L518
+            let program = CString::new(format!(
+                "syscall:::entry /pid == {}/ {{ @r0[uregs[0]] = count(); @r1[uregs[1]] = count(); raise(SIGSTOP); }}",
+                child
+            )).unwrap();
+            trace!("DTrace program: {}", program.to_str().unwrap());
 
-        let prog = dtrace::dtrace_program_strcompile(
-            dtrace_handle,
-            program.as_ptr(),
-            dtrace::dtrace_probespec_DTRACE_PROBESPEC_NAME,
-            0,
-            0,
-            std::ptr::null(),
-        );
-        if prog.is_null() {
-            let err = dtrace::dtrace_errno(dtrace_handle);
-            panic!("dtrace_program_strcompile failed: {}", err);
+            let prog = dtrace::dtrace_program_strcompile(
+                dtrace_handle,
+                program.as_ptr(),
+                dtrace::dtrace_probespec_DTRACE_PROBESPEC_NAME,
+                0,
+                0,
+                std::ptr::null(),
+            );
+            if prog.is_null() {
+                let errno = dtrace::dtrace_errno(dtrace_handle);
+                let err = String::from_utf8_lossy(CStr::from_ptr(dtrace::dtrace_errmsg(dtrace_handle, errno)).to_bytes()).to_string();
+                panic!("dtrace_program_strcompile failed: {} ({})", err, errno);
+            }
+
+            let mut pip: dtrace::dtrace_proginfo_t = std::mem::zeroed();
+            if dtrace::dtrace_program_exec(dtrace_handle, prog, &mut pip) != 0 {
+                let err = dtrace::dtrace_errno(dtrace_handle);
+                panic!("dtrace_program_exec failed: {}", err);
+            }
         }
 
-        let mut pip: dtrace::dtrace_proginfo_t = std::mem::zeroed();
-        if dtrace::dtrace_program_exec(dtrace_handle, prog, &mut pip) != 0 {
-            let err = dtrace::dtrace_errno(dtrace_handle);
-            panic!("dtrace_program_exec failed: {}", err);
+        // Mach Traps
+        {
+            // Mach traps/syscalls only return one value in x0
+            let program = CString::new(format!(
+                "mach_trap:::entry /pid == {}/ {{ @r0[uregs[0]] = count(); raise(SIGSTOP); }}",
+                child
+            ))
+            .unwrap();
+            trace!("DTrace program: {}", program.to_str().unwrap());
+
+            let prog = dtrace::dtrace_program_strcompile(
+                dtrace_handle,
+                program.as_ptr(),
+                dtrace::dtrace_probespec_DTRACE_PROBESPEC_NAME,
+                0,
+                0,
+                std::ptr::null(),
+            );
+            if prog.is_null() {
+                let errno = dtrace::dtrace_errno(dtrace_handle);
+                let err = String::from_utf8_lossy(CStr::from_ptr(dtrace::dtrace_errmsg(dtrace_handle, errno)).to_bytes()).to_string();
+                panic!("dtrace_program_strcompile failed: {} ({})", err, errno);
+            }
+
+            let mut pip: dtrace::dtrace_proginfo_t = std::mem::zeroed();
+            if dtrace::dtrace_program_exec(dtrace_handle, prog, &mut pip) != 0 {
+                let err = dtrace::dtrace_errno(dtrace_handle);
+                panic!("dtrace_program_exec failed: {}", err);
+            }
+        }
+
+        // Library interception
+        // TODO: these should just be breakpoints
+        {
+            // Don't need to record any regs
+            let program = CString::new(format!(
+                "pid{}:libsystem_kernel.dylib:mach_absolute_time:entry {{ @dummy[0] = count(); raise(SIGSTOP); }}",
+                child
+            ))
+            .unwrap();
+            trace!("DTrace program: {}", program.to_str().unwrap());
+
+            let prog = dtrace::dtrace_program_strcompile(
+                dtrace_handle,
+                program.as_ptr(),
+                dtrace::dtrace_probespec_DTRACE_PROBESPEC_NAME,
+                0,
+                0,
+                std::ptr::null(),
+            );
+            if prog.is_null() {
+                let errno = dtrace::dtrace_errno(dtrace_handle);
+                let err = String::from_utf8_lossy(CStr::from_ptr(dtrace::dtrace_errmsg(dtrace_handle, errno)).to_bytes()).to_string();
+                panic!("dtrace_program_strcompile failed: {} ({})", err, errno);
+            }
+
+            let mut pip: dtrace::dtrace_proginfo_t = std::mem::zeroed();
+            if dtrace::dtrace_program_exec(dtrace_handle, prog, &mut pip) != 0 {
+                let err = dtrace::dtrace_errno(dtrace_handle);
+                panic!("dtrace_program_exec failed: {}", err);
+            }
         }
 
         if dtrace::dtrace_go(dtrace_handle) != 0 {

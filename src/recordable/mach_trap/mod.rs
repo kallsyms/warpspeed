@@ -21,7 +21,7 @@ pub struct MachTrap {
 pub fn record_mach_trap(
     task_port: mach::mach_port_t,
     thread_port: mach::mach_port_t,
-    clobbered_regs: [u64; 2],
+    clobbered_regs: [u64; 1],
 ) -> MachTrap {
     let mut regs = mach::mrr_get_regs(thread_port);
 

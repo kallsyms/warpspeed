@@ -18,7 +18,7 @@ mod dtrace;
 mod mach;
 mod recordable;
 
-use recordable::Recordable;
+use recordable::{Recordable, Event};
 
 /// mRR, the macOS Record Replay Debugger
 #[derive(Parser)]
@@ -121,7 +121,14 @@ fn handle_record_mach_exception_raise(
                     // TODO: if signal != SIGSTOP, record
 
                     if signal == Signal::SIGSTOP {
-                        dtrace.dispatch(task_port, thread_port)
+                        if let Some(event) = dtrace.dispatch(task_port, thread_port) {
+                            Some(Recordable {
+                                pc: mach::mrr_get_regs(thread_port).__pc - 4,
+                                event,
+                            })
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -191,6 +198,22 @@ fn inject_code(task_port: mach::mach_port_t, pc: u64, new_bytes: &[u8]) -> Vec<u
     }
 }
 
+fn bp_next(
+    next_log: &Option<Recordable>,
+    breakpoints: &mut HashMap<u64, Breakpoint>,
+    task_port: mach::mach_port_t,
+) {
+    if let Some(next_log) = next_log {
+        trace!("adding bp for next log at {:x}", next_log.pc);
+        let next_pc = next_log.pc;
+        let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
+        breakpoints.insert(next_pc, Breakpoint {
+            orig_bytes,
+            single_step: false,
+        });
+    }
+}
+
 fn handle_replay_mach_exception_raise(
     expected_log: &Recordable,
     next_log: &Option<Recordable>,
@@ -202,49 +225,32 @@ fn handle_replay_mach_exception_raise(
     let exception = exception_request.exception;
     let code = exception_request.code;
 
-    trace!(
-        "handle_replay_mach_exception_raise: exception: {}, code: {:?}",
-        exception,
-        code
-    );
     match exception {
         mach::EXC_BREAKPOINT => {
             let pc = code[1] as u64;
+            trace!("handle_replay_mach_exception_raise: breakpoint at {:x}", pc);
 
-            //trace!("breakpoints: {:?}", breakpoints);
             if let Some(bp) = breakpoints.get(&pc) {
                 if bp.single_step {
                     trace!("continuing after single step");
                     inject_code(task_port, pc, &bp.orig_bytes);
                     breakpoints.remove(&pc);
 
-                    // lay down a breakpoint at the next log's pc
-                    match next_log {
-                        None => {}
-                        Some(Recordable::Syscall(next_syscall)) => {
-                            let next_pc = next_syscall.pc;
-                            let orig_bytes =
-                                inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
-                            breakpoints.insert(
-                                next_pc,
-                                Breakpoint {
-                                    orig_bytes,
-                                    single_step: false,
-                                },
-                            );
-                        }
-                        _ => panic!("Unexpected log entry: {:?}", next_log),
-                    }
+                    bp_next(next_log, breakpoints, task_port);
 
                     return true;
                 }
             }
 
-            let syscall_handled = match expected_log {
-                Recordable::Syscall(expected_syscall) => {
+            if pc != expected_log.pc {
+                panic!("PC mismatch: {:x} != {:x}", pc, expected_log.pc);
+            }
+
+            let event_handled = match &expected_log.event {
+                Event::Syscall(expected_syscall) => {
                     recordable::syscall::replay_syscall(task_port, thread_port, expected_syscall)
                 }
-                Recordable::MachTrap(expected_mach_trap) => {
+                Event::MachTrap(expected_mach_trap) => {
                     recordable::mach_trap::replay_mach_trap(
                         task_port,
                         thread_port,
@@ -254,34 +260,28 @@ fn handle_replay_mach_exception_raise(
                 _ => panic!("Unexpected log entry: {:?}", expected_log),
             };
 
-            if syscall_handled {
-                // lay down a breakpoint at the next log's pc
-                match next_log {
-                    None => {}
-                    Some(Recordable::Syscall(next_syscall)) => {
-                        let next_pc = next_syscall.pc;
-                        let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
-                        breakpoints.insert(
-                            next_pc,
-                            Breakpoint {
-                                orig_bytes,
-                                single_step: false,
-                            },
-                        );
-                    }
-                    _ => panic!("Unexpected log entry: {:?}", next_log),
-                }
+            if event_handled {
+                // handler mutated the program state to replay the event, now bump the pc over the svc,
+                // and lay down a breakpoint for the next event.
+                let mut regs = mach::mrr_get_regs(thread_port);
+                regs.__pc += 4;
+                mach::mrr_set_regs(thread_port, regs);
+
+                bp_next(next_log, breakpoints, task_port);
             } else {
-                // restore this (syscall) instruction, break at next instruction, then restore it and continue
-                // basically single step
+                // replay didn't do anything, so we need to restore this (now breakpoint) instruction back to
+                // it's original svc/syscall instruction and re-run it.
+                // N.B. we don't just restore the insn and set the next bp, as the next bp might be the same address,
+                // undoing the restore. Instead, we set a single step bp at the next insn, then proceed with setting the next bp.
+                // TODO: optimize to check if next log is this same pc, and only do this single step if so.
                 let orig = &breakpoints[&pc];
                 inject_code(task_port, pc, orig.orig_bytes.as_slice());
                 trace!("adding breakpoint for single step at pc: {:x}", pc + 4);
-                let next = inject_code(task_port, pc + 4, &BREAKPOINT_INSTRUCTION);
+                let next_insn = inject_code(task_port, pc + 4, &BREAKPOINT_INSTRUCTION);
                 breakpoints.insert(
                     pc + 4,
                     Breakpoint {
-                        orig_bytes: next,
+                        orig_bytes: next_insn,
                         single_step: true,
                     },
                 );
@@ -291,26 +291,14 @@ fn handle_replay_mach_exception_raise(
         mach::EXC_SOFTWARE => {
             match code {
                 [mach::EXC_SOFT_SIGNAL64, signum] => {
-                    // only hit on first entry (when we're stopped at entry)?
-                    let _signal: Signal = unsafe { std::mem::transmute(signum as i32) };
-                    // TODO: if signal != SIGSTOP, die?
-
-                    // lay down a breakpoint at the next log's pc
-                    match next_log {
-                        Some(Recordable::Syscall(next_syscall)) => {
-                            let next_pc = next_syscall.pc;
-                            let orig_bytes =
-                                inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
-                            breakpoints.insert(
-                                next_pc,
-                                Breakpoint {
-                                    orig_bytes,
-                                    single_step: false,
-                                },
-                            );
-                        }
-                        _ => panic!("Unexpected log entry: {:?}", next_log),
+                    // should only be hit on first entry (when we're stopped at entry)
+                    // TODO: handle replaying other signals
+                    let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
+                    if signal != Signal::SIGSTOP {
+                        panic!("Unexpected signal in replay: {:?}", signal);
                     }
+
+                    bp_next(next_log, breakpoints, task_port);
                 }
                 _ => {
                     info!("Unhandled EXC_SOFTWARE code: {:?}", code);
@@ -409,7 +397,7 @@ fn record(args: &RecordArgs) {
     );
     dtrace.register_program(dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")), &program, |task_port, thread_port, data| {
         let clobbered_regs: [u64; 2] = [data[0], data[1]];
-        Some(Recordable::Syscall(recordable::syscall::record_syscall(task_port, thread_port, clobbered_regs)))
+        Some(Event::Syscall(recordable::syscall::record_syscall(task_port, thread_port, clobbered_regs)))
     }).unwrap();
 
     // Mach Traps
@@ -420,7 +408,7 @@ fn record(args: &RecordArgs) {
     );
     dtrace.register_program(dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")), &program, |task_port, thread_port, data| {
         let clobbered_regs: [u64; 1] = [data[0]];
-        Some(Recordable::MachTrap(recordable::mach_trap::record_mach_trap(task_port, thread_port, clobbered_regs)))
+        Some(Event::MachTrap(recordable::mach_trap::record_mach_trap(task_port, thread_port, clobbered_regs)))
     }).unwrap();
 
     // Library interception

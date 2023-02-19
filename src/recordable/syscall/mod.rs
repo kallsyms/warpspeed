@@ -14,7 +14,6 @@ enum SyscallData {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Syscall {
-    pub pc: u64,
     syscall_number: u32,
     data: SyscallData,
 }
@@ -30,7 +29,6 @@ pub fn record_syscall(
 
     regs.__x[0] = clobbered_regs[0];
     regs.__x[1] = clobbered_regs[1];
-    regs.__pc -= 4;
 
     trace!("regs {:x?}", regs);
 
@@ -55,7 +53,6 @@ pub fn record_syscall(
             }
 
             Syscall {
-                pc: regs.__pc,
                 syscall_number,
                 data: SyscallData::Read {
                     data: data[..ret_vals[0] as usize].to_vec(),
@@ -65,7 +62,6 @@ pub fn record_syscall(
         sysno::SYS_write => {
             // capture retval
             Syscall {
-                pc: regs.__pc,
                 syscall_number,
                 data: SyscallData::ReturnOnly { ret_vals },
             }
@@ -77,7 +73,6 @@ pub fn record_syscall(
             // This readjusts PC back forwards, but will need to be fixed properly (upstream?)
             // since syscall "0" is a valid syscall (indirect syscall).
             Syscall {
-                pc: regs.__pc + 4,
                 syscall_number,
                 data: SyscallData::Unhandled,
             }
@@ -85,7 +80,6 @@ pub fn record_syscall(
         _ => {
             warn!("Unhandled syscall {}", syscall_number);
             Syscall {
-                pc: regs.__pc,
                 syscall_number,
                 data: SyscallData::Unhandled,
             }
@@ -99,10 +93,6 @@ pub fn replay_syscall(
     syscall: &Syscall,
 ) -> bool {
     let mut regs = mach::mrr_get_regs(thread_port);
-
-    if regs.__pc != syscall.pc {
-        panic!("PC mismatch: {:x} != {:x}", regs.__pc, syscall.pc);
-    }
 
     if regs.__x[16] as u32 != syscall.syscall_number {
         panic!(
@@ -130,12 +120,10 @@ pub fn replay_syscall(
                 "Unhandled syscall {}, not intercepting",
                 syscall.syscall_number
             );
-            // TODO: restore original instruction which SVC overwrote
             return false;
         }
     }
 
-    regs.__pc += 4;
     mach::mrr_set_regs(thread_port, regs);
 
     true

@@ -3,7 +3,7 @@ use log::{trace, debug, info, warn, error};
 use nix::libc;
 
 use crate::mach;
-use crate::recordable::Recordable;
+use crate::recordable::Event;
 
 mod bindings;
 
@@ -85,7 +85,7 @@ impl ProbeDescription {
     }
 }
 
-type ProbeCallback = dyn Fn(mach::mach_port_t, mach::mach_port_t, &Vec<u64>) -> Option<Recordable>;
+type ProbeCallback = dyn Fn(mach::mach_port_t, mach::mach_port_t, &Vec<u64>) -> Option<Event>;
 
 pub struct DTraceManager {
     handle: *mut bindings::dtrace_hdl,
@@ -143,7 +143,7 @@ impl DTraceManager {
 
     pub fn register_program<F>(&mut self, probe_description: ProbeDescription, program: &str, callback: F) -> Result<(), String> 
     where
-        F: Fn(mach::mach_port_t, mach::mach_port_t, &Vec<u64>) -> Option<Recordable> + 'static,
+        F: Fn(mach::mach_port_t, mach::mach_port_t, &Vec<u64>) -> Option<Event> + 'static,
     {
         let program_cstr = CString::new(probe_description.to_program_description() + program).unwrap();
         debug!("register_program: {}", program_cstr.to_str().unwrap());
@@ -185,7 +185,7 @@ impl DTraceManager {
         }
     }
 
-    pub fn dispatch(&self, task_port: mach::mach_port_t, thread_port: mach::mach_port_t) -> Option<Recordable> {
+    pub fn dispatch(&self, task_port: mach::mach_port_t, thread_port: mach::mach_port_t) -> Option<Event> {
         // We should only expect 1 line of output per call to dtrace_consume
         let mut trace_data: Vec<u64> = vec![];
         let mut probe_description: Option<bindings::dtrace_probedesc_t> = None;

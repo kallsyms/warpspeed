@@ -13,7 +13,6 @@ enum MachTrapData {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MachTrap {
-    pub pc: u64,
     trap_number: u32,
     data: MachTrapData,
 }
@@ -28,23 +27,21 @@ pub fn record_mach_trap(
     let ret_val: u64 = regs.__x[0];
 
     regs.__x[0] = clobbered_regs[0];
-    regs.__pc -= 4;
 
     trace!("regs {:x?}", regs);
 
+    // We treat the trap number as the positive version of the actual number passed in
     let trap_number: u32 = (-(regs.__x[16] as i64)) as u32;
 
     match trap_number {
         trapno::MACH_ARM_TRAP_ABSTIME => {
             MachTrap {
-                pc: regs.__pc,
                 trap_number,
                 data: MachTrapData::ReturnOnly { ret_val },
             }
         }
         trapno::MACH_ARM_TRAP_CONTTIME => {
             MachTrap {
-                pc: regs.__pc,
                 trap_number,
                 data: MachTrapData::ReturnOnly { ret_val },
             }
@@ -65,7 +62,6 @@ pub fn record_mach_trap(
             }
 
             MachTrap {
-                pc: regs.__pc,
                 trap_number,
                 data: MachTrapData::Timebase { data },
             }
@@ -73,7 +69,6 @@ pub fn record_mach_trap(
         _ => {
             warn!("Unhandled mach trap {}", trap_number);
             MachTrap {
-                pc: regs.__pc,
                 trap_number,
                 data: MachTrapData::Unhandled,
             }
@@ -88,11 +83,9 @@ pub fn replay_mach_trap(
 ) -> bool {
     let mut regs = mach::mrr_get_regs(thread_port);
 
-    if regs.__pc != trap.pc {
-        panic!("PC mismatch: {:x} != {:x}", regs.__pc, trap.pc);
-    }
+    let trap_number: u32 = (-(regs.__x[16] as i64)) as u32;
 
-    if regs.__x[16] as u32 != trap.trap_number {
+    if trap_number != trap.trap_number {
         panic!(
             "Trap number mismatch: {:x} != {:x}",
             regs.__x[16], trap.trap_number
@@ -102,10 +95,9 @@ pub fn replay_mach_trap(
     match &trap.data {
         MachTrapData::Unhandled => {
             warn!(
-                "Unhandled trap {}, not intercepting",
+                "Unhandled trap {}, not replaying",
                 trap.trap_number
             );
-            // TODO: restore original instruction which SVC overwrote
             return false;
         }
         MachTrapData::ReturnOnly { ret_val } => {
@@ -124,7 +116,6 @@ pub fn replay_mach_trap(
         }
     }
 
-    regs.__pc += 4;
     mach::mrr_set_regs(thread_port, regs);
 
     true

@@ -95,6 +95,7 @@ fn main() {
     // DTrace
     bindgen::Builder::default()
         .header(sdkroot.join("usr/include/dtrace.h").to_str().unwrap())
+        .derive_eq(true)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .generate()
         .expect("Unable to generate dtrace bindings")

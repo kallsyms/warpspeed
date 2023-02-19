@@ -404,25 +404,22 @@ fn record(args: &RecordArgs) {
     // arm64 syscalls can return 2 results in x0 and x1
     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/arm/systemcalls.c#L518
     let program = format!(
-        "/pid == {}/ {{ @r0[uregs[0]] = count(); @r1[uregs[1]] = count(); raise(SIGSTOP); }}",
+        "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); raise(SIGSTOP); }}",
         child
     );
-    dtrace.register_program(dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")), &program, |task_port, thread_port, aggdata| {
-        let clobbered_regs: [u64; 2] = [aggdata["r0"], aggdata["r1"]];
+    dtrace.register_program(dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")), &program, |task_port, thread_port, data| {
+        let clobbered_regs: [u64; 2] = [data[0], data[1]];
         Some(Recordable::Syscall(recordable::syscall::record_syscall(task_port, thread_port, clobbered_regs)))
     }).unwrap();
 
     // Mach Traps
     // Mach traps/syscalls only return one value in x0
     let program = format!(
-        "/pid == {}/ {{ @r0[uregs[0]] = count(); raise(SIGSTOP); }}",
+        "/pid == {}/ {{ trace(uregs[0]); raise(SIGSTOP); }}",
         child
     );
-    dtrace.register_program(dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")), &program, |task_port, thread_port, aggdata| {
-        let clobbered_regs: [u64; 1] = [aggdata["r0"]];
-        if aggdata.len() != 1 {
-            panic!("Unexpected number of registers clobbered by mach trap: {:?}", aggdata);
-        }
+    dtrace.register_program(dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")), &program, |task_port, thread_port, data| {
+        let clobbered_regs: [u64; 1] = [data[0]];
         Some(Recordable::MachTrap(recordable::mach_trap::record_mach_trap(task_port, thread_port, clobbered_regs)))
     }).unwrap();
 
@@ -488,8 +485,10 @@ fn record(args: &RecordArgs) {
                         exception_request.exception,
                         exception_request.code,
                     );
-                    serde_json::to_writer(&mut output, &log_entry).unwrap();
-                    output.write_all(b"\n").unwrap();
+                    if log_entry.is_some() {
+                        serde_json::to_writer(&mut output, &log_entry.unwrap()).unwrap();
+                        output.write_all(b"\n").unwrap();
+                    }
 
                     let mut exception_reply =
                         &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;

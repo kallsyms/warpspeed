@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-pub mod syscall;
 pub mod mach_trap;
 pub mod scheduling;
+pub mod syscall;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Recordable {

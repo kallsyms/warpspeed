@@ -8,7 +8,7 @@ enum SchedulerData {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Scheduling {
-    pub tid: u32,  // TODO: proper type
+    pub tid: u32, // TODO: proper type
     pub pc: u64,
     data: SchedulerData,
 }

@@ -18,7 +18,7 @@ mod dtrace;
 mod mach;
 mod recordable;
 
-use recordable::{Recordable, Event};
+use recordable::{Event, Recordable};
 
 /// mRR, the macOS Record Replay Debugger
 #[derive(Parser)]
@@ -207,10 +207,13 @@ fn bp_next(
         trace!("adding bp for next log at {:x}", next_log.pc);
         let next_pc = next_log.pc;
         let orig_bytes = inject_code(task_port, next_pc, &BREAKPOINT_INSTRUCTION);
-        breakpoints.insert(next_pc, Breakpoint {
-            orig_bytes,
-            single_step: false,
-        });
+        breakpoints.insert(
+            next_pc,
+            Breakpoint {
+                orig_bytes,
+                single_step: false,
+            },
+        );
     }
 }
 
@@ -227,6 +230,13 @@ fn handle_replay_mach_exception_raise(
 
     match exception {
         mach::EXC_BREAKPOINT => {
+            // TODO: instead of laying down ~tracks~ breakpoints right infront of us
+            // (https://media3.giphy.com/media/3oz8xtBx06mcZWoNJm/giphy.gif)
+            // maybe just set all breakpoints at the start of the program?
+            // then, for unhandled replays, restore the insn, single step, and reset the prior insn back to a breakpoint?
+            // this would likely
+            // 1) be faster (less flipping of memory perms)
+            // 2) catch desync faster/at all (right now, if we don't hit the (expected) next breakpoint we may never hit another bp)
             let pc = code[1] as u64;
             trace!("handle_replay_mach_exception_raise: breakpoint at {:x}", pc);
 
@@ -250,13 +260,11 @@ fn handle_replay_mach_exception_raise(
                 Event::Syscall(expected_syscall) => {
                     recordable::syscall::replay_syscall(task_port, thread_port, expected_syscall)
                 }
-                Event::MachTrap(expected_mach_trap) => {
-                    recordable::mach_trap::replay_mach_trap(
-                        task_port,
-                        thread_port,
-                        expected_mach_trap,
-                    )
-                }
+                Event::MachTrap(expected_mach_trap) => recordable::mach_trap::replay_mach_trap(
+                    task_port,
+                    thread_port,
+                    expected_mach_trap,
+                ),
                 _ => panic!("Unexpected log entry: {:?}", expected_log),
             };
 
@@ -395,21 +403,38 @@ fn record(args: &RecordArgs) {
         "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); raise(SIGSTOP); }}",
         child
     );
-    dtrace.register_program(dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")), &program, |task_port, thread_port, data| {
-        let clobbered_regs: [u64; 2] = [data[0], data[1]];
-        Some(Event::Syscall(recordable::syscall::record_syscall(task_port, thread_port, clobbered_regs)))
-    }).unwrap();
+    dtrace
+        .register_program(
+            dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")),
+            &program,
+            |task_port, thread_port, data| {
+                let clobbered_regs: [u64; 2] = [data[0], data[1]];
+                Some(Event::Syscall(recordable::syscall::record_syscall(
+                    task_port,
+                    thread_port,
+                    clobbered_regs,
+                )))
+            },
+        )
+        .unwrap();
 
     // Mach Traps
     // Mach traps/syscalls only return one value in x0
-    let program = format!(
-        "/pid == {}/ {{ trace(uregs[0]); raise(SIGSTOP); }}",
-        child
-    );
-    dtrace.register_program(dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")), &program, |task_port, thread_port, data| {
-        let clobbered_regs: [u64; 1] = [data[0]];
-        Some(Event::MachTrap(recordable::mach_trap::record_mach_trap(task_port, thread_port, clobbered_regs)))
-    }).unwrap();
+    let program = format!("/pid == {}/ {{ trace(uregs[0]); raise(SIGSTOP); }}", child);
+    dtrace
+        .register_program(
+            dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")),
+            &program,
+            |task_port, thread_port, data| {
+                let clobbered_regs: [u64; 1] = [data[0]];
+                Some(Event::MachTrap(recordable::mach_trap::record_mach_trap(
+                    task_port,
+                    thread_port,
+                    clobbered_regs,
+                )))
+            },
+        )
+        .unwrap();
 
     // Library interception
     // Don't need to record any regs, just use a dummy so we have an aggregate to find

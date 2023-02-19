@@ -1,6 +1,9 @@
-use std::{ffi::{CString, CStr}, collections::HashMap};
-use log::{trace, debug, info, warn, error};
+use log::{debug, error, info, trace, warn};
 use nix::libc;
+use std::{
+    collections::HashMap,
+    ffi::{CStr, CString},
+};
 
 use crate::mach;
 use crate::recordable::Event;
@@ -14,8 +17,14 @@ extern "C" fn dtrace_consume_rec_handler(
     rec: *const bindings::dtrace_recdesc_t,
     arg: *mut libc::c_void,
 ) -> libc::c_int {
-    let closure: &mut &mut dyn FnMut(*const bindings::dtrace_probedata_t, *const bindings::dtrace_recdesc_t) -> bool = unsafe {
-        &mut *(arg as *mut &mut dyn std::ops::FnMut(*const bindings::dtrace_probedata_t, *const bindings::dtrace_recdesc_t) -> bool)
+    let closure: &mut &mut dyn FnMut(
+        *const bindings::dtrace_probedata_t,
+        *const bindings::dtrace_recdesc_t,
+    ) -> bool = unsafe {
+        &mut *(arg as *mut &mut dyn std::ops::FnMut(
+            *const bindings::dtrace_probedata_t,
+            *const bindings::dtrace_recdesc_t,
+        ) -> bool)
     };
     closure(pd, rec) as libc::c_int
 }
@@ -26,7 +35,10 @@ fn dtrace_consume_cb<F>(handle: *mut bindings::dtrace_hdl, mut callback: F) -> l
 where
     F: FnMut(*const bindings::dtrace_probedata_t, *const bindings::dtrace_recdesc_t) -> libc::c_int,
 {
-    let mut cb: &mut dyn FnMut(*const bindings::dtrace_probedata_t, *const bindings::dtrace_recdesc_t) -> libc::c_int = &mut callback;
+    let mut cb: &mut dyn FnMut(
+        *const bindings::dtrace_probedata_t,
+        *const bindings::dtrace_recdesc_t,
+    ) -> libc::c_int = &mut callback;
     let cb = &mut cb;
     unsafe {
         bindings::dtrace_consume(
@@ -39,10 +51,20 @@ where
     }
 }
 
-pub struct ProbeDescription(pub Option<String>, pub Option<String>, pub Option<String>, pub Option<String>);
+pub struct ProbeDescription(
+    pub Option<String>,
+    pub Option<String>,
+    pub Option<String>,
+    pub Option<String>,
+);
 
 impl ProbeDescription {
-    pub fn new(provider: Option<&str>, module: Option<&str>, function: Option<&str>, name: Option<&str>) -> Self {
+    pub fn new(
+        provider: Option<&str>,
+        module: Option<&str>,
+        function: Option<&str>,
+        name: Option<&str>,
+    ) -> Self {
         ProbeDescription(
             provider.map(|s| s.to_string()),
             module.map(|s| s.to_string()),
@@ -52,7 +74,8 @@ impl ProbeDescription {
     }
 
     fn to_program_description(&self) -> String {
-        format!("{}:{}:{}:{}",
+        format!(
+            "{}:{}:{}:{}",
             self.0.as_ref().map(|s| s.as_str()).unwrap_or(""),
             self.1.as_ref().map(|s| s.as_str()).unwrap_or(""),
             self.2.as_ref().map(|s| s.as_str()).unwrap_or(""),
@@ -62,7 +85,9 @@ impl ProbeDescription {
 
     fn matches(&self, probe: &bindings::dtrace_probedesc_t) -> bool {
         if let Some(provider) = &self.0 {
-            if provider != &unsafe { CStr::from_ptr(probe.dtpd_provider.as_ptr()) }.to_string_lossy() {
+            if provider
+                != &unsafe { CStr::from_ptr(probe.dtpd_provider.as_ptr()) }.to_string_lossy()
+            {
                 return false;
             }
         }
@@ -106,7 +131,7 @@ impl DTraceManager {
     pub fn new() -> Result<Self, String> {
         let handle = unsafe {
             let mut err: i32 = 0;
-            let dtrace_handle = bindings::dtrace_open(/*version=*/3, 0, &mut err);
+            let dtrace_handle = bindings::dtrace_open(/*version=*/ 3, 0, &mut err);
             if dtrace_handle.is_null() {
                 return Err(format!("dtrace_open failed: {}", err));
             }
@@ -138,14 +163,24 @@ impl DTraceManager {
             dtrace_handle
         };
 
-        Ok(Self { handle, pending_library_probes: vec![], hooks: vec![] })
+        Ok(Self {
+            handle,
+            pending_library_probes: vec![],
+            hooks: vec![],
+        })
     }
 
-    pub fn register_program<F>(&mut self, probe_description: ProbeDescription, program: &str, callback: F) -> Result<(), String> 
+    pub fn register_program<F>(
+        &mut self,
+        probe_description: ProbeDescription,
+        program: &str,
+        callback: F,
+    ) -> Result<(), String>
     where
         F: Fn(mach::mach_port_t, mach::mach_port_t, &Vec<u64>) -> Option<Event> + 'static,
     {
-        let program_cstr = CString::new(probe_description.to_program_description() + program).unwrap();
+        let program_cstr =
+            CString::new(probe_description.to_program_description() + program).unwrap();
         debug!("register_program: {}", program_cstr.to_str().unwrap());
 
         unsafe {
@@ -159,8 +194,14 @@ impl DTraceManager {
             );
             if prog.is_null() {
                 let errno = bindings::dtrace_errno(self.handle);
-                let err = String::from_utf8_lossy(CStr::from_ptr(bindings::dtrace_errmsg(self.handle, errno)).to_bytes()).to_string();
-                return Err(format!("dtrace_program_strcompile failed: {} ({})", err, errno));
+                let err = String::from_utf8_lossy(
+                    CStr::from_ptr(bindings::dtrace_errmsg(self.handle, errno)).to_bytes(),
+                )
+                .to_string();
+                return Err(format!(
+                    "dtrace_program_strcompile failed: {} ({})",
+                    err, errno
+                ));
             }
 
             if bindings::dtrace_program_exec(self.handle, prog, std::ptr::null_mut()) != 0 {
@@ -185,41 +226,44 @@ impl DTraceManager {
         }
     }
 
-    pub fn dispatch(&self, task_port: mach::mach_port_t, thread_port: mach::mach_port_t) -> Option<Event> {
+    pub fn dispatch(
+        &self,
+        task_port: mach::mach_port_t,
+        thread_port: mach::mach_port_t,
+    ) -> Option<Event> {
         // We should only expect 1 line of output per call to dtrace_consume
         let mut trace_data: Vec<u64> = vec![];
         let mut probe_description: Option<bindings::dtrace_probedesc_t> = None;
 
         unsafe {
-            let closure = |data: *const bindings::dtrace_probedata_t, record: *const bindings::dtrace_recdesc_t| {
+            let closure = |data: *const bindings::dtrace_probedata_t,
+                           record: *const bindings::dtrace_recdesc_t| {
                 if record.is_null() {
                     return bindings::DTRACE_CONSUME_NEXT as i32;
                 }
 
                 let pdesc = *(*data).dtpda_pdesc;
                 if probe_description.is_some() && probe_description.unwrap() != pdesc {
-                    warn!("Multiple probe descriptions: {:?} != {:?}", probe_description, pdesc);
+                    warn!(
+                        "Multiple probe descriptions: {:?} != {:?}",
+                        probe_description, pdesc
+                    );
                 }
                 probe_description = Some(pdesc);
 
                 let action = (*record).dtrd_action;
                 match action as u32 {
-                    bindings::DTRACEACT_DIFEXPR => {
-                        trace_data.push(
-                            match (*record).dtrd_size {
-                                1 => *((*data).dtpda_data as *const u8) as u64,
-                                2 => *((*data).dtpda_data as *const u16) as u64,
-                                4 => *((*data).dtpda_data as *const u32) as u64,
-                                8 => *((*data).dtpda_data as *const u64),
-                                _ => {
-                                    warn!("Unexpected size: {}", (*record).dtrd_size);
-                                    0
-                                }
-                            }
-                        )
-                    }
-                    bindings::DTRACEACT_RAISE => {
-                    },
+                    bindings::DTRACEACT_DIFEXPR => trace_data.push(match (*record).dtrd_size {
+                        1 => *((*data).dtpda_data as *const u8) as u64,
+                        2 => *((*data).dtpda_data as *const u16) as u64,
+                        4 => *((*data).dtpda_data as *const u32) as u64,
+                        8 => *((*data).dtpda_data as *const u64),
+                        _ => {
+                            warn!("Unexpected size: {}", (*record).dtrd_size);
+                            0
+                        }
+                    }),
+                    bindings::DTRACEACT_RAISE => {}
                     _ => {
                         warn!("Unexpected action: {}", action);
                     }

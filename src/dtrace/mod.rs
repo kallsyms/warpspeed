@@ -51,6 +51,7 @@ where
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct ProbeDescription(
     pub Option<String>,
     pub Option<String>,
@@ -83,30 +84,55 @@ impl ProbeDescription {
         )
     }
 
-    fn matches(&self, probe: &bindings::dtrace_probedesc_t) -> bool {
+    fn matches(&self, probe: &ProbeDescription) -> bool {
         if let Some(provider) = &self.0 {
-            if provider
-                != &unsafe { CStr::from_ptr(probe.dtpd_provider.as_ptr()) }.to_string_lossy()
-            {
+            if provider != probe.0.as_ref().unwrap() {
                 return false;
             }
         }
         if let Some(module) = &self.1 {
-            if module != &unsafe { CStr::from_ptr(probe.dtpd_mod.as_ptr()) }.to_string_lossy() {
+            if module != probe.1.as_ref().unwrap() {
                 return false;
             }
         }
         if let Some(function) = &self.2 {
-            if function != &unsafe { CStr::from_ptr(probe.dtpd_func.as_ptr()) }.to_string_lossy() {
+            if function != probe.2.as_ref().unwrap() {
                 return false;
             }
         }
         if let Some(name) = &self.3 {
-            if name != &unsafe { CStr::from_ptr(probe.dtpd_name.as_ptr()) }.to_string_lossy() {
+            if name != probe.3.as_ref().unwrap() {
                 return false;
             }
         }
         true
+    }
+}
+
+impl From<*mut bindings::dtrace_probedesc_t> for ProbeDescription {
+    fn from(probe: *mut bindings::dtrace_probedesc_t) -> Self {
+        ProbeDescription(
+            Some(
+                unsafe { CStr::from_ptr((*probe).dtpd_provider.as_ptr()) }
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            Some(
+                unsafe { CStr::from_ptr((*probe).dtpd_mod.as_ptr()) }
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            Some(
+                unsafe { CStr::from_ptr((*probe).dtpd_func.as_ptr()) }
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            Some(
+                unsafe { CStr::from_ptr((*probe).dtpd_name.as_ptr()) }
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        )
     }
 }
 
@@ -231,9 +257,8 @@ impl DTraceManager {
         task_port: mach::mach_port_t,
         thread_port: mach::mach_port_t,
     ) -> Option<Event> {
-        // We should only expect 1 line of output per call to dtrace_consume
         let mut trace_data: Vec<u64> = vec![];
-        let mut probe_description: Option<bindings::dtrace_probedesc_t> = None;
+        let mut probe_description: Option<ProbeDescription> = None;
 
         unsafe {
             let closure = |data: *const bindings::dtrace_probedata_t,
@@ -242,14 +267,16 @@ impl DTraceManager {
                     return bindings::DTRACE_CONSUME_NEXT as i32;
                 }
 
-                let pdesc = *(*data).dtpda_pdesc;
-                if probe_description.is_some() && probe_description.unwrap() != pdesc {
+                let pdesc = ProbeDescription::from((*data).dtpda_pdesc);
+                if probe_description.is_some() && probe_description.as_ref().unwrap() != &pdesc {
                     warn!(
                         "Multiple probe descriptions: {:?} != {:?}",
                         probe_description, pdesc
                     );
                 }
-                probe_description = Some(pdesc);
+                if probe_description.is_none() || pdesc.3.as_ref().unwrap() == &"lwp-start" {
+                    probe_description = Some(pdesc);
+                }
 
                 let action = (*record).dtrd_action;
                 match action as u32 {
@@ -275,15 +302,15 @@ impl DTraceManager {
             dtrace_consume_cb(self.handle, closure);
         }
 
-        if trace_data.len() == 0 {
-            warn!("No data found?");
+        if probe_description.is_none() {
+            warn!("No probe description from dtrace?");
             return None;
         }
 
         trace!("data: {:?}", trace_data);
 
         for (probe, hook) in &self.hooks {
-            if probe.matches(&probe_description.unwrap()) {
+            if probe.matches(probe_description.as_ref().unwrap()) {
                 return hook(task_port, thread_port, &trace_data);
             }
         }

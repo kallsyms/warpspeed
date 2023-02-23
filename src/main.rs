@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use log::{error, info, trace, warn};
 use mach::mach_check_return;
-use nix::libc;
+use nix::libc::{self, sleep};
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use serde::{Deserialize, Serialize};
@@ -9,9 +9,12 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::thread;
+use std::time::Duration;
 
 use crate::mach::mig;
 
+// https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/sys/spawn.h#L62
 const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
 
 mod dtrace;
@@ -120,7 +123,8 @@ fn handle_record_mach_exception_raise(
 
                     // TODO: if signal != SIGSTOP, record
 
-                    if signal == Signal::SIGSTOP {
+                    if signal == Signal::SIGCONT {
+                        // TODO: is this the correct thread if a non-leader thread is stopped?
                         if let Some(event) = dtrace.dispatch(task_port, thread_port) {
                             Some(Recordable {
                                 pc: mach::mrr_get_regs(thread_port).__pc - 4,
@@ -286,6 +290,7 @@ fn handle_replay_mach_exception_raise(
                 inject_code(task_port, pc, orig.orig_bytes.as_slice());
                 trace!("adding breakpoint for single step at pc: {:x}", pc + 4);
                 let next_insn = inject_code(task_port, pc + 4, &BREAKPOINT_INSTRUCTION);
+                // TODO: could we just PT_STEP?
                 breakpoints.insert(
                     pc + 4,
                     Breakpoint {
@@ -302,7 +307,7 @@ fn handle_replay_mach_exception_raise(
                     // should only be hit on first entry (when we're stopped at entry)
                     // TODO: handle replaying other signals
                     let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
-                    if signal != Signal::SIGSTOP {
+                    if signal != Signal::SIGCONT {
                         panic!("Unexpected signal in replay: {:?}", signal);
                     }
 
@@ -321,16 +326,28 @@ fn handle_replay_mach_exception_raise(
     true
 }
 
-/// Convert a vector of strings to a vector of C strings, including a null terminator.
-fn to_c_string_array(strings: &[String]) -> Vec<*mut i8> {
-    let owned = strings
-        .iter()
-        .map(|a| CString::new(a.as_bytes()).unwrap())
-        .collect::<Vec<_>>();
-    let mut pointers: Vec<*mut i8> = owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
-    pointers.push(std::ptr::null_mut());
+struct CStringArray {
+    // I think this can be done with lifetimes and phantomdata...
+    owned: Vec<CString>,
+    pointers: Vec<*mut i8>,
+}
 
-    pointers
+impl CStringArray {
+    fn new(strings: &[String]) -> CStringArray {
+        let owned: Vec<CString> = strings
+            .iter()
+            .map(|a| CString::new(a.as_bytes()).unwrap())
+            .collect();
+
+        let mut pointers: Vec<*mut i8> = owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
+        pointers.push(std::ptr::null_mut());
+
+        CStringArray { owned, pointers }
+    }
+
+    fn as_ptr(&self) -> *const *mut i8 {
+        self.pointers.as_ptr()
+    }
 }
 
 fn spawn_target(target: &Target) -> nix::unistd::Pid {
@@ -360,8 +377,11 @@ fn spawn_target(target: &Target) -> nix::unistd::Pid {
         let executable = CString::new(target.executable.clone()).unwrap();
         let mut all_args = vec![target.executable.clone()];
         all_args.extend(target.arguments.clone());
-        let argv = to_c_string_array(&all_args);
-        let env = to_c_string_array(&target.environment);
+        let argv = CStringArray::new(&all_args);
+        let env = CStringArray::new(&target.environment);
+
+        // let p: *const *mut i8 = argv.into();
+        // trace!("{:?} {:?}", p, *p);
 
         let res = libc::posix_spawn(
             &mut pid,
@@ -396,11 +416,35 @@ fn record(args: &RecordArgs) {
 
     let mut dtrace = dtrace::DTraceManager::new().unwrap();
 
+    // Thread monitor
+    // Record the new tid and the pc that the new thread is starting at.
+    // uregs[R_PC] doesn't seem to be correct, so fetch it out via the thread port.
+    let program = format!("/pid == {}/ {{ trace(tid); raise(SIGCONT); }}", child);
+    dtrace
+        .register_program(
+            dtrace::ProbeDescription::new(
+                Some("proc"),
+                Some("mach_kernel"),
+                None,
+                Some("lwp-start"),
+            ),
+            &program,
+            |_task_port, thread_port, data| {
+                let tid = data[0] as u32;
+                let pc = mach::mrr_get_regs(thread_port).__pc;
+                Some(Event::Scheduling(recordable::scheduling::Scheduling {
+                    tid,
+                    event: recordable::scheduling::SchedulerEvent::Start { pc },
+                }))
+            },
+        )
+        .unwrap();
+
     // Syscalls
     // arm64 syscalls can return 2 results in x0 and x1
     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/arm/systemcalls.c#L518
     let program = format!(
-        "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); raise(SIGSTOP); }}",
+        "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); raise(SIGCONT); }}",
         child
     );
     dtrace
@@ -420,7 +464,7 @@ fn record(args: &RecordArgs) {
 
     // Mach Traps
     // Mach traps/syscalls only return one value in x0
-    let program = format!("/pid == {}/ {{ trace(uregs[0]); raise(SIGSTOP); }}", child);
+    let program = format!("/pid == {}/ {{ trace(uregs[0]); raise(SIGCONT); }}", child);
     dtrace
         .register_program(
             dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")),
@@ -436,10 +480,19 @@ fn record(args: &RecordArgs) {
         )
         .unwrap();
 
+    // Ticker to ensure we run other threads
+    // eww
+    let child2 = child.clone();
+    let _ticker = thread::spawn(move || loop {
+        trace!("tick");
+        nix::sys::signal::kill(child2, nix::sys::signal::Signal::SIGSTOP).unwrap();
+        thread::sleep(Duration::from_secs(1));
+    });
+
     // Library interception
-    // Don't need to record any regs, just use a dummy so we have an aggregate to find
+    // Don't need to record any regs.
     // let program = format!(
-    //     "pid{}:libsystem_kernel.dylib:mach_absolute_time:entry {{ @dummy[0] = count(); raise(SIGSTOP); }}",
+    //     "pid{}:libsystem_kernel.dylib:mach_absolute_time:entry {{ raise(SIGSTOP); }}",
     //     child
     // );
     // dtrace.register_program(&program, dtrace::ProbeDescription::new(None, None, Some("mach_absolute_time"), None), |task_port, thread_port, aggdata| {
@@ -449,10 +502,12 @@ fn record(args: &RecordArgs) {
 
     dtrace.enable().unwrap();
 
-    let (_task_port, exception_port) = mach::mrr_set_exception_port(child);
+    let (child_task_port, exception_port) = mach::mrr_set_exception_port(child);
 
     ptrace_attachexc(child).unwrap();
     trace!("Attached");
+
+    let mut threadidx = 0;
 
     // TODO: make this into a struct/trait callback to dedup with replay?
     loop {
@@ -462,6 +517,8 @@ fn record(args: &RecordArgs) {
         let reply_header = &mut rpl_buf as *mut _ as *mut mach::mach_msg_header_t;
 
         unsafe {
+            trace!("Waiting for message");
+
             mach::mach_check_return(mach::mach_msg(
                 request_header,
                 mach::MACH_RCV_MSG,
@@ -499,31 +556,45 @@ fn record(args: &RecordArgs) {
                         exception_request.code,
                     );
                     if log_entry.is_some() {
+                        trace!("Logging: {:?}", log_entry);
                         serde_json::to_writer(&mut output, &log_entry.unwrap()).unwrap();
                         output.write_all(b"\n").unwrap();
                     }
+
+                    let threads = mach::mrr_list_threads(child_task_port);
+                    trace!("Threads: {:?}", threads);
+                    trace!("Exception thread: {}", exception_request.thread.name);
+                    // for thread in &threads {
+                    //     mach::mach_check_return(mach::thread_suspend(*thread)).unwrap();
+                    // }
+                    // trace!("Resuming thread: {}", threads[threadidx % threads.len()]);
+                    // mach::mach_check_return(mach::thread_resume(
+                    //     threads[threadidx % threads.len()],
+                    // ))
+                    // .unwrap();
+                    threadidx += 1;
 
                     let mut exception_reply =
                         &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
                     (*exception_reply).RetCode = mach::KERN_SUCCESS;
                     (*exception_reply).NDR = mig::NDR_record;
+
+                    mach::mach_check_return(mach::mach_msg(
+                        reply_header,
+                        mach::MACH_SEND_MSG,
+                        (*reply_header).msgh_size,
+                        0,
+                        mach::MACH_PORT_NULL,
+                        mach::MACH_MSG_TIMEOUT_NONE,
+                        mach::MACH_PORT_NULL,
+                    ))
+                    .unwrap();
                 }
                 x => {
                     error!("unexpected mach_msg number: {}", x);
                     break;
                 }
             }
-
-            mach::mach_check_return(mach::mach_msg(
-                reply_header,
-                mach::MACH_SEND_MSG,
-                (*reply_header).msgh_size,
-                0,
-                mach::MACH_PORT_NULL,
-                mach::MACH_MSG_TIMEOUT_NONE,
-                mach::MACH_PORT_NULL,
-            ))
-            .unwrap();
         }
     }
 

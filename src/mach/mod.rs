@@ -111,3 +111,23 @@ pub fn mrr_set_regs(thread_port: mach_port_t, regs: arm_thread_state64_t) {
         .unwrap();
     }
 }
+
+// Return a vec of ports for all threads in the task
+pub fn mrr_list_threads(task_port: mach_port_t) -> Vec<thread_t> {
+    unsafe {
+        let mut threads: thread_act_array_t = std::ptr::null_mut();
+        let mut thread_count: mach_msg_type_number_t = 0;
+        mach_check_return(task_threads(task_port, &mut threads, &mut thread_count)).unwrap();
+        let mut thread_list: Vec<thread_t> = Vec::new();
+        for i in 0..thread_count {
+            thread_list.push(*threads.offset(i as isize));
+        }
+        mach_check_return(vm_deallocate(
+            mach_task_self(),
+            threads as vm_address_t,
+            thread_count as vm_size_t,
+        ))
+        .unwrap();
+        thread_list
+    }
+}

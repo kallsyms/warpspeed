@@ -30,8 +30,6 @@ pub fn record_syscall(
     regs.__x[0] = clobbered_regs[0];
     regs.__x[1] = clobbered_regs[1];
 
-    trace!("regs {:x?}", regs);
-
     let syscall_number: u32 = regs.__x[16] as u32;
 
     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/kern/syscalls.master#L45

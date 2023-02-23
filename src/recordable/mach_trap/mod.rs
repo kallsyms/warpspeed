@@ -28,8 +28,6 @@ pub fn record_mach_trap(
 
     regs.__x[0] = clobbered_regs[0];
 
-    trace!("regs {:x?}", regs);
-
     // We treat the trap number as the positive version of the actual number passed in
     let trap_number: u32 = (-(regs.__x[16] as i64)) as u32;
 

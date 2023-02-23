@@ -106,50 +106,6 @@ fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
     }
 }
 
-fn handle_record_mach_exception_raise(
-    dtrace: &dtrace::DTraceManager,
-    _exception_port: mach::mach_port_t,
-    thread_port: mach::mach_port_t,
-    task_port: mach::mach_port_t,
-    exception: mach::exception_type_t,
-    code: [i64; 2],
-) -> Option<Recordable> {
-    match exception {
-        mach::EXC_SOFTWARE => {
-            match code {
-                [mach::EXC_SOFT_SIGNAL64, signum] => {
-                    let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
-                    trace!("EXC_SOFT_SIGNAL: {}", signal);
-
-                    // TODO: if signal != SIGSTOP, record
-
-                    if signal == Signal::SIGCONT {
-                        // TODO: is this the correct thread if a non-leader thread is stopped?
-                        if let Some(event) = dtrace.dispatch(task_port, thread_port) {
-                            Some(Recordable {
-                                pc: mach::mrr_get_regs(thread_port).__pc - 4,
-                                event,
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-                _ => {
-                    info!("Unhandled EXC_SOFTWARE code: {:?}", code);
-                    None
-                }
-            }
-        }
-        _ => {
-            info!("Unhandled exception type: {}", exception);
-            None
-        }
-    }
-}
-
 const BREAKPOINT_INSTRUCTION: [u8; 4] = [0x00, 0x00, 0x20, 0xd4];
 
 #[derive(Debug)]
@@ -419,7 +375,7 @@ fn record(args: &RecordArgs) {
     // Thread monitor
     // Record the new tid and the pc that the new thread is starting at.
     // uregs[R_PC] doesn't seem to be correct, so fetch it out via the thread port.
-    let program = format!("/pid == {}/ {{ trace(tid); raise(SIGCONT); }}", child);
+    let program = format!("/pid == {}/ {{ trace(tid); stop(); }}", child);
     dtrace
         .register_program(
             dtrace::ProbeDescription::new(
@@ -444,7 +400,7 @@ fn record(args: &RecordArgs) {
     // arm64 syscalls can return 2 results in x0 and x1
     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/arm/systemcalls.c#L518
     let program = format!(
-        "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); raise(SIGCONT); }}",
+        "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); stop(); }}",
         child
     );
     dtrace
@@ -464,7 +420,7 @@ fn record(args: &RecordArgs) {
 
     // Mach Traps
     // Mach traps/syscalls only return one value in x0
-    let program = format!("/pid == {}/ {{ trace(uregs[0]); raise(SIGCONT); }}", child);
+    let program = format!("/pid == {}/ {{ trace(uregs[0]); stop(); }}", child);
     dtrace
         .register_program(
             dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")),
@@ -480,19 +436,10 @@ fn record(args: &RecordArgs) {
         )
         .unwrap();
 
-    // Ticker to ensure we run other threads
-    // eww
-    let child2 = child.clone();
-    let _ticker = thread::spawn(move || loop {
-        trace!("tick");
-        nix::sys::signal::kill(child2, nix::sys::signal::Signal::SIGSTOP).unwrap();
-        thread::sleep(Duration::from_secs(1));
-    });
-
     // Library interception
     // Don't need to record any regs.
     // let program = format!(
-    //     "pid{}:libsystem_kernel.dylib:mach_absolute_time:entry {{ raise(SIGSTOP); }}",
+    //     "pid{}:libsystem_kernel.dylib:mach_absolute_time:entry {{ stop(); }}",
     //     child
     // );
     // dtrace.register_program(&program, dtrace::ProbeDescription::new(None, None, Some("mach_absolute_time"), None), |task_port, thread_port, aggdata| {
@@ -511,91 +458,31 @@ fn record(args: &RecordArgs) {
 
     // TODO: make this into a struct/trait callback to dedup with replay?
     loop {
-        let mut req_buf: [u8; 4096] = [0; 4096];
-        let request_header = &mut req_buf as *mut _ as *mut mach::mach_msg_header_t;
-        let mut rpl_buf: [u8; 4096] = [0; 4096];
-        let reply_header = &mut rpl_buf as *mut _ as *mut mach::mach_msg_header_t;
-
-        unsafe {
-            trace!("Waiting for message");
-
-            mach::mach_check_return(mach::mach_msg(
-                request_header,
-                mach::MACH_RCV_MSG,
-                0,
-                4096,
-                exception_port,
-                mach::MACH_MSG_TIMEOUT_NONE,
-                mach::MACH_PORT_NULL,
-            ))
-            .unwrap();
-
-            match (*request_header).msgh_id {
-                mach::MACH_NOTIFY_DEAD_NAME => {
-                    info!("Child died");
-                    break;
-                }
-                mig::MACH_EXCEPTION_RAISE => {
-                    (*reply_header).msgh_bits =
-                        (*request_header).msgh_bits & mig::MACH_MSGH_BITS_REMOTE_MASK;
-                    (*reply_header).msgh_remote_port = (*request_header).msgh_remote_port;
-                    (*reply_header).msgh_size =
-                        std::mem::size_of::<mig::__Reply__mach_exception_raise_t>() as u32;
-                    (*reply_header).msgh_local_port = mach::MACH_PORT_NULL;
-                    (*reply_header).msgh_id = (*request_header).msgh_id + 100;
-                    (*reply_header).msgh_voucher_port = 0;
-
-                    let exception_request = *(request_header as *const _
-                        as *const mig::__Request__mach_exception_raise_t);
-                    let log_entry = handle_record_mach_exception_raise(
-                        &dtrace,
-                        exception_request.Head.msgh_local_port,
-                        exception_request.thread.name,
-                        exception_request.task.name,
-                        exception_request.exception,
-                        exception_request.code,
-                    );
-                    if log_entry.is_some() {
-                        trace!("Logging: {:?}", log_entry);
-                        serde_json::to_writer(&mut output, &log_entry.unwrap()).unwrap();
-                        output.write_all(b"\n").unwrap();
-                    }
-
-                    let threads = mach::mrr_list_threads(child_task_port);
-                    trace!("Threads: {:?}", threads);
-                    trace!("Exception thread: {}", exception_request.thread.name);
-                    // for thread in &threads {
-                    //     mach::mach_check_return(mach::thread_suspend(*thread)).unwrap();
-                    // }
-                    // trace!("Resuming thread: {}", threads[threadidx % threads.len()]);
-                    // mach::mach_check_return(mach::thread_resume(
-                    //     threads[threadidx % threads.len()],
-                    // ))
-                    // .unwrap();
-                    threadidx += 1;
-
-                    let mut exception_reply =
-                        &mut rpl_buf as *mut _ as *mut mig::__Reply__mach_exception_raise_t;
-                    (*exception_reply).RetCode = mach::KERN_SUCCESS;
-                    (*exception_reply).NDR = mig::NDR_record;
-
-                    mach::mach_check_return(mach::mach_msg(
-                        reply_header,
-                        mach::MACH_SEND_MSG,
-                        (*reply_header).msgh_size,
-                        0,
-                        mach::MACH_PORT_NULL,
-                        mach::MACH_MSG_TIMEOUT_NONE,
-                        mach::MACH_PORT_NULL,
-                    ))
-                    .unwrap();
-                }
-                x => {
-                    error!("unexpected mach_msg number: {}", x);
-                    break;
-                }
+        let threads = mach::mrr_list_threads(child_task_port);
+        trace!("Threads: {:?}", threads);
+        mach::task_get_state(task, flavor, old_state, old_stateCnt)
+        match dtrace.dispatch(child_task_port, thread_port) {
+            Some(event) => {
+                let log_entry = Recordable {
+                    pc: mach::mrr_get_regs(thread_port).__pc - 4,
+                    event,
+                };
+                trace!("Logging: {:?}", log_entry);
+                serde_json::to_writer(&mut output, &log_entry.unwrap()).unwrap();
+                output.write_all(b"\n").unwrap();
             }
-        }
+            _ => None,
+        };
+
+        // for thread in &threads {
+        //     mach::mach_check_return(mach::thread_suspend(*thread)).unwrap();
+        // }
+        // trace!("Resuming thread: {}", threads[threadidx % threads.len()]);
+        // mach::mach_check_return(mach::thread_resume(
+        //     threads[threadidx % threads.len()],
+        // ))
+        // .unwrap();
+        threadidx += 1;
     }
 
     trace!("Cleaning up");

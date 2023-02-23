@@ -291,6 +291,7 @@ impl DTraceManager {
                         }
                     }),
                     bindings::DTRACEACT_RAISE => {}
+                    bindings::DTRACEACT_STOP => {}
                     _ => {
                         warn!("Unexpected action: {}", action);
                     }

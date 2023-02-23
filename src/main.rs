@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use log::{error, info, trace, warn};
 use mach::mach_check_return;
-use nix::libc::{self, sleep};
+use nix::libc;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::thread;
 use std::time::Duration;
 
 use crate::mach::mig;
@@ -459,20 +458,37 @@ fn record(args: &RecordArgs) {
     // TODO: make this into a struct/trait callback to dedup with replay?
     loop {
         let threads = mach::mrr_list_threads(child_task_port);
-        trace!("Threads: {:?}", threads);
-        mach::task_get_state(task, flavor, old_state, old_stateCnt)
-        match dtrace.dispatch(child_task_port, thread_port) {
-            Some(event) => {
-                let log_entry = Recordable {
-                    pc: mach::mrr_get_regs(thread_port).__pc - 4,
-                    event,
-                };
-                trace!("Logging: {:?}", log_entry);
-                serde_json::to_writer(&mut output, &log_entry.unwrap()).unwrap();
-                output.write_all(b"\n").unwrap();
+
+        let mut ti: mach::mach_task_basic_info = unsafe { std::mem::zeroed() };
+
+        unsafe {
+            let mut n: u32 = mach::TASK_INFO_MAX as u32;
+            mach::mach_check_return(mach::task_info(
+                child_task_port,
+                mach::MACH_TASK_BASIC_INFO as u32,
+                &mut ti as *mut _ as *mut i32,
+                &mut n,
+            ))
+            .unwrap();
+            if ti.suspend_count == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
             }
-            _ => None,
-        };
+        }
+
+        if let Some(event) = dtrace.dispatch(child_task_port, threads[0]) {
+            let log_entry = Recordable {
+                pc: mach::mrr_get_regs(threads[0]).__pc - 4,
+                event,
+            };
+            trace!("Logging: {:?}", log_entry);
+            serde_json::to_writer(&mut output, &log_entry).unwrap();
+            output.write_all(b"\n").unwrap();
+        }
+
+        unsafe {
+            mach::mach_check_return(mach::task_resume(child_task_port)).unwrap();
+        }
 
         // for thread in &threads {
         //     mach::mach_check_return(mach::thread_suspend(*thread)).unwrap();

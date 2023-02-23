@@ -56,15 +56,15 @@ pub fn mrr_set_exception_port(child: nix::unistd::Pid) -> (task_t, mach_port_nam
             MACH_MSG_TYPE_MAKE_SEND,
         ))
         .unwrap();
-        mach_check_return(task_set_exception_ports(
-            task_port,
-            EXC_MASK_ALL,
-            exception_port,
-            (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as i32,
-            THREAD_STATE_NONE, // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
-        ))
-        .unwrap();
-        trace!("set exception port");
+        // mach_check_return(task_set_exception_ports(
+        //     task_port,
+        //     EXC_MASK_ALL,
+        //     exception_port,
+        //     (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as i32,
+        //     THREAD_STATE_NONE, // Why does setting ARM_THREAD_STATE not cause us to go to the state handler?
+        // ))
+        // .unwrap();
+        // trace!("set exception port");
 
         let mut req_port: mach_port_t = 0;
         mach_check_return(mach_port_request_notification(

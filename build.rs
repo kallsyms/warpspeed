@@ -1,6 +1,6 @@
-use std::process::Command;
-use std::path::PathBuf;
 use std::env;
+use std::path::PathBuf;
+use std::process::Command;
 
 #[derive(Debug)]
 struct MachParseCallbacks;
@@ -9,14 +9,12 @@ static MACRO_PREFIX_TYPES: &[(&str, bindgen::callbacks::IntKind)] = &[
     // N.B. ordering
     ("EXC_MASK_", bindgen::callbacks::IntKind::U32),
     ("EXC_", bindgen::callbacks::IntKind::I32),
-
     ("KERN_", bindgen::callbacks::IntKind::I32),
     ("MACH_RCV_", bindgen::callbacks::IntKind::I32),
     ("MACH_SEND_", bindgen::callbacks::IntKind::I32),
     ("MACH_NOTIFY_", bindgen::callbacks::IntKind::I32),
     ("THREAD_STATE", bindgen::callbacks::IntKind::I32),
     ("ARM_THREAD_STATE", bindgen::callbacks::IntKind::I32),
-
     ("EXCEPTION_", bindgen::callbacks::IntKind::U32),
     ("MACH_EXCEPTION_", bindgen::callbacks::IntKind::U32),
     ("MACH_PORT_", bindgen::callbacks::IntKind::U32),
@@ -52,13 +50,8 @@ fn main() {
         .arg(sdkroot.join("usr/include/mach/mach_exc.defs"))
         .status()
         .expect("failed to run mig");
-    
-    // Build the mach_excServer library
-    cc::Build::new()
-        .file(out_dir.join("mach_excServer.c"))
-        .compile("mach_excServer");
-    
-    // And also build bindings for the generated mig header
+
+    // Bindings for the generated mig header
     bindgen::Builder::default()
         .header(out_dir.join("mach_exc.h").to_str().unwrap())
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
@@ -70,13 +63,43 @@ fn main() {
     // Mach headers
     bindgen::Builder::default()
         .header(sdkroot.join("usr/include/mach/mach.h").to_str().unwrap())
-        .header(sdkroot.join("usr/include/mach/mach_error.h").to_str().unwrap())
-        .header(sdkroot.join("usr/include/mach/mach_init.h").to_str().unwrap())
-        .header(sdkroot.join("usr/include/mach/mach_port.h").to_str().unwrap())
-        .header(sdkroot.join("usr/include/mach/mach_traps.h").to_str().unwrap())
-        .header(sdkroot.join("usr/include/mach/mach_types.h").to_str().unwrap())
+        .header(
+            sdkroot
+                .join("usr/include/mach/mach_error.h")
+                .to_str()
+                .unwrap(),
+        )
+        .header(
+            sdkroot
+                .join("usr/include/mach/mach_init.h")
+                .to_str()
+                .unwrap(),
+        )
+        .header(
+            sdkroot
+                .join("usr/include/mach/mach_port.h")
+                .to_str()
+                .unwrap(),
+        )
+        .header(
+            sdkroot
+                .join("usr/include/mach/mach_traps.h")
+                .to_str()
+                .unwrap(),
+        )
+        .header(
+            sdkroot
+                .join("usr/include/mach/mach_types.h")
+                .to_str()
+                .unwrap(),
+        )
         .header(sdkroot.join("usr/include/mach/mach_vm.h").to_str().unwrap())
-        .header(sdkroot.join("usr/include/mach/arm/thread_status.h").to_str().unwrap())
+        .header(
+            sdkroot
+                .join("usr/include/mach/arm/thread_status.h")
+                .to_str()
+                .unwrap(),
+        )
         .parse_callbacks(Box::new(MachParseCallbacks))
         .generate()
         .expect("Unable to generate mach bindings")
@@ -101,6 +124,10 @@ fn main() {
         .expect("Unable to generate dtrace bindings")
         .write_to_file(out_dir.join("dtrace.rs"))
         .expect("Couldn't write dtrace bindings");
-    
+
+    // Recordable protobuf
+    prost_build::compile_protos(&["src/recordable/recordable.proto"], &["src/recordable"])
+        .expect("Failed to compile recordable.proto");
+
     println!("cargo:rustc-link-lib=dylib=dtrace");
 }

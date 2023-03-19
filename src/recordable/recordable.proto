@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package mrr.recordable;
+
+import "mach_trap/mach_trap.proto";
+import "scheduling/scheduling.proto";
+import "syscall/syscall.proto";
+
+// Top level messages are broken up roughly by if they would be self-contained
+// in a module.
+
+// Trace is the top level message. It contains a target and a list of events.
+message Trace {
+  message Target {
+    string path = 1;
+    repeated string arguments = 2;
+    repeated string environment = 3;
+  }
+
+  Target target = 1;
+  repeated LogEvent events = 2;
+}
+
+// LogEvent is a single event in the trace.
+// It contains a program counter and a union of all possible events.
+message LogEvent {
+  uint64 pc = 1;
+  oneof event {
+    mrr.recordable.syscall.Syscall syscall = 10;
+    mrr.recordable.mach_trap.MachTrap mach_trap = 11;
+    mrr.recordable.scheduling.Scheduling scheduling = 12;
+  }
+}

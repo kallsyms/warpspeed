@@ -4,11 +4,11 @@ use mach::mach_check_return;
 use nix::libc;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use prost::Message;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Duration;
 
 use crate::mach::mig;
@@ -20,7 +20,7 @@ mod dtrace;
 mod mach;
 mod recordable;
 
-use recordable::{Event, Recordable};
+use recordable::{log_event::Event, trace::Target, LogEvent, Trace};
 
 /// mRR, the macOS Record Replay Debugger
 #[derive(Parser)]
@@ -84,13 +84,6 @@ fn test_args() {
         }
         _ => panic!("unexpected command"),
     }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Target {
-    executable: String,
-    arguments: Vec<String>,
-    environment: Vec<String>,
 }
 
 fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
@@ -158,7 +151,7 @@ fn inject_code(task_port: mach::mach_port_t, pc: u64, new_bytes: &[u8]) -> Vec<u
 }
 
 fn bp_next(
-    next_log: &Option<Recordable>,
+    next_log: Option<&LogEvent>,
     breakpoints: &mut HashMap<u64, Breakpoint>,
     task_port: mach::mach_port_t,
 ) {
@@ -177,8 +170,8 @@ fn bp_next(
 }
 
 fn handle_replay_mach_exception_raise(
-    expected_log: &Recordable,
-    next_log: &Option<Recordable>,
+    expected_log: &LogEvent,
+    next_log: Option<&LogEvent>,
     breakpoints: &mut HashMap<u64, Breakpoint>,
     exception_request: &mig::__Request__mach_exception_raise_t,
 ) -> bool {
@@ -216,14 +209,16 @@ fn handle_replay_mach_exception_raise(
             }
 
             let event_handled = match &expected_log.event {
-                Event::Syscall(expected_syscall) => {
+                Some(Event::Syscall(expected_syscall)) => {
                     recordable::syscall::replay_syscall(task_port, thread_port, expected_syscall)
                 }
-                Event::MachTrap(expected_mach_trap) => recordable::mach_trap::replay_mach_trap(
-                    task_port,
-                    thread_port,
-                    expected_mach_trap,
-                ),
+                Some(Event::MachTrap(expected_mach_trap)) => {
+                    recordable::mach_trap::replay_mach_trap(
+                        task_port,
+                        thread_port,
+                        expected_mach_trap,
+                    )
+                }
                 _ => panic!("Unexpected log entry: {:?}", expected_log),
             };
 
@@ -329,8 +324,8 @@ fn spawn_target(target: &Target) -> nix::unistd::Pid {
             );
         }
 
-        let executable = CString::new(target.executable.clone()).unwrap();
-        let mut all_args = vec![target.executable.clone()];
+        let executable = CString::new(target.path.clone()).unwrap();
+        let mut all_args = vec![target.path.clone()];
         all_args.extend(target.arguments.clone());
         let argv = CStringArray::new(&all_args);
         let env = CStringArray::new(&target.environment);
@@ -358,7 +353,7 @@ fn record(args: &RecordArgs) {
     let mut output = File::create(&args.trace_filename).unwrap();
 
     let target = Target {
-        executable: args.executable.clone(),
+        path: args.executable.clone(),
         arguments: args.arguments.clone(),
         environment: vec![], // TODO
     };
@@ -366,8 +361,10 @@ fn record(args: &RecordArgs) {
     let child = spawn_target(&target);
     info!("Child pid {}", child);
 
-    serde_json::to_writer(&mut output, &target).unwrap();
-    output.write_all(b"\n").unwrap();
+    let mut trace = Trace {
+        target: Some(target),
+        events: vec![],
+    };
 
     let mut dtrace = dtrace::DTraceManager::new().unwrap();
 
@@ -391,7 +388,9 @@ fn record(args: &RecordArgs) {
                 let pc = data[1];
                 Some(Event::Scheduling(recordable::scheduling::Scheduling {
                     tid,
-                    event: recordable::scheduling::SchedulerEvent::Start { pc },
+                    event: Some(recordable::scheduling::scheduling::Event::Start(
+                        recordable::scheduling::scheduling::NewThread { pc },
+                    )),
                 }))
             },
         )
@@ -470,42 +469,52 @@ fn record(args: &RecordArgs) {
         // mach port to the thread that was last running
         let last_thread = known_threads[threadidx];
 
-        // Then handle any events we got from dtrace.
-        let events = dtrace.dispatch(child_task_port, last_thread);
-        trace!("Events: {:?}", events);
-        for event in events {
-            let log_entry = Recordable {
-                pc: mach::mrr_get_regs(last_thread).__pc - 4,
-                event,
-            };
-            trace!("Logging: {:?}", log_entry);
-            serde_json::to_writer(&mut output, &log_entry).unwrap();
-            output.write_all(b"\n").unwrap();
-        }
-
-        // TODO: handle exited threads
-
         // Suspend new threads since they start running.
         let threads = mach::mrr_list_threads(child_task_port);
 
-        let new_threads: Vec<&mach::thread_t> = threads
+        let new_threads: Vec<mach::thread_t> = threads
             .iter()
             .filter(|t| !known_threads.contains(t))
+            .map(|t| *t)
+            .collect();
+        let exited_threads: Vec<mach::thread_t> = known_threads
+            .iter()
+            .filter(|t| !threads.contains(t))
+            .map(|t| *t)
             .collect();
 
         for thread in &new_threads {
             trace!("Suspending new thread: {}", *thread);
-            mach::mach_check_return(unsafe { mach::thread_suspend(**thread) }).unwrap();
+            mach::mach_check_return(unsafe { mach::thread_suspend(*thread) }).unwrap();
         }
-
-        // Suspend the thread that was just running
-        // TODO: skip this suspend/resume if there's only 1 thread
-        trace!("Suspending thread: {}", last_thread);
-        mach::mach_check_return(unsafe { mach::thread_suspend(last_thread) }).unwrap();
 
         // Add new threads to the list of known threads
         for thread in &new_threads {
-            known_threads.push(**thread);
+            known_threads.push(*thread);
+        }
+        // And remove exited threads
+        for thread in &exited_threads {
+            trace!("Thread exited: {}", thread);
+            known_threads.retain(|t| t != thread);
+        }
+
+        if !exited_threads.contains(&last_thread) {
+            // Suspend the thread that was just running
+            // TODO: skip this suspend/resume if there's only 1 thread
+            trace!("Suspending thread: {}", last_thread);
+            mach::mach_check_return(unsafe { mach::thread_suspend(last_thread) }).unwrap();
+
+            // Then handle any events we got from dtrace.
+            let events = dtrace.dispatch(child_task_port, last_thread);
+            trace!("Events: {:?}", events);
+            for event in events {
+                let log_entry = LogEvent {
+                    pc: mach::mrr_get_regs(last_thread).__pc - 4,
+                    event: Some(event),
+                };
+                trace!("Logging: {:?}", log_entry);
+                trace.events.push(log_entry);
+            }
         }
 
         // Switch to the next thread
@@ -540,22 +549,22 @@ fn record(args: &RecordArgs) {
 
     trace!("Cleaning up");
 
-    // TODO: close down ports (maybe a drop impl on a mach port type?)
+    // TODO: close down ports? (maybe a drop impl on a mach port type?)
+
+    output
+        .write_all(prost::Message::encode_to_vec(&trace).as_slice())
+        .unwrap();
 }
 
 fn replay(args: &ReplayArgs) {
-    let trace_file = File::open(&args.trace_filename).unwrap();
-    let mut lines = BufReader::new(trace_file).lines();
-    let target: Target = serde_json::from_str(lines.next().unwrap().unwrap().as_str()).unwrap();
+    let trace_file = std::fs::read(&args.trace_filename).unwrap();
+    let trace = Trace::decode(trace_file.as_slice()).unwrap();
+    let mut events = trace.events.iter();
 
-    let mut trace = lines
-        .map(|x| x.unwrap())
-        .map(|x| serde_json::from_str(x.as_str()).unwrap());
+    let mut this_entry = events.next().unwrap();
+    let mut next_entry = events.next();
 
-    let mut this_entry = trace.next().unwrap();
-    let mut next_entry = trace.next();
-
-    let child = spawn_target(&target);
+    let child = spawn_target(&trace.target.unwrap());
     info!("Child pid {}", child);
 
     let (_task_port, exception_port) = mach::mrr_set_exception_port(child);
@@ -604,7 +613,7 @@ fn replay(args: &ReplayArgs) {
                         as *const mig::__Request__mach_exception_raise_t);
                     advance = handle_replay_mach_exception_raise(
                         &this_entry,
-                        &next_entry,
+                        next_entry,
                         &mut breakpoints,
                         &exception_request,
                     );
@@ -638,7 +647,7 @@ fn replay(args: &ReplayArgs) {
             }
 
             this_entry = next_entry.unwrap();
-            next_entry = trace.next();
+            next_entry = events.next();
         }
     }
 

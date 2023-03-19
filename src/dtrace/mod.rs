@@ -3,7 +3,7 @@ use nix::libc;
 use std::ffi::{CStr, CString};
 
 use crate::mach;
-use crate::recordable::Recordable;
+use crate::recordable::log_event::Event;
 
 mod bindings;
 

@@ -1,21 +1,10 @@
 use log::{trace, warn};
-use serde::{Deserialize, Serialize};
 
 use crate::mach;
+
 mod trapno;
 
-#[derive(Debug, Serialize, Deserialize)]
-enum MachTrapData {
-    Unhandled,
-    ReturnOnly { ret_val: u64 },
-    Timebase { data: Vec<u8> },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MachTrap {
-    trap_number: u32,
-    data: MachTrapData,
-}
+include!(concat!(env!("OUT_DIR"), "/mrr.recordable.mach_trap.rs"));
 
 pub fn record_mach_trap(
     task_port: mach::mach_port_t,
@@ -32,13 +21,9 @@ pub fn record_mach_trap(
     let trap_number: u32 = (-(regs.__x[16] as i64)) as u32;
 
     match trap_number {
-        trapno::MACH_ARM_TRAP_ABSTIME => MachTrap {
+        trapno::MACH_ARM_TRAP_ABSTIME | trapno::MACH_ARM_TRAP_CONTTIME => MachTrap {
             trap_number,
-            data: MachTrapData::ReturnOnly { ret_val },
-        },
-        trapno::MACH_ARM_TRAP_CONTTIME => MachTrap {
-            trap_number,
-            data: MachTrapData::ReturnOnly { ret_val },
+            data: Some(mach_trap::Data::ReturnOnly(ret_val)),
         },
         trapno::mach_timebase_info => {
             let mut data: Vec<u8> = vec![0; 8]; // sizeof(mach_timebase_info)
@@ -57,14 +42,14 @@ pub fn record_mach_trap(
 
             MachTrap {
                 trap_number,
-                data: MachTrapData::Timebase { data },
+                data: Some(mach_trap::Data::Timebase(mach_trap::Timebase { data })),
             }
         }
         _ => {
             warn!("Unhandled mach trap {}", trap_number);
             MachTrap {
                 trap_number,
-                data: MachTrapData::Unhandled,
+                data: None,
             }
         }
     }
@@ -87,14 +72,14 @@ pub fn replay_mach_trap(
     }
 
     match &trap.data {
-        MachTrapData::Unhandled => {
+        None => {
             warn!("Unhandled trap {}, not replaying", trap.trap_number);
             return false;
         }
-        MachTrapData::ReturnOnly { ret_val } => {
+        Some(mach_trap::Data::ReturnOnly(ret_val)) => {
             regs.__x[0] = *ret_val;
         }
-        MachTrapData::Timebase { data } => {
+        Some(mach_trap::Data::Timebase(data)) => {
             // This is completely correct as far as i can tell but causes desync???
             // unsafe {
             //     mach::mach_check_return(mach::mach_vm_write(

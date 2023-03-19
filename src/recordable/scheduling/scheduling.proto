@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package mrr.recordable.scheduling;
+
+message Scheduling {
+  uint32 tid = 1; // TODO: proper type?
+  message NewThread { uint64 pc = 1; }
+  message SwitchCurrent { uint32 new_tid = 1; }
+  oneof event {
+    NewThread start = 2;
+    SwitchCurrent switch = 3;
+  }
+}

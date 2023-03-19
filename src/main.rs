@@ -5,7 +5,7 @@ use nix::libc;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -399,7 +399,7 @@ fn record(args: &RecordArgs) {
     // arm64 syscalls can return 2 results in x0 and x1
     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/arm/systemcalls.c#L518
     let program = format!(
-        "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); stop(); }}",
+        "/pid == {}/ {{ trace(1337); trace(tid); trace(uregs[0]); trace(uregs[1]); stop(); }}",
         child
     );
     dtrace
@@ -407,7 +407,7 @@ fn record(args: &RecordArgs) {
             dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")),
             &program,
             |task_port, thread_port, data| {
-                let clobbered_regs: [u64; 2] = [data[0], data[1]];
+                let clobbered_regs: [u64; 2] = [data[2], data[3]];
                 Some(Event::Syscall(recordable::syscall::record_syscall(
                     task_port,
                     thread_port,
@@ -419,13 +419,16 @@ fn record(args: &RecordArgs) {
 
     // Mach Traps
     // Mach traps/syscalls only return one value in x0
-    let program = format!("/pid == {}/ {{ trace(uregs[0]); stop(); }}", child);
+    let program = format!(
+        "/pid == {}/ {{ trace(1337); trace(tid); trace(uregs[0]); stop(); }}",
+        child
+    );
     dtrace
         .register_program(
             dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")),
             &program,
             |task_port, thread_port, data| {
-                let clobbered_regs: [u64; 1] = [data[0]];
+                let clobbered_regs: [u64; 1] = [data[2]];
                 Some(Event::MachTrap(recordable::mach_trap::record_mach_trap(
                     task_port,
                     thread_port,
@@ -454,51 +457,88 @@ fn record(args: &RecordArgs) {
     trace!("Attached");
 
     let mut threadidx = 0;
+    let mut known_threads: Vec<mach::thread_t> = mach::mrr_list_threads(child_task_port);
 
-    // TODO: make this into a struct/trait callback to dedup with replay?
+    // TODO: deal with forks
     loop {
+        // First, suspend the child process.
+        let status = mach::mach_check_return(unsafe { mach::task_suspend(child_task_port) });
+        // TODO: async read from the exception port to check if the process exited
+        if !status.is_ok() {
+            break;
+        }
+
+        // Then grab the list of threads.
         let threads = mach::mrr_list_threads(child_task_port);
 
+        // Get the suspend count for the child process...
         let mut ti: mach::mach_task_basic_info = unsafe { std::mem::zeroed() };
-
-        unsafe {
-            let mut n: u32 = mach::TASK_INFO_MAX as u32;
-            mach::mach_check_return(mach::task_info(
+        let mut n: u32 = mach::TASK_INFO_MAX as u32;
+        mach::mach_check_return(unsafe {
+            mach::task_info(
                 child_task_port,
                 mach::MACH_TASK_BASIC_INFO as u32,
                 &mut ti as *mut _ as *mut i32,
                 &mut n,
-            ))
-            .unwrap();
-            if ti.suspend_count == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
+            )
+        })
+        .unwrap();
+
+        // ... to check if it's been suspended by dtrace as well.
+        // TODO: dispatch regardless so that if a reentrant syscall happens (e.g. mutex wait),
+        // we clear that event before the next thread runs.
+        if ti.suspend_count > 1 {
+            // TODO: get the thread that's suspended by dtrace
+            let events = dtrace.dispatch(child_task_port, threads[0]);
+            for event in events {
+                let log_entry = Recordable {
+                    pc: mach::mrr_get_regs(threads[0]).__pc - 4,
+                    event,
+                };
+                trace!("Logging: {:?}", log_entry);
+                serde_json::to_writer(&mut output, &log_entry).unwrap();
+                output.write_all(b"\n").unwrap();
             }
         }
 
-        if let Some(event) = dtrace.dispatch(child_task_port, threads[0]) {
-            let log_entry = Recordable {
-                pc: mach::mrr_get_regs(threads[0]).__pc - 4,
-                event,
-            };
-            trace!("Logging: {:?}", log_entry);
-            serde_json::to_writer(&mut output, &log_entry).unwrap();
-            output.write_all(b"\n").unwrap();
+        // TODO: handle exited threads
+
+        // Suspend new threads since they start running.
+        let new_threads: Vec<&mach::thread_t> = threads
+            .iter()
+            .filter(|t| !known_threads.contains(t))
+            .collect();
+
+        for thread in &new_threads {
+            trace!("Suspending new thread: {}", *thread);
+            mach::mach_check_return(unsafe { mach::thread_suspend(**thread) }).unwrap();
+            //mach::mach_check_return(unsafe { mach::thread_abort(**thread) }).unwrap();
         }
 
-        unsafe {
-            mach::mach_check_return(mach::task_resume(child_task_port)).unwrap();
+        // Suspend the thread that was just running
+        // TODO: skip this suspend/resume if there's only 1 thread
+        trace!("Suspending thread: {}", known_threads[threadidx]);
+        mach::mach_check_return(unsafe { mach::thread_suspend(known_threads[threadidx]) }).unwrap();
+        //mach::mach_check_return(unsafe { mach::thread_abort(known_threads[threadidx]) }).unwrap();
+
+        for thread in &new_threads {
+            known_threads.push(**thread);
         }
 
-        // for thread in &threads {
-        //     mach::mach_check_return(mach::thread_suspend(*thread)).unwrap();
-        // }
-        // trace!("Resuming thread: {}", threads[threadidx % threads.len()]);
-        // mach::mach_check_return(mach::thread_resume(
-        //     threads[threadidx % threads.len()],
-        // ))
-        // .unwrap();
-        threadidx += 1;
+        trace!("idx {}, th {:?}", threadidx, known_threads);
+        threadidx = (threadidx + 1) % known_threads.len();
+
+        // And resume the next
+        trace!("Resuming thread: {}", known_threads[threadidx]);
+        mach::mach_check_return(unsafe { mach::thread_resume(known_threads[threadidx]) }).unwrap();
+
+        // And resume the entire task
+        // (may require multiple resumes if the task was suspended by dtrace)
+        for _ in 0..ti.suspend_count {
+            mach::mach_check_return(unsafe { mach::task_resume(child_task_port) }).unwrap();
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
     }
 
     trace!("Cleaning up");

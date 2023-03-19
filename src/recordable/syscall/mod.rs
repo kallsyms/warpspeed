@@ -6,8 +6,14 @@ use crate::mach;
 mod sysno;
 
 #[derive(Debug, Serialize, Deserialize)]
+enum ReadData {
+    Error(u64),
+    Data { data: Vec<u8> },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 enum SyscallData {
-    Read { data: Vec<u8> },
+    Read(ReadData),
     ReturnOnly { ret_vals: [u64; 2] },
     Unhandled,
 }
@@ -36,25 +42,29 @@ pub fn record_syscall(
     match syscall_number {
         sysno::SYS_read => {
             // store the data that was read
-            let mut data: Vec<u8> = vec![0; regs.__x[2] as usize];
-            let mut copy_size: mach::mach_vm_size_t = regs.__x[2];
+            let data = if (regs.__x[2] as i32) < 0 {
+                ReadData::Error(regs.__x[2])
+            } else {
+                let mut data: Vec<u8> = vec![0; regs.__x[2] as usize];
+                let mut copy_size: mach::mach_vm_size_t = regs.__x[2];
 
-            unsafe {
-                mach::mach_check_return(mach::mach_vm_read_overwrite(
-                    task_port,
-                    regs.__x[1],
-                    regs.__x[2],
-                    data.as_mut_ptr() as mach::mach_vm_address_t,
-                    &mut copy_size,
-                ))
-                .unwrap();
-            }
+                unsafe {
+                    mach::mach_check_return(mach::mach_vm_read_overwrite(
+                        task_port,
+                        regs.__x[1],
+                        regs.__x[2],
+                        data.as_mut_ptr() as mach::mach_vm_address_t,
+                        &mut copy_size,
+                    ))
+                    .unwrap();
+                }
+
+                ReadData::Data { data }
+            };
 
             Syscall {
                 syscall_number,
-                data: SyscallData::Read {
-                    data: data[..ret_vals[0] as usize].to_vec(),
-                },
+                data: SyscallData::Read(data),
             }
         }
         sysno::SYS_write => {
@@ -100,14 +110,24 @@ pub fn replay_syscall(
     }
 
     match &syscall.data {
-        SyscallData::Read { data } => unsafe {
-            mach::mach_check_return(mach::mach_vm_write(
-                task_port,
-                regs.__x[1],
-                data.as_ptr() as mach::vm_offset_t,
-                data.len() as mach::mach_msg_type_number_t,
-            ))
-            .unwrap();
+        SyscallData::Read(read_data) => unsafe {
+            match read_data {
+                ReadData::Error(err) => {
+                    regs.__x[0] = *err;
+                    regs.__x[1] = 0;
+                }
+                ReadData::Data { data } => {
+                    mach::mach_check_return(mach::mach_vm_write(
+                        task_port,
+                        regs.__x[1],
+                        data.as_ptr() as mach::vm_offset_t,
+                        data.len() as mach::mach_msg_type_number_t,
+                    ))
+                    .unwrap();
+                    regs.__x[0] = data.len() as u64;
+                    regs.__x[1] = 0;
+                }
+            }
         },
         SyscallData::ReturnOnly { ret_vals } => {
             regs.__x[0] = ret_vals[0];

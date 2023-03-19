@@ -51,7 +51,7 @@ where
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProbeDescription(
     pub Option<String>,
     pub Option<String>,
@@ -256,9 +256,14 @@ impl DTraceManager {
         &self,
         task_port: mach::mach_port_t,
         thread_port: mach::mach_port_t,
-    ) -> Option<Event> {
+    ) -> Vec<Event> {
+        // In theory we only have one thread running at a time, so this should only be hit in the case
+        // where a single syscalls/trap causes something to happen which hits another probe, most of
+        // the time this is going to be thread creation.
+        let mut probe_id: Option<ProbeDescription> = None;
         let mut trace_data: Vec<u64> = vec![];
-        let mut probe_description: Option<ProbeDescription> = None;
+
+        let mut events = vec![];
 
         unsafe {
             let closure = |data: *const bindings::dtrace_probedata_t,
@@ -268,15 +273,30 @@ impl DTraceManager {
                 }
 
                 let pdesc = ProbeDescription::from((*data).dtpda_pdesc);
-                if probe_description.is_some() && probe_description.as_ref().unwrap() != &pdesc {
-                    warn!(
-                        "Multiple probe descriptions: {:?} != {:?}",
-                        probe_description, pdesc
-                    );
+
+                if probe_id.is_some() && probe_id.as_ref() != Some(&pdesc) {
+                    trace!("probe1: {:?}, probe2: {:?}", probe_id, pdesc);
+                    trace!("probe: {:?}, data: {:?}", probe_id, trace_data);
+
+                    let mut found = false;
+                    for (probe, hook) in &self.hooks {
+                        if probe.matches(&pdesc) {
+                            if let Some(event) = hook(task_port, thread_port, &trace_data) {
+                                events.push(event);
+                            }
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if !found {
+                        warn!("No hook found for probe {:?}", pdesc);
+                    }
+
+                    trace_data.clear();
                 }
-                if probe_description.is_none() || pdesc.3.as_ref().unwrap() == &"lwp-start" {
-                    probe_description = Some(pdesc);
-                }
+
+                probe_id = Some(pdesc);
 
                 let action = (*record).dtrd_action;
                 match action as u32 {
@@ -303,20 +323,32 @@ impl DTraceManager {
             dtrace_consume_cb(self.handle, closure);
         }
 
-        if probe_description.is_none() {
-            warn!("No probe description from dtrace?");
-            return None;
-        }
+        match probe_id {
+            None => {
+                warn!("No probe description from dtrace?");
+                vec![]
+            }
+            Some(pdesc) => {
+                // TODO: dedup with above
+                trace!("probe: {:?}, data: {:?}", pdesc, trace_data);
 
-        trace!("data: {:?}", trace_data);
+                let mut found = false;
+                for (probe, hook) in &self.hooks {
+                    if probe.matches(&pdesc) {
+                        if let Some(event) = hook(task_port, thread_port, &trace_data) {
+                            events.push(event);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
 
-        for (probe, hook) in &self.hooks {
-            if probe.matches(probe_description.as_ref().unwrap()) {
-                return hook(task_port, thread_port, &trace_data);
+                if !found {
+                    warn!("No hook found for probe {:?}", pdesc);
+                }
+
+                events
             }
         }
-
-        warn!("No hook found for probe {:?}", probe_description);
-        None
     }
 }

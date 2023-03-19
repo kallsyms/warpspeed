@@ -1,12 +1,9 @@
 use log::{debug, error, info, trace, warn};
 use nix::libc;
-use std::{
-    collections::HashMap,
-    ffi::{CStr, CString},
-};
+use std::ffi::{CStr, CString};
 
 use crate::mach;
-use crate::recordable::Event;
+use crate::recordable::Recordable;
 
 mod bindings;
 
@@ -252,15 +249,31 @@ impl DTraceManager {
         }
     }
 
+    fn dispatch_one(
+        &self,
+        task_port: mach::mach_port_t,
+        thread_port: mach::mach_port_t,
+        pdesc: &ProbeDescription,
+        trace_data: &Vec<u64>,
+    ) -> Option<Event> {
+        for (probe, hook) in &self.hooks {
+            if probe.matches(&pdesc) {
+                return hook(task_port, thread_port, trace_data);
+            }
+        }
+
+        warn!("No hook found for probe {:?}", pdesc);
+        return None;
+    }
+
     pub fn dispatch(
         &self,
         task_port: mach::mach_port_t,
         thread_port: mach::mach_port_t,
     ) -> Vec<Event> {
-        // In theory we only have one thread running at a time, so this should only be hit in the case
-        // where a single syscalls/trap causes something to happen which hits another probe, most of
-        // the time this is going to be thread creation.
-        let mut probe_id: Option<ProbeDescription> = None;
+        // The last probe hit in the closure
+        let mut last_probe: Option<ProbeDescription> = None;
+        // Accumulated data from the probe
         let mut trace_data: Vec<u64> = vec![];
 
         let mut events = vec![];
@@ -274,29 +287,20 @@ impl DTraceManager {
 
                 let pdesc = ProbeDescription::from((*data).dtpda_pdesc);
 
-                if probe_id.is_some() && probe_id.as_ref() != Some(&pdesc) {
-                    trace!("probe1: {:?}, probe2: {:?}", probe_id, pdesc);
-                    trace!("probe: {:?}, data: {:?}", probe_id, trace_data);
-
-                    let mut found = false;
-                    for (probe, hook) in &self.hooks {
-                        if probe.matches(&pdesc) {
-                            if let Some(event) = hook(task_port, thread_port, &trace_data) {
-                                events.push(event);
-                            }
-                            found = true;
-                            break;
-                        }
+                // This is a new probe, so we need to flush the previous one
+                if last_probe.is_some() && last_probe.as_ref() != Some(&pdesc) {
+                    if let Some(event) = self.dispatch_one(
+                        task_port,
+                        thread_port,
+                        last_probe.as_ref().unwrap(),
+                        &trace_data,
+                    ) {
+                        events.push(event);
                     }
-
-                    if !found {
-                        warn!("No hook found for probe {:?}", pdesc);
-                    }
-
                     trace_data.clear();
                 }
 
-                probe_id = Some(pdesc);
+                last_probe = Some(pdesc);
 
                 let action = (*record).dtrd_action;
                 match action as u32 {
@@ -323,32 +327,12 @@ impl DTraceManager {
             dtrace_consume_cb(self.handle, closure);
         }
 
-        match probe_id {
-            None => {
-                warn!("No probe description from dtrace?");
-                vec![]
-            }
-            Some(pdesc) => {
-                // TODO: dedup with above
-                trace!("probe: {:?}, data: {:?}", pdesc, trace_data);
-
-                let mut found = false;
-                for (probe, hook) in &self.hooks {
-                    if probe.matches(&pdesc) {
-                        if let Some(event) = hook(task_port, thread_port, &trace_data) {
-                            events.push(event);
-                        }
-                        found = true;
-                        break;
-                    }
-                }
-
-                if !found {
-                    warn!("No hook found for probe {:?}", pdesc);
-                }
-
-                events
+        if let Some(pdesc) = last_probe {
+            if let Some(event) = self.dispatch_one(task_port, thread_port, &pdesc, &trace_data) {
+                events.push(event);
             }
         }
+
+        events
     }
 }

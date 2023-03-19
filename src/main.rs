@@ -567,12 +567,13 @@ fn replay(args: &ReplayArgs) {
     let child = spawn_target(&trace.target.unwrap());
     info!("Child pid {}", child);
 
-    let (_task_port, exception_port) = mach::mrr_set_exception_port(child);
+    let (task_port, exception_port) = mach::mrr_set_exception_port(child);
 
     ptrace_attachexc(child).unwrap();
     trace!("Attached");
 
     let mut breakpoints = HashMap::new();
+    bp_next(Some(&this_entry), &mut breakpoints, task_port);
 
     loop {
         let advance;

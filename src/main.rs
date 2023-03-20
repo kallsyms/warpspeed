@@ -8,7 +8,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::time::Duration;
 
 use crate::mach::mig;
@@ -449,7 +449,7 @@ fn record(args: &RecordArgs) {
 
     dtrace.enable().unwrap();
 
-    let (child_task_port, exception_port) = mach::mrr_set_exception_port(child);
+    let (child_task_port, _exception_port) = mach::mrr_set_exception_port(child);
 
     ptrace_attachexc(child).unwrap();
     trace!("Attached");
@@ -462,7 +462,7 @@ fn record(args: &RecordArgs) {
         // First, suspend the child process.
         let status = mach::mach_check_return(unsafe { mach::task_suspend(child_task_port) });
         // TODO: async read from the exception port to check if the process exited
-        if !status.is_ok() {
+        if status.is_err() {
             break;
         }
 
@@ -475,12 +475,12 @@ fn record(args: &RecordArgs) {
         let new_threads: Vec<mach::thread_t> = threads
             .iter()
             .filter(|t| !known_threads.contains(t))
-            .map(|t| *t)
+            .copied()
             .collect();
         let exited_threads: Vec<mach::thread_t> = known_threads
             .iter()
             .filter(|t| !threads.contains(t))
-            .map(|t| *t)
+            .copied()
             .collect();
 
         for thread in &new_threads {
@@ -573,7 +573,7 @@ fn replay(args: &ReplayArgs) {
     trace!("Attached");
 
     let mut breakpoints = HashMap::new();
-    bp_next(Some(&this_entry), &mut breakpoints, task_port);
+    bp_next(Some(this_entry), &mut breakpoints, task_port);
 
     loop {
         let advance;
@@ -613,7 +613,7 @@ fn replay(args: &ReplayArgs) {
                     let exception_request = *(request_header as *const _
                         as *const mig::__Request__mach_exception_raise_t);
                     advance = handle_replay_mach_exception_raise(
-                        &this_entry,
+                        this_entry,
                         next_entry,
                         &mut breakpoints,
                         &exception_request,

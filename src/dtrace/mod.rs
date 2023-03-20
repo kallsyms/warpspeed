@@ -74,10 +74,10 @@ impl ProbeDescription {
     fn to_program_description(&self) -> String {
         format!(
             "{}:{}:{}:{}",
-            self.0.as_ref().map(|s| s.as_str()).unwrap_or(""),
-            self.1.as_ref().map(|s| s.as_str()).unwrap_or(""),
-            self.2.as_ref().map(|s| s.as_str()).unwrap_or(""),
-            self.3.as_ref().map(|s| s.as_str()).unwrap_or(""),
+            self.0.as_deref().unwrap_or(""),
+            self.1.as_deref().unwrap_or(""),
+            self.2.as_deref().unwrap_or(""),
+            self.3.as_deref().unwrap_or(""),
         )
     }
 
@@ -257,13 +257,13 @@ impl DTraceManager {
         trace_data: &Vec<u64>,
     ) -> Option<Event> {
         for (probe, hook) in &self.hooks {
-            if probe.matches(&pdesc) {
+            if probe.matches(pdesc) {
                 return hook(task_port, thread_port, trace_data);
             }
         }
 
         warn!("No hook found for probe {:?}", pdesc);
-        return None;
+        None
     }
 
     pub fn dispatch(

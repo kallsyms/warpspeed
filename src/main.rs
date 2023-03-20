@@ -370,10 +370,7 @@ fn record(args: &RecordArgs) {
 
     // Thread monitor
     // Record the new tid and the pc that the new thread is starting at.
-    let program = format!(
-        "/pid == {}/ {{ trace(tid); trace(uregs[R_PC]); stop(); }}",
-        child
-    );
+    let program = format!("/pid == {}/ {{ trace(uregs[R_PC]); stop(); }}", child);
     dtrace
         .register_program(
             dtrace::ProbeDescription::new(
@@ -383,11 +380,10 @@ fn record(args: &RecordArgs) {
                 Some("lwp-start"),
             ),
             &program,
-            |_task_port, _thread_port, data| {
-                let tid = data[0] as u32;
-                let pc = data[1];
+            |_task_port, thread_port, data| {
+                let pc = data[0];
                 Some(Event::Scheduling(recordable::scheduling::Scheduling {
-                    tid,
+                    tid: thread_port,
                     event: Some(recordable::scheduling::scheduling::Event::Start(
                         recordable::scheduling::scheduling::NewThread { pc },
                     )),
@@ -520,6 +516,20 @@ fn record(args: &RecordArgs) {
         // Switch to the next thread
         threadidx = (threadidx + 1) % known_threads.len();
         let new_thread = known_threads[threadidx];
+
+        if new_thread != last_thread {
+            trace.events.push(LogEvent {
+                pc: mach::mrr_get_regs(last_thread).__pc - 4,
+                event: Some(Event::Scheduling(recordable::scheduling::Scheduling {
+                    tid: last_thread,
+                    event: Some(recordable::scheduling::scheduling::Event::Switch(
+                        recordable::scheduling::scheduling::SwitchCurrent {
+                            new_tid: new_thread,
+                        },
+                    )),
+                })),
+            });
+        }
 
         // And resume it
         trace!("Resuming thread: {}", new_thread);

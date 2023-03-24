@@ -25,7 +25,7 @@ message Trace {
 // It contains a program counter and a union of all possible events.
 message LogEvent {
   uint64 pc = 1;
-  uint64 retired_branches = 2;
+  repeated uint64 register_state = 2;
   oneof event {
     mrr.recordable.syscall.Syscall syscall = 10;
     mrr.recordable.mach_trap.MachTrap mach_trap = 11;

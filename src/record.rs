@@ -169,7 +169,7 @@ pub fn record(args: &cli::RecordArgs) {
             for event in events {
                 let log_entry = LogEvent {
                     pc: mach::mrr_get_regs(last_thread).__pc - 4,
-                    retired_branches: 0, // TODO
+                    register_state: mach::mrr_get_regs(last_thread).__x.to_vec(),
                     event: Some(event),
                 };
                 trace!("Logging: {:?}", log_entry);
@@ -184,7 +184,7 @@ pub fn record(args: &cli::RecordArgs) {
         if new_thread != last_thread {
             trace.events.push(LogEvent {
                 pc: mach::mrr_get_regs(last_thread).__pc - 4,
-                retired_branches: 0,
+                register_state: mach::mrr_get_regs(last_thread).__x.to_vec(),
                 event: Some(Event::Scheduling(recordable::scheduling::Scheduling {
                     tid: last_thread,
                     event: Some(recordable::scheduling::scheduling::Event::Switch(

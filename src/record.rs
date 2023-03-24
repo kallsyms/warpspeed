@@ -30,6 +30,7 @@ pub fn record(args: &cli::RecordArgs) {
     };
 
     let mut dtrace = dtrace::DTraceManager::new().unwrap();
+    //let mut kpc = kpc::Monitor::new(child).unwrap();
 
     // Thread monitor
     // Record the new tid and the pc that the new thread is starting at.

@@ -125,6 +125,19 @@ fn main() {
         .write_to_file(out_dir.join("dtrace.rs"))
         .expect("Couldn't write dtrace bindings");
 
+    // KPC (performance counters)
+    bindgen::Builder::default()
+        .header("src/kpc/kpc2.h")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .generate()
+        .expect("Unable to generate kpc bindings")
+        .write_to_file(out_dir.join("kpc.rs"))
+        .expect("Couldn't write kpc bindings");
+    println!(
+        "cargo:rustc-link-search=framework={}",
+        "/System/Library/PrivateFrameworks"
+    );
+
     // Recordable protobuf
     prost_build::compile_protos(&["src/recordable/recordable.proto"], &["."])
         .expect("Failed to compile protos");

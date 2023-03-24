@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod cli;
 mod dtrace;
+mod kpc;
 mod mach;
 mod record;
 mod recordable;

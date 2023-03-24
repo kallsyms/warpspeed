@@ -6,7 +6,7 @@ use crate::recordable::trace::Target;
 
 struct CStringArray {
     // I think this can be done with lifetimes and phantomdata...
-    owned: Vec<CString>,
+    _owned: Vec<CString>,
     pointers: Vec<*mut i8>,
 }
 
@@ -20,7 +20,10 @@ impl CStringArray {
         let mut pointers: Vec<*mut i8> = owned.iter().map(|s| s.as_ptr() as *mut i8).collect();
         pointers.push(std::ptr::null_mut());
 
-        CStringArray { owned, pointers }
+        CStringArray {
+            _owned: owned,
+            pointers,
+        }
     }
 
     fn as_ptr(&self) -> *const *mut i8 {

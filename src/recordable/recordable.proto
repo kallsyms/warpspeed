@@ -2,9 +2,9 @@ syntax = "proto3";
 
 package mrr.recordable;
 
-import "mach_trap/mach_trap.proto";
-import "scheduling/scheduling.proto";
-import "syscall/syscall.proto";
+import "src/recordable/mach_trap/mach_trap.proto";
+import "src/recordable/scheduling/scheduling.proto";
+import "src/recordable/syscall/syscall.proto";
 
 // Top level messages are broken up roughly by if they would be self-contained
 // in a module.
@@ -25,6 +25,7 @@ message Trace {
 // It contains a program counter and a union of all possible events.
 message LogEvent {
   uint64 pc = 1;
+  uint64 retired_branches = 2;
   oneof event {
     mrr.recordable.syscall.Syscall syscall = 10;
     mrr.recordable.mach_trap.MachTrap mach_trap = 11;

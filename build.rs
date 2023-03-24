@@ -126,8 +126,8 @@ fn main() {
         .expect("Couldn't write dtrace bindings");
 
     // Recordable protobuf
-    prost_build::compile_protos(&["src/recordable/recordable.proto"], &["src/recordable"])
-        .expect("Failed to compile recordable.proto");
+    prost_build::compile_protos(&["src/recordable/recordable.proto"], &["."])
+        .expect("Failed to compile protos");
 
     println!("cargo:rustc-link-lib=dylib=dtrace");
 }

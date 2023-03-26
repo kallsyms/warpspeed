@@ -59,12 +59,24 @@ pub fn record(args: &cli::RecordArgs) {
     // arm64 syscalls can return 2 results in x0 and x1
     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/arm/systemcalls.c#L518
     let program = format!(
-        "/pid == {}/ {{ trace(uregs[0]); trace(uregs[1]); stop(); }}",
+        "/pid == {}/ {{ self->x0 = uregs[0]; self->x1 = uregs[1]; }}",
         child
     );
     dtrace
         .register_program(
             dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")),
+            &program,
+            |_task_port, _thread_port, _data| None,
+        )
+        .unwrap();
+
+    let program = format!(
+        "/pid == {}/ {{ trace(self->x0); trace(self->x1); stop();}}",
+        child
+    );
+    dtrace
+        .register_program(
+            dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("return")),
             &program,
             |task_port, thread_port, data| {
                 let clobbered_regs: [u64; 2] = [data[0], data[1]];
@@ -79,10 +91,19 @@ pub fn record(args: &cli::RecordArgs) {
 
     // Mach Traps
     // Mach traps/syscalls only return one value in x0
-    let program = format!("/pid == {}/ {{ trace(uregs[0]); stop(); }}", child);
+    let program = format!("/pid == {}/ {{ self->x0 = uregs[0]; }}", child);
     dtrace
         .register_program(
             dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")),
+            &program,
+            |_task_port, _thread_port, _data| None,
+        )
+        .unwrap();
+
+    let program = format!("/pid == {}/ {{ trace(self->x0); stop(); }}", child);
+    dtrace
+        .register_program(
+            dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("return")),
             &program,
             |task_port, thread_port, data| {
                 let clobbered_regs: [u64; 1] = [data[0]];

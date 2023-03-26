@@ -176,7 +176,7 @@ impl DTraceManager {
                 return Err(format!("dtrace_setopt(switchrate) failed: {}", err));
             }
 
-            // Needed for raise() to work
+            // Needed for raise() and stop() to work
             let opt = CString::new("destructive").unwrap();
             if bindings::dtrace_setopt(dtrace_handle, opt.as_ptr(), std::ptr::null()) != 0 {
                 let err = bindings::dtrace_errno(dtrace_handle);

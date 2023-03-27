@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::cli;
 use crate::dtrace;
+use crate::kdebug;
 use crate::mach;
 use crate::recordable;
 use crate::util;
@@ -30,6 +31,8 @@ pub fn record(args: &cli::RecordArgs) {
     };
 
     let mut dtrace = dtrace::DTraceManager::new().unwrap();
+    kdebug::init(child).unwrap();
+    kdebug::enable().unwrap();
 
     // Thread monitor
     // Record the new tid and the pc that the new thread is starting at.
@@ -239,11 +242,12 @@ pub fn record(args: &cli::RecordArgs) {
             mach_check_return(unsafe { mach::task_resume(child_task_port) }).unwrap();
         }
 
-        // TODO: there's got to be a way to receive an event when the child is suspended by dtrace...
-        std::thread::sleep(Duration::from_millis(1));
+        trace!("{:?}", kdebug::read());
     }
 
     trace!("Cleaning up");
+
+    kdebug::disable().unwrap();
 
     // TODO: close down ports? (maybe a drop impl on a mach port type?)
 

@@ -40,3 +40,5 @@
 * sigstop causes ptrace event
 * child memory is probed and stored
 * PC of syscall is recorded so we know to set breakpoint there in replay
+* Signals don't really work well for multithreaded programs though (when we're manually scheduling threads in and out at least).
+  * When a non-leader thread raises a signal, we never get notified (presumably) because the main thread is suspended.

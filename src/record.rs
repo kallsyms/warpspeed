@@ -129,17 +129,50 @@ pub fn record(args: &cli::RecordArgs) {
 
     dtrace.enable().unwrap();
 
-    let (child_task_port, _exception_port) = mach::mrr_set_exception_port(child);
+    let mut child_task_port: mach::task_t = 0;
+    unsafe {
+        mach_check_return(mach::task_for_pid(
+            mach::mach_task_self(),
+            child.into(),
+            &mut child_task_port,
+        ))
+        .unwrap();
+    }
 
     util::ptrace_attachexc(child).unwrap();
     trace!("Attached");
 
     let mut threadidx = 0;
+    let mut last_switch = std::time::Instant::now();
     let mut known_threads: Vec<mach::thread_t> = mach::mrr_list_threads(child_task_port);
 
     // TODO: deal with forks
     loop {
-        // First, suspend the child process.
+        // Spinloop until the child process is suspended.
+        let mut ti: mach::mach_task_basic_info = unsafe { std::mem::zeroed() };
+        let mut n: u32 = mach::TASK_INFO_MAX as u32;
+        if mach_check_return(unsafe {
+            mach::task_info(
+                child_task_port,
+                mach::MACH_TASK_BASIC_INFO as u32,
+                &mut ti as *mut _ as *mut i32,
+                &mut n,
+            )
+        })
+        .is_err()
+        {
+            break;
+        }
+
+        if ti.suspend_count == 0
+            && (known_threads.len() == 1
+                || last_switch.elapsed() < std::time::Duration::from_millis(1))
+        {
+            continue;
+        }
+
+        // First, suspend the child process (since it may be running in the case the timeout
+        // is what caused us to fall through).
         let status = mach_check_return(unsafe { mach::task_suspend(child_task_port) });
         // TODO: async read from the exception port to check if the process exited
         if status.is_err() {
@@ -165,7 +198,7 @@ pub fn record(args: &cli::RecordArgs) {
 
         for thread in &new_threads {
             trace!("Suspending new thread: {}", *thread);
-            mach_check_return(unsafe { mach::thread_suspend(*thread) }).unwrap();
+            mach_check_return(unsafe { mach::thread_suspend(*thread) });
         }
 
         // Add new threads to the list of known threads
@@ -180,10 +213,8 @@ pub fn record(args: &cli::RecordArgs) {
 
         if !exited_threads.contains(&last_thread) {
             // Suspend the thread that was just running
-            // TODO: skip this suspend/resume if there's only 1 thread
             trace!("Suspending thread: {}", last_thread);
             mach_check_return(unsafe { mach::thread_suspend(last_thread) }).unwrap();
-
             // Then handle any events we got from dtrace.
             let events = dtrace.dispatch(child_task_port, last_thread);
             trace!("Events: {:?}", events);
@@ -201,8 +232,10 @@ pub fn record(args: &cli::RecordArgs) {
         // Switch to the next thread
         threadidx = (threadidx + 1) % known_threads.len();
         let new_thread = known_threads[threadidx];
+        last_switch = std::time::Instant::now();
 
-        if new_thread != last_thread {
+        // known_threads.contains check is to ensure we don't try to probe a thread that has just exited
+        if new_thread != last_thread && !exited_threads.contains(&last_thread) {
             trace.events.push(LogEvent {
                 pc: mach::mrr_get_regs(last_thread).__pc - 4,
                 register_state: mach::mrr_get_regs(last_thread).__x.to_vec(),
@@ -223,24 +256,10 @@ pub fn record(args: &cli::RecordArgs) {
 
         // And resume the entire task
         // (may require multiple resumes if the task was suspended by dtrace)
-        let mut ti: mach::mach_task_basic_info = unsafe { std::mem::zeroed() };
-        let mut n: u32 = mach::TASK_INFO_MAX as u32;
-        mach_check_return(unsafe {
-            mach::task_info(
-                child_task_port,
-                mach::MACH_TASK_BASIC_INFO as u32,
-                &mut ti as *mut _ as *mut i32,
-                &mut n,
-            )
-        })
-        .unwrap();
-
-        for _ in 0..ti.suspend_count {
+        // +1 because we suspended the task after getting task info
+        for _ in 0..ti.suspend_count + 1 {
             mach_check_return(unsafe { mach::task_resume(child_task_port) }).unwrap();
         }
-
-        // TODO: there's got to be a way to receive an event when the child is suspended by dtrace...
-        std::thread::sleep(Duration::from_millis(1));
     }
 
     trace!("Cleaning up");

@@ -286,6 +286,7 @@ pub fn replay(args: &cli::ReplayArgs) {
 
             this_entry = next_entry.unwrap();
             next_entry = events.next();
+            trace!("next up: {:?}", this_entry);
         }
     }
 

@@ -1,4 +1,4 @@
-use log::{trace, warn};
+use log::{info, trace, warn};
 
 use crate::mach;
 
@@ -107,6 +107,31 @@ pub fn replay_syscall(
             }
         },
         Some(syscall::Data::ReturnOnly(ret_vals)) => {
+            // Show when/what the child writes to stdout
+            if (syscall.syscall_number == sysno::SYS_write
+                || syscall.syscall_number == sysno::SYS_write_nocancel)
+                && regs.__x[0] == 1
+            {
+                let mut data: Vec<u8> = vec![0; ret_vals.rv0 as usize];
+                let mut copy_size: mach::mach_vm_size_t = ret_vals.rv0;
+
+                unsafe {
+                    mach::mach_check_return(mach::mach_vm_read_overwrite(
+                        task_port,
+                        regs.__x[1],
+                        ret_vals.rv0,
+                        data.as_mut_ptr() as mach::mach_vm_address_t,
+                        &mut copy_size,
+                    ))
+                    .unwrap();
+                }
+
+                info!(
+                    "Child wrote to stdout: {:?}",
+                    std::str::from_utf8(&data).unwrap()
+                );
+            }
+
             regs.__x[0] = ret_vals.rv0;
             regs.__x[1] = ret_vals.rv1;
         }

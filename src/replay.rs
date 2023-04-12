@@ -102,7 +102,7 @@ fn handle_replay_mach_exception_raise(
             // 1) be faster (less flipping of memory perms)
             // 2) catch desync faster/at all (right now, if we don't hit the (expected) next breakpoint we may never hit another bp)
             let pc = code[1] as u64;
-            trace!("handle_replay_mach_exception_raise: breakpoint at {:x}", pc);
+            trace!("Child breakpoint at {:x}", pc);
 
             if let Some(bp) = breakpoints.get(&pc) {
                 if bp.single_step {
@@ -117,7 +117,10 @@ fn handle_replay_mach_exception_raise(
             }
 
             if pc != expected_log.pc {
-                panic!("PC mismatch: {:x} != {:x}", pc, expected_log.pc);
+                panic!(
+                    "PC mismatch: current {:x} != expected {:x}",
+                    pc, expected_log.pc
+                );
             }
 
             let event_handled = match &expected_log.event {
@@ -131,6 +134,7 @@ fn handle_replay_mach_exception_raise(
                         expected_mach_trap,
                     )
                 }
+                // TODO: scheduling
                 _ => panic!("Unexpected log entry: {:?}", expected_log),
             };
 
@@ -168,8 +172,9 @@ fn handle_replay_mach_exception_raise(
                 [mach::EXC_SOFT_SIGNAL64, signum] => {
                     // should only be hit on first entry (when we're stopped at entry)
                     // TODO: handle replaying other signals
+                    trace!("Child received signal: {}", signum);
                     let signal: Signal = unsafe { std::mem::transmute(signum as i32) };
-                    if signal != Signal::SIGCONT {
+                    if signal != Signal::SIGSTOP {
                         panic!("Unexpected signal in replay: {:?}", signal);
                     }
 
@@ -205,7 +210,7 @@ pub fn replay(args: &cli::ReplayArgs) {
     trace!("Attached");
 
     let mut breakpoints = HashMap::new();
-    bp_next(Some(this_entry), &mut breakpoints, task_port);
+    //bp_next(Some(this_entry), &mut breakpoints, task_port);
 
     loop {
         let advance;

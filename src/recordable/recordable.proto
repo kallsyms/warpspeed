@@ -13,8 +13,8 @@ import "src/recordable/syscall/syscall.proto";
 message Trace {
   message Target {
     string path = 1;
-    repeated string arguments = 2;
-    repeated string environment = 3;
+    repeated string arguments = 2;   // N.B. Does not include argv[0]
+    repeated string environment = 3; // K=V strings
   }
 
   Target target = 1;

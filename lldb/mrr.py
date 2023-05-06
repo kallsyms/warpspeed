@@ -11,6 +11,9 @@ TARGET_KEY = "target"
 PROCESS_KEY = "process"
 CURRENT_ENTRY_KEY = "cur"
 
+REG_X0 = "x0"
+REG_X1 = "x1"
+
 
 def load(debugger, command, _result, internal_dict):
     args = shlex.split(command)
@@ -37,15 +40,6 @@ def load(debugger, command, _result, internal_dict):
     print(trace.target)
     target = debugger.CreateTarget(trace.target.path)
 
-    # debugger.SetInternalVariable(
-    #     "target.run-args", " ".join(trace.target.arguments), debugger.GetInstanceName()
-    # )
-    # debugger.SetInternalVariable(
-    #     "target.env-vars",
-    #     " ".join(trace.target.environment),
-    #     debugger.GetInstanceName(),
-    # )
-
     # TODO: cwd
     launch_info = target.GetLaunchInfo()
     launch_info.SetArguments(list(trace.target.arguments), False)
@@ -56,10 +50,6 @@ def load(debugger, command, _result, internal_dict):
     error = lldb.SBError()
     process = target.Launch(launch_info, error)
     print(f"Launch {error=}")
-
-    # process = target.LaunchSimple(
-    #     trace.target.arguments, trace.target.environment, os.getcwd()
-    # )
 
     internal_dict[TRACE_KEY] = trace
     internal_dict[TARGET_KEY] = target
@@ -91,40 +81,41 @@ def handle_bp(frame, bp_loc, extra_args, internal_dict):
     if cur_event.WhichOneof("event") == "syscall":
         if cur_event.syscall.WhichOneof("data") == "return_only":
             # Show child stdout/stderr writes
+            # TODO: 4 = SYS_write, 397 = SYS_write_nocancel
             if cur_event.syscall.syscall_number in (4, 397) and frame.register[
-                "x0"
+                REG_X0
             ].unsigned in (1, 2):
                 error = lldb.SBError()
                 out = process.ReadMemory(
-                    frame.register["x1"].unsigned,
+                    frame.register[REG_X1].unsigned,
                     cur_event.syscall.return_only.rv0,
                     error,
                 )
                 print(f"Child wrote to fd {frame.register['x0'].unsigned}: {out}")
 
-            frame.register["x0"].value = str(cur_event.syscall.return_only.rv0)
-            frame.register["x1"].value = str(cur_event.syscall.return_only.rv1)
+            frame.register[REG_X0].value = str(cur_event.syscall.return_only.rv0)
+            frame.register[REG_X1].value = str(cur_event.syscall.return_only.rv1)
             frame.SetPC(frame.pc + 4)
 
         elif cur_event.syscall.WhichOneof("data") == "read":
             if cur_event.syscall.read.WhichOneof("result") == "data":
                 error = lldb.SBError()
                 process.WriteMemory(
-                    frame.register["x1"].unsigned, cur_event.syscall.read.data, error
+                    frame.register[REG_X1].unsigned, cur_event.syscall.read.data, error
                 )
                 print(f"read {error=}")
-                frame.register["x0"].value = str(len(cur_event.syscall.read.data))
-                frame.register["x1"].value = "0"
+                frame.register[REG_X0].value = str(len(cur_event.syscall.read.data))
+                frame.register[REG_X1].value = "0"
             else:
-                frame.register["x0"].value = str(cur_event.syscall.read.error)
-                frame.register["x1"].value = "0"
+                frame.register[REG_X0].value = str(cur_event.syscall.read.error)
+                frame.register[REG_X1].value = "0"
             frame.SetPC(frame.pc + 4)
 
         else:
             print(f"Unhandled syscall {cur_event.syscall.syscall_number}")
     elif cur_event.WhichOneof("event") == "mach_trap":
         if cur_event.mach_trap.WhichOneof("data") == "return_only":
-            frame.register["x0"].value = str(cur_event.mach_trap.return_only)
+            frame.register[REG_X0].value = str(cur_event.mach_trap.return_only)
             frame.SetPC(frame.pc + 4)
         # TODO
         # elif cur_event.mach_trap.WhichOneof("data") == "timebase":
@@ -138,7 +129,7 @@ def handle_bp(frame, bp_loc, extra_args, internal_dict):
     event_idx += 1
     internal_dict[CURRENT_ENTRY_KEY] = event_idx
     if event_idx < len(trace.events):
-        print(f"Registering next bp at {trace.events[event_idx].pc}")
+        print(f"Registering next bp at {trace.events[event_idx].pc:02x}")
         reg_bp(internal_dict[TARGET_KEY], trace.events[event_idx])
 
 

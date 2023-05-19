@@ -37,10 +37,12 @@ void commpage_setup(uint8_t *commpage)
 	*version = _COMM_PAGE_THIS_VERSION;
 
 	ncpus = (uint8_t*)CGET(_COMM_PAGE_NCPUS);
-	*ncpus = sysconf(_SC_NPROCESSORS_CONF);
+    *ncpus = 1;  // ghost
+	//*ncpus = sysconf(_SC_NPROCESSORS_CONF);
 
 	nactivecpus = (uint8_t*)CGET(_COMM_PAGE_ACTIVE_CPUS);
-	*nactivecpus = sysconf(_SC_NPROCESSORS_ONLN);
+    *nactivecpus = 1;  // ghost
+	//*nactivecpus = sysconf(_SC_NPROCESSORS_ONLN);
 
 	// Better imprecise information than no information
 	physcpus = (uint8_t*)CGET(_COMM_PAGE_PHYSICAL_CPUS);

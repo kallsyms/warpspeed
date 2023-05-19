@@ -27,21 +27,22 @@ static void* compatible_mmap(struct load_results *lr, void *addr, size_t length,
     }
     length = PAGE_ROUNDUP(length);
 
-    fprintf(stderr, "alloc %lu = mmap(addr=%p, len=0x%lx, prot=0x%x, flags=0x%x, fd=%d, offset=%llx)\n", lr->alloc_n, addr, length, prot, flags, fd, offset);
+    fprintf(stderr, "alloc %lu = mmap(addr=%p, len=0x%lx, prot=0x%x, flags=0x%x, fd=%d, offset=%llx)\n", lr->n_mappings, addr, length, prot, flags, fd, offset);
 
-    if (lr->alloc_n > 0 && lr->allocs[lr->alloc_n - 1].addr == addr) {
-        struct alloc prev = lr->allocs[lr->alloc_n - 1];
+    if (lr->n_mappings > 0 && lr->mappings[lr->n_mappings - 1].guest == addr) {
+        struct vm_mmap prev = lr->mappings[lr->n_mappings - 1];
         if (prev.len != length || prev.prot != prot) {
             fprintf(stderr, "prior %p alloc was ( %lx, %x), now is (%lx, %x)\n", addr, prev.len, prev.prot, length, prot);
         }
     } else {
-        lr->allocs[lr->alloc_n++] = (struct alloc){
-            .addr = addr,
+        lr->mappings[lr->n_mappings++] = (struct vm_mmap){
+            .guest = addr,
+            .hyper = addr,
             .len = length,
             .prot = prot,
         };
     }
-    return mmap(addr, length, prot, flags, fd, offset);
+    return mmap(addr, length, PROT_READ | PROT_WRITE, flags | MAP_PRIVATE, fd, offset);
 }
 
 // https://github.com/darlinghq/darling/blob/dec20ddf3892ff35f0a688a047d8931faf4471c4/src/startup/mldr/mldr.c#L454
@@ -174,6 +175,20 @@ void load(const char* path, bool expect_dylinker, struct load_results* lr)
 static void setup_space(struct load_results* lr, bool is_64_bit) {
     fprintf(stderr, "setup_space\n");
 
+	uint8_t *commpage = (uint8_t*) mmap((void*)0xf00d0000, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	if (commpage == MAP_FAILED)
+	{
+		fprintf(stderr, "Cannot mmap commpage: %s\n", strerror(errno));
+		exit(1);
+	}
+    lr->mappings[lr->n_mappings++] = (struct vm_mmap){
+        .guest = _COMM_PAGE64_BASE_ADDRESS,
+        .hyper = commpage,
+        .len = PAGE_SIZE,
+        .prot = PROT_READ | PROT_WRITE,
+    };
+    commpage_setup(commpage);
+
 	struct rlimit limit;
 	getrlimit(RLIMIT_STACK, &limit);
 	// allocate a few pages 16 pages if it's less than the limit; otherwise, allocate the limit
@@ -181,15 +196,22 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 	if (limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < size) {
 		size = limit.rlim_cur;
 	}
+    size = PAGE_ROUNDUP(size);
 
-	uint8_t *commpage = (uint8_t*) mmap((void*)_COMM_PAGE64_BASE_ADDRESS, _COMM_PAGE64_AREA_LENGTH + size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	if (commpage == MAP_FAILED)
+	uint8_t *stack = (uint8_t*) mmap((void*)0xdead0000, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	if (stack == MAP_FAILED)
 	{
-		fprintf(stderr, "Cannot mmap commpage: %s\n", strerror(errno));
+		fprintf(stderr, "Cannot mmap stack: %s\n", strerror(errno));
 		exit(1);
 	}
-    commpage_setup(commpage + size);
-    lr->stack_top = commpage + size;
+    lr->mappings[lr->n_mappings++] = (struct vm_mmap){
+        .guest = stack,
+        .hyper = stack,
+        .len = size,
+        .prot = PROT_READ | PROT_WRITE,
+    };
+    lr->stack_top = stack + size - 0x1000;
+
 }
 
 
@@ -405,13 +427,19 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 			}
 			case LC_UNIXTHREAD:
 			{
-#ifdef GEN_64BIT
-				entryPoint = ((uint64_t*) lc)[18];
-#endif
-#ifdef GEN_32BIT
-				entryPoint = ((uint32_t*) lc)[14];
-#endif
-				entryPoint += slide;
+                uint32_t flavor = ((uint32_t*)lc)[2];
+                switch (flavor) {
+                    case ARM_THREAD_STATE64: {
+                        entryPoint = ((uint32_t*)lc)[0x44];
+                        entryPoint += slide;
+                        fprintf(stderr, "unixthread entrypoint: %p\n", entryPoint);
+                        break;
+                    }
+                    default:
+                        fprintf(stderr, "unhandled unixthread flavor %d\n", flavor);
+                        exit(1);
+                        break;
+                }
 				break;
 			}
 			case LC_LOAD_DYLINKER:
@@ -493,8 +521,10 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 	if (header.filetype == MH_EXECUTE)
 		lr->mh = (uintptr_t) mappedHeader;
-	if (entryPoint && !lr->entry_point)
+	if (entryPoint && !lr->entry_point) {
+        fprintf(stderr, "setting entrypoint: %lx\n", entryPoint);
 		lr->entry_point = entryPoint;
+    }
 
 	if (tmp_map_base)
 		munmap(tmp_map_base, PAGE_ROUNDUP(sizeof(header) + header.sizeofcmds));

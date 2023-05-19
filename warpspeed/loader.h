@@ -7,8 +7,9 @@
 #include <stddef.h>
 #include <mach-o/loader.h>
 
-struct alloc {
-    void *addr;
+struct vm_mmap {
+    void *guest;
+    void *hyper;
     size_t len;
     int prot;
 };
@@ -38,8 +39,8 @@ struct load_results {
 	char** envp;
 
     // ghost: TODO TERRIBEL
-    size_t alloc_n;
-    struct alloc allocs[100];
+    size_t n_mappings;
+    struct vm_mmap mappings[100];
 };
 
 void load(const char* path, bool expect_dylinker, struct load_results* lr);

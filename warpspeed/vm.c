@@ -28,6 +28,8 @@
     } \
 } while (0)
 
+const char brk[4] = {0x00, 0x00, 0x20, 0xD4};
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -45,30 +47,47 @@ int main(int argc, char **argv)
     HYP_ASSERT_SUCCESS(hv_vm_create(NULL));
     HYP_ASSERT_SUCCESS(hv_vcpu_create(&vcpu, &vcpu_exit, NULL));
 
-    for (int i = 0; i < res.alloc_n; i++) {
+    // enable fpu
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, (1 << 20) | (1 << 21)));
+    //HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, (1 << 6)));
+
+    //HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, 0x1));
+    
+    // ghost: TODO: SCTLR_EL1? caches and such?
+
+    for (int i = 0; i < res.n_mappings; i++) {
         int prot = 0;
-        // TODO: necessary?
-        if (res.allocs[i].prot & PROT_READ) {
+        // ghost: TODO: necessary?
+        if (res.mappings[i].prot & PROT_READ) {
             prot |= HV_MEMORY_READ;
         }
-        if (res.allocs[i].prot & PROT_WRITE) {
+        if (res.mappings[i].prot & PROT_WRITE) {
             prot |= HV_MEMORY_WRITE;
         }
-        if (res.allocs[i].prot & PROT_EXEC) {
+        if (res.mappings[i].prot & PROT_EXEC) {
             prot |= HV_MEMORY_EXEC;
         }
-        fprintf(stderr, "passthru %p %lx %x\n", res.allocs[i].addr, res.allocs[i].len, prot);
-        HYP_ASSERT_SUCCESS(hv_vm_map(res.allocs[i].addr, (hv_ipa_t)res.allocs[i].addr, res.allocs[i].len, prot));
+        fprintf(stderr, "mapping %p -> %p len:0x%lx prot:%x\n", res.mappings[i].hyper, res.mappings[i].guest, res.mappings[i].len, prot);
+        HYP_ASSERT_SUCCESS(hv_vm_map(res.mappings[i].hyper, (hv_ipa_t)res.mappings[i].guest, res.mappings[i].len, prot));
     }
 
-    // Configure initial VBAR_EL1 to the trampoline
-    //HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, g_kAdrResetTrampoline));
+    // Configure initial VBAR_EL1 to BRKs
+#define PAGE_SIZE 16384
+    uint32_t *vbar = mmap(0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    for (int i = 0; i < (PAGE_SIZE / sizeof(brk)); i++) {
+        memcpy(vbar + i, brk, sizeof(brk));
+    }
+    HYP_ASSERT_SUCCESS(hv_vm_map(vbar, (hv_ipa_t)0xdead0000, PAGE_SIZE, HV_MEMORY_READ | HV_MEMORY_EXEC));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, 0xdead0000));
 
-    // Set initial CPSR, PC, and SP
-    // HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c4));
+    // Set initial PC, and SP
     fprintf(stderr, "starting at pc=%p, sp=%p\n", res.entry_point, res.stack_top);
+    fprintf(stderr, "*pc=%lx\n", *(uint32_t*)res.entry_point);
+    //memcpy(res.entry_point, brk, 4);
+
     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, res.entry_point));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, res.stack_top));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c0));
 
     HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_exceptions(vcpu, true));
 
@@ -102,23 +121,56 @@ int main(int argc, char **argv)
                 HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
             } else if (ec == 0x3C) {
                 // Exception Class 0x3C is BRK in AArch64 state
-                uint64_t x0;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
                 printf("VM made an BRK call!\n");
                 printf("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg < HV_REG_X5; reg++) {
+                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
                     uint64_t s;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
                     printf("X%d: 0x%llx\n", reg, s);
+                    /* if (reg < 2) { */
+                    /*     printf("s: %s\n", s); */
+                    /* } */
                 }
+                uint64_t pc;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
+                printf("PC: 0x%llx\n", pc);
+                uint64_t elr;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
+                printf("ELR_EL1: 0x%llx\n", elr);
+                uint64_t far;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
+                printf("FAR_EL1: 0x%llx\n", far);
+                uint64_t x;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
+                printf("ESR: 0x%llx\n", x);
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &x));
+                printf("sctlr %llx\n", x);
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x));
+                printf("cpacr %llx\n", x);
                 break;
             } else {
+                uint64_t pc;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
                 fprintf(stderr, "Unexpected VM exception: 0x%llx, EC 0x%x, VirtAddr 0x%llx, IPA 0x%llx\n",
                     syndrome,
                     ec,
                     vcpu_exit->exception.virtual_address,
-                    vcpu_exit->exception.physical_address
+                    vcpu_exit->exception.physical_address,
+                    pc
                 );
+                printf("Reg dump:\n");
+                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
+                    uint64_t s;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
+                    printf("X%d: 0x%llx\n", reg, s);
+                }
+                printf("PC: 0x%llx\n", pc);
+                uint64_t elr;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
+                printf("ELR_EL1: 0x%llx\n", elr);
+                uint64_t far;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
+                printf("FAR_EL1: 0x%llx\n", far);
                 break;
             }
         } else {

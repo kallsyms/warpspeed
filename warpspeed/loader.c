@@ -29,15 +29,16 @@ static void* compatible_mmap(struct load_results *lr, void *addr, size_t length,
 
     fprintf(stderr, "alloc %lu = mmap(addr=%p, len=0x%lx, prot=0x%x, flags=0x%x, fd=%d, offset=%llx)\n", lr->n_mappings, addr, length, prot, flags, fd, offset);
 
-    if (lr->n_mappings > 0 && lr->mappings[lr->n_mappings - 1].guest == addr) {
+    if (lr->n_mappings > 0 && lr->mappings[lr->n_mappings - 1].guest_va == addr) {
         struct vm_mmap prev = lr->mappings[lr->n_mappings - 1];
         if (prev.len != length || prev.prot != prot) {
             fprintf(stderr, "prior %p alloc was ( %lx, %x), now is (%lx, %x)\n", addr, prev.len, prev.prot, length, prot);
         }
     } else {
         lr->mappings[lr->n_mappings++] = (struct vm_mmap){
-            .guest = addr,
             .hyper = addr,
+            .guest_pa = addr,
+            .guest_va = addr,
             .len = length,
             .prot = prot,
         };
@@ -182,8 +183,9 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 		exit(1);
 	}
     lr->mappings[lr->n_mappings++] = (struct vm_mmap){
-        .guest = _COMM_PAGE64_BASE_ADDRESS,
         .hyper = commpage,
+        .guest_pa = _COMM_PAGE64_BASE_ADDRESS,
+        .guest_va = _COMM_PAGE64_BASE_ADDRESS,
         .len = PAGE_SIZE,
         .prot = PROT_READ | PROT_WRITE,
     };
@@ -205,8 +207,9 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 		exit(1);
 	}
     lr->mappings[lr->n_mappings++] = (struct vm_mmap){
-        .guest = stack,
         .hyper = stack,
+        .guest_pa = stack,
+        .guest_va = stack,
         .len = size,
         .prot = PROT_READ | PROT_WRITE,
     };

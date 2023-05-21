@@ -8,8 +8,9 @@
 #include <mach-o/loader.h>
 
 struct vm_mmap {
-    void *guest;
     void *hyper;
+    void *guest_pa;
+    void *guest_va;
     size_t len;
     int prot;
 };

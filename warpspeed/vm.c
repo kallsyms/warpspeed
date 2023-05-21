@@ -51,6 +51,67 @@ const char hvc_insns[4] = {0x02, 0x00, 0x00, 0xD4};
 extern uint64_t syscall_t(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t num);
 extern int     __shared_region_check_np(uint64_t *startaddress);
 
+uint64_t dyn_pa_base = 0x13370000;  // if guest_pa is not explicitly set, the next available physical address to use
+size_t tblidx = 1;
+uint64_t *page_tables;
+
+void do_map(struct vm_mmap m) {
+    if (!m.guest_pa) {
+        m.guest_pa = dyn_pa_base;
+        dyn_pa_base += m.len;
+    }
+    fprintf(stderr, "mapping %p -> %p -> %p len:0x%lx\n", m.hyper, m.guest_pa, m.guest_va, m.len);
+    HYP_ASSERT_SUCCESS(hv_vm_map(m.hyper, (hv_ipa_t)m.guest_pa, m.len, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC));
+
+    for (size_t offset = 0; offset < m.len; offset += 0x1000) {
+        uint64_t pa = (uint64_t)m.guest_pa + offset;
+        if (pa > (1ULL << 48)) {
+            fprintf(stderr, "pa too big\n");
+            exit(1);
+        }
+        if (pa & ((1 << 12) - 1)) {
+            fprintf(stderr, "low bits in pa set\n");
+            exit(1);
+        }
+        uint64_t va = (uint64_t)m.guest_va + offset;
+
+        uint16_t l0idx = (va >> 39) & 0x1ff;
+        uint16_t l1idx = (va >> 30) & 0x1ff;
+        uint16_t l2idx = (va >> 21) & 0x1ff;
+        uint16_t l3idx = (va >> 12) & 0x1ff;
+
+        uint64_t *l0pt = page_tables;
+        if (!l0pt[l0idx]) {
+            fprintf(stderr, "creating l1pt at offset %d for l0idx %d\n", tblidx, l0idx);
+            l0pt[l0idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
+            fprintf(stderr, "l1pt descriptor: %p\n", l0pt[l0idx]);
+            tblidx++;
+        }
+        uint64_t *l1pt = (uint64_t*)((l0pt[l0idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
+        if (!l1pt[l1idx]) {
+            fprintf(stderr, "creating l2pt at offset %d for l1idx %d\n", tblidx, l1idx);
+            l1pt[l1idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
+            fprintf(stderr, "l2pt descriptor: %p\n", l1pt[l1idx]);
+            tblidx++;
+        }
+        uint64_t *l2pt = (uint64_t*)((l1pt[l1idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
+        if (!l2pt[l2idx]) {
+            fprintf(stderr, "creating l3pt at offset %d for l2idx %d\n", tblidx, l2idx);
+            l2pt[l2idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
+            fprintf(stderr, "l3pt descriptor: %p\n", l2pt[l2idx]);
+            tblidx++;
+        }
+        uint64_t *l3pt = (uint64_t*)((l2pt[l2idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
+        // ghost: TODO: these are all rwx effectively
+        l3pt[l3idx] = (uint64_t)pa | 0b11 | (1 << 5) | (0b01 << 6) | (0b11 << 8) | (1 << 10);
+        // privileged?
+        //if (va > (1ULL << 48)) {
+            l3pt[l3idx] &= ~(0b11 << 6);
+        //}
+        //fprintf(stderr, "page descriptor (idx %d): %p\n", l3idx, l3pt[l3idx]);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -128,67 +189,11 @@ int main(int argc, char **argv)
     /* }; */
 
     // Configure 1:1 translation tables
-    uint64_t *page_tables = mmap(0, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    page_tables = mmap(0, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     HYP_ASSERT_SUCCESS(hv_vm_map(page_tables, (hv_ipa_t)PAGING_PA, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE));
 
-    uint64_t dyn_pa_base = 0x13370000;  // if guest_pa is not explicitly set, the next available physical address to use
-    uint16_t tblidx = 1;
     for (int i = 0; i < res.n_mappings; i++) {
-        struct vm_mmap m = res.mappings[i];
-        if (!m.guest_pa) {
-            m.guest_pa = dyn_pa_base;
-            dyn_pa_base += m.len;
-        }
-        fprintf(stderr, "mapping %p -> %p -> %p len:0x%lx\n", m.hyper, m.guest_pa, m.guest_va, m.len);
-        HYP_ASSERT_SUCCESS(hv_vm_map(m.hyper, (hv_ipa_t)m.guest_pa, m.len, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC));
-
-        for (size_t offset = 0; offset < m.len; offset += 0x1000) {
-            uint64_t pa = (uint64_t)m.guest_pa + offset;
-            if (pa > (1ULL << 48)) {
-                fprintf(stderr, "pa too big\n");
-                exit(1);
-            }
-            if (pa & ((1 << 12) - 1)) {
-                fprintf(stderr, "low bits in pa set\n");
-                exit(1);
-            }
-            uint64_t va = (uint64_t)m.guest_va + offset;
-
-            uint16_t l0idx = (va >> 39) & 0x1ff;
-            uint16_t l1idx = (va >> 30) & 0x1ff;
-            uint16_t l2idx = (va >> 21) & 0x1ff;
-            uint16_t l3idx = (va >> 12) & 0x1ff;
-
-            uint64_t *l0pt = page_tables;
-            if (!l0pt[l0idx]) {
-                fprintf(stderr, "creating l1pt at offset %d for l0idx %d\n", tblidx, l0idx);
-                l0pt[l0idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
-                fprintf(stderr, "l1pt descriptor: %p\n", l0pt[l0idx]);
-                tblidx++;
-            }
-            uint64_t *l1pt = (uint64_t*)((l0pt[l0idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
-            if (!l1pt[l1idx]) {
-                fprintf(stderr, "creating l2pt at offset %d for l1idx %d\n", tblidx, l1idx);
-                l1pt[l1idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
-                fprintf(stderr, "l2pt descriptor: %p\n", l1pt[l1idx]);
-                tblidx++;
-            }
-            uint64_t *l2pt = (uint64_t*)((l1pt[l1idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
-            if (!l2pt[l2idx]) {
-                fprintf(stderr, "creating l3pt at offset %d for l2idx %d\n", tblidx, l2idx);
-                l2pt[l2idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
-                fprintf(stderr, "l3pt descriptor: %p\n", l2pt[l2idx]);
-                tblidx++;
-            }
-            uint64_t *l3pt = (uint64_t*)((l2pt[l2idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
-            // ghost: TODO: these are all rwx effectively
-            l3pt[l3idx] = (uint64_t)pa | 0b11 | (1 << 5) | (0b01 << 6) | (0b11 << 8) | (1 << 10);
-            // privileged?
-            //if (va > (1ULL << 48)) {
-                l3pt[l3idx] &= ~(0b11 << 6);
-            //}
-            //fprintf(stderr, "page descriptor (idx %d): %p\n", l3idx, l3pt[l3idx]);
-        }
+        do_map(res.mappings[i]);
     }
 
     //memcpy(res.entry_point + (0x000055f4 - 0x00004950), brk_insns, sizeof(brk_insns));
@@ -253,14 +258,39 @@ int main(int argc, char **argv)
                     uint64_t num;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X16, &num));
                     printf("forwarding syscall %p(%p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5]);
-                    uint64_t ret = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], num);
-                    uint64_t cflags;
-                    asm volatile ("mrs %0, NZCV" : "=r"(cflags));
-                    uint64_t ret1;
+                    uint64_t cflags, ret0, ret1;
+                    switch (num) {
+                        case 0x126:  // shared_region_check_np
+                            *(uint64_t*)args[0] = 0;
+                            ret0 = EINVAL;
+                            ret1 = 0;
+                            cflags = (1 << 29);
+                            break;
+                        default:
+                            ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], num);
+                            asm volatile ("mov %0, x1" : "=r"(ret1));
+                            asm volatile ("mrs %0, NZCV" : "=r"(cflags));
+                            switch (num) {
+                                case 0xfffffffffffffff6: { // mach_vm_allocate
+                                    uint64_t addr = PAGE_ALIGN(ret1);
+                                    size_t size = args[2];
+                                    struct vm_mmap m = (struct vm_mmap){
+                                        .hyper = (void*)addr,
+                                        .guest_va = (void*)addr,
+                                        .len = size,
+                                        .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+                                    };
+                                    do_map(m);
+                                    break;
+                                }
+                                default:
+                                    break;
+                            }
+                            break;
+                    }
                     // ghost: is this correct? binja says this is good
-                    asm volatile ("mov %0, x1" : "=r"(ret1));
-                    printf("ret: %p %p\n", ret, ret1);
-                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X0, ret));
+                    printf("ret: %p %p\n", ret0, ret1);
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X0, ret0));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X1, ret1));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, (cpsr & (~(0b1111ULL << 28))) | cflags));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, elr));

@@ -37,7 +37,6 @@ static void* compatible_mmap(struct load_results *lr, void *addr, size_t length,
     } else {
         lr->mappings[lr->n_mappings++] = (struct vm_mmap){
             .hyper = addr,
-            .guest_pa = addr,
             .guest_va = addr,
             .len = length,
             .prot = prot,
@@ -184,7 +183,6 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 	}
     lr->mappings[lr->n_mappings++] = (struct vm_mmap){
         .hyper = commpage,
-        .guest_pa = _COMM_PAGE64_BASE_ADDRESS,
         .guest_va = _COMM_PAGE64_BASE_ADDRESS,
         .len = PAGE_SIZE,
         .prot = PROT_READ | PROT_WRITE,
@@ -208,7 +206,6 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 	}
     lr->mappings[lr->n_mappings++] = (struct vm_mmap){
         .hyper = stack,
-        .guest_pa = stack,
         .guest_va = stack,
         .len = size,
         .prot = PROT_READ | PROT_WRITE,

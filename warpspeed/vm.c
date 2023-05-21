@@ -37,7 +37,6 @@ const char hvc_insns[4] = {0x02, 0x00, 0x00, 0xD4};
 #define PAGING_PA   (0x10000)
 #define VBAR_ADDR (0xffffffffffff0000ULL)
 #define VBAR_PA (0x20000)
-#define CODE_PA (0x30000)
 
 int main(int argc, char **argv)
 {
@@ -47,8 +46,8 @@ int main(int argc, char **argv)
     }
 
     struct load_results res = {};
-    /* load(argv[1], false, &res); */
-    /* setup_stack64(argv[1], &res); */
+    load(argv[1], false, &res);
+    setup_stack64(argv[1], &res);
 
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t *vcpu_exit;
@@ -69,37 +68,15 @@ int main(int argc, char **argv)
         .prot = PROT_READ | PROT_EXEC,
     };
 
-    // test
-    void *code = mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    res.mappings[res.n_mappings++] = (struct vm_mmap) {
-        .hyper = code,
-        .guest_pa = (void*)CODE_PA,
-        .guest_va = (void*)CODE_PA,
-        .len = HV_PAGE_SIZE,
-        .prot = PROT_READ | PROT_EXEC,
-    };
-
     // Configure 1:1 translation tables
     uint64_t *page_tables = mmap(0, HV_PAGE_SIZE * 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     HYP_ASSERT_SUCCESS(hv_vm_map(page_tables, (hv_ipa_t)PAGING_PA, HV_PAGE_SIZE * 4, PROT_READ | PROT_WRITE));
-    /* res.mappings[res.n_mappings++] = (struct vm_mmap) { */
-    /*     .hyper = page_tables, */
-    /*     .guest = (void*)PAGING_PA, */
-    /*     .len = HV_PAGE_SIZE * 10, */
-    /*     .prot = PROT_READ | PROT_WRITE, */
-    /* }; */
 
-#define PT_USER     (1<<6)      // unprivileged, EL0 access allowed
-#define PT_AF       (1<<10)     // accessed flag
-#define PT_ISH      (3<<8)      // inner shareable
-// defined in MAIR register
-#define PT_MEM      (0<<2)      // normal memory
-
+    uint64_t dyn_pa_base = 0x13370000;  // if guest_pa is not explicitly set, the next available physical address to use
     uint16_t tblidx = 1;
     for (int i = 0; i < res.n_mappings; i++) {
         struct vm_mmap m = res.mappings[i];
         int prot = 0;
-        // ghost: TODO: necessary?
         if (m.prot & PROT_READ) {
             prot |= HV_MEMORY_READ;
         }
@@ -109,81 +86,77 @@ int main(int argc, char **argv)
         if (m.prot & PROT_EXEC) {
             prot |= HV_MEMORY_EXEC;
         }
+        if (!m.guest_pa) {
+            m.guest_pa = dyn_pa_base;
+            dyn_pa_base += m.len;
+        }
         fprintf(stderr, "mapping %p -> %p -> %p len:0x%lx prot:%x\n", m.hyper, m.guest_pa, m.guest_va, m.len, prot);
         HYP_ASSERT_SUCCESS(hv_vm_map(m.hyper, (hv_ipa_t)m.guest_pa, m.len, prot));
 
-        for (uint64_t addr = (uint64_t)m.guest_va; addr < ((uint64_t)m.guest_va + m.len); addr += 0x1000) {
-            uint16_t l0idx = (addr >> 39) & 0x1ff;
-            uint16_t l1idx = (addr >> 30) & 0x1ff;
-            uint16_t l2idx = (addr >> 21) & 0x1ff;
-            uint16_t l3idx = (addr >> 12) & 0x1ff;
+        for (size_t offset = 0; offset < m.len; offset += 0x1000) {
+            uint64_t pa = (uint64_t)m.guest_pa + offset;
+            if (pa > (1ULL << 48)) {
+                fprintf(stderr, "pa too big\n");
+                exit(1);
+            }
+            if (pa & ((1 << 12) - 1)) {
+                fprintf(stderr, "low bits in pa set\n");
+                exit(1);
+            }
+            uint64_t va = (uint64_t)m.guest_va + offset;
+
+            uint16_t l0idx = (va >> 39) & 0x1ff;
+            uint16_t l1idx = (va >> 30) & 0x1ff;
+            uint16_t l2idx = (va >> 21) & 0x1ff;
+            uint16_t l3idx = (va >> 12) & 0x1ff;
 
             uint64_t *l0pt = page_tables;
             if (!l0pt[l0idx]) {
                 fprintf(stderr, "creating l1pt at offset %d for l0idx %d\n", tblidx, l0idx);
-                l0pt[l0idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11| (1ULL << 63);
+                l0pt[l0idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
                 fprintf(stderr, "l1pt descriptor: %p\n", l0pt[l0idx]);
                 tblidx++;
             }
-            uint64_t *l1pt = (uint64_t*)((l0pt[l0idx] & 0x7ffffffff000) - PAGING_PA + (uint64_t)page_tables);
+            uint64_t *l1pt = (uint64_t*)((l0pt[l0idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
             if (!l1pt[l1idx]) {
                 fprintf(stderr, "creating l2pt at offset %d for l1idx %d\n", tblidx, l1idx);
-                l1pt[l1idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11| (1ULL << 63);
+                l1pt[l1idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
                 fprintf(stderr, "l2pt descriptor: %p\n", l1pt[l1idx]);
                 tblidx++;
             }
-            uint64_t *l2pt = (uint64_t*)((l1pt[l1idx] & 0x7ffffffff000) - PAGING_PA + (uint64_t)page_tables);
+            uint64_t *l2pt = (uint64_t*)((l1pt[l1idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
             if (!l2pt[l2idx]) {
                 fprintf(stderr, "creating l3pt at offset %d for l2idx %d\n", tblidx, l2idx);
-                l2pt[l2idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11 | (1ULL << 63);
+                l2pt[l2idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
                 fprintf(stderr, "l3pt descriptor: %p\n", l2pt[l2idx]);
                 tblidx++;
             }
-            uint64_t *l3pt = (uint64_t*)((l2pt[l2idx] & 0x7ffffffff000) - PAGING_PA + (uint64_t)page_tables);
-            l3pt[l3idx] = (uint64_t)m.guest_pa | 0b11 | (1 << 5) | (0b01 << 6) | (0b11 << 8) | (1 << 10);
-            if (addr > (1ULL << 48)) {
+            uint64_t *l3pt = (uint64_t*)((l2pt[l2idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
+            // ghost: TODO: these are all rwx effectively
+            l3pt[l3idx] = (uint64_t)pa | 0b11 | (1 << 5) | (0b01 << 6) | (0b11 << 8) | (1 << 10);
+            // privileged?
+            if (va > (1ULL << 48)) {
                 l3pt[l3idx] &= ~(0b11 << 6);
             }
             fprintf(stderr, "page descriptor (idx %d): %p\n", l3idx, l3pt[l3idx]);
         }
     }
 
+    // https://github.com/Impalabs/hyperpom/blob/85a4df8b6af2babf3689bd4c486fcbbd4c831f8a/src/memory.rs#L1836
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0x44));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, 0x10 | (0x10 << 16) | (0b10 << 30) | (1ULL << 39) | (1ULL << 40)));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, PAGING_PA));
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, PAGING_PA));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, PAGING_PA));  // ghost: this should use 2 tables but ^ needs refactoring before that
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, 0x1005));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, (3 << 20)));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c0));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, VBAR_ADDR));
 
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, CODE_PA));
-    memcpy(code, hvc_insns, sizeof(hvc_insns));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, res.entry_point));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, res.stack_top));
 
     HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_exceptions(vcpu, true));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_reg_accesses(vcpu, true));
-
-    const char basedir[] = "/tmp/mem";
-    for (int i = 0; i < res.n_mappings; i++) {
-        struct vm_mmap m = res.mappings[i];
-        char path[1024] = {0};
-        snprintf(path, sizeof(path), "%s/%p", basedir, m.guest_pa);
-        int fd = open(path, O_WRONLY|O_CREAT|O_TRUNC, 0777);
-        if (fd < 0) {
-            printf("failed to open %s: %s\n", path, strerror(errno));
-            exit(1);
-        }
-        size_t n = 0;
-        while (n < m.len) {
-            int foo = write(fd, m.hyper + n, m.len - n);
-            if (foo < 0) {
-                printf("failed to write %s\n", path);
-                exit(1);
-            }
-            n += foo;
-        }
-        close(fd);
-    }
 
     while (true) {
         HYP_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
@@ -218,6 +191,8 @@ int main(int argc, char **argv)
                 printf("ttbr0 %llx\n", x);
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x));
                 printf("tcr %llx\n", x);
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_PAR_EL1, &x));
+                printf("par %llx\n", x);
 
                 break;
             } else if (ec == 0x17) {

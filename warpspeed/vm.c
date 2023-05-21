@@ -76,22 +76,12 @@ int main(int argc, char **argv)
     uint16_t tblidx = 1;
     for (int i = 0; i < res.n_mappings; i++) {
         struct vm_mmap m = res.mappings[i];
-        int prot = 0;
-        if (m.prot & PROT_READ) {
-            prot |= HV_MEMORY_READ;
-        }
-        if (m.prot & PROT_WRITE) {
-            prot |= HV_MEMORY_WRITE;
-        }
-        if (m.prot & PROT_EXEC) {
-            prot |= HV_MEMORY_EXEC;
-        }
         if (!m.guest_pa) {
             m.guest_pa = dyn_pa_base;
             dyn_pa_base += m.len;
         }
-        fprintf(stderr, "mapping %p -> %p -> %p len:0x%lx prot:%x\n", m.hyper, m.guest_pa, m.guest_va, m.len, prot);
-        HYP_ASSERT_SUCCESS(hv_vm_map(m.hyper, (hv_ipa_t)m.guest_pa, m.len, prot));
+        fprintf(stderr, "mapping %p -> %p -> %p len:0x%lx prot:%x\n", m.hyper, m.guest_pa, m.guest_va, m.len);
+        HYP_ASSERT_SUCCESS(hv_vm_map(m.hyper, (hv_ipa_t)m.guest_pa, m.len, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC));
 
         for (size_t offset = 0; offset < m.len; offset += 0x1000) {
             uint64_t pa = (uint64_t)m.guest_pa + offset;
@@ -135,10 +125,10 @@ int main(int argc, char **argv)
             // ghost: TODO: these are all rwx effectively
             l3pt[l3idx] = (uint64_t)pa | 0b11 | (1 << 5) | (0b01 << 6) | (0b11 << 8) | (1 << 10);
             // privileged?
-            if (va > (1ULL << 48)) {
+            //if (va > (1ULL << 48)) {
                 l3pt[l3idx] &= ~(0b11 << 6);
-            }
-            fprintf(stderr, "page descriptor (idx %d): %p\n", l3idx, l3pt[l3idx]);
+            //}
+            //fprintf(stderr, "page descriptor (idx %d): %p\n", l3idx, l3pt[l3idx]);
         }
     }
 
@@ -149,11 +139,12 @@ int main(int argc, char **argv)
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, PAGING_PA));  // ghost: this should use 2 tables but ^ needs refactoring before that
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, 0x1005));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, (3 << 20)));
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c0));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c4));  // ghost: figure out why 3c0 causes faults
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, VBAR_ADDR));
 
     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, res.entry_point));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, res.stack_top));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, res.stack_top)); // ghost: when we go back to el0, remove
 
     HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_exceptions(vcpu, true));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_reg_accesses(vcpu, true));
@@ -170,13 +161,30 @@ int main(int argc, char **argv)
                 uint64_t x0;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
                 printf("VM made an HVC call! x0 register holds 0x%llx\n", x0);
-
                 uint64_t pc;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
                 printf("PC: 0x%llx\n", pc);
                 uint64_t elr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
                 printf("ELR_EL1: 0x%llx\n", elr);
+                uint64_t esr;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr));
+                printf("ESR: 0x%llx\n", esr);
+
+                if (esr == 0x56000080) {  // SVC in aarch64
+                    uint64_t args[6];
+                    for (int i = HV_REG_X0; i < HV_REG_X6; i++) {
+                        HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, i, &args[i - HV_REG_X0]));
+                    }
+                    uint64_t num;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X16, &num));
+                    printf("forwarding syscall %d(%p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5]);
+                    uint64_t ret = syscall(num, args[0], args[1], args[2], args[3], args[4], args[5]);
+                    printf("ret: %p\n", ret);
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, elr));
+                    continue;
+                }
+
                 uint64_t far;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
                 printf("FAR_EL1: 0x%llx\n", far);

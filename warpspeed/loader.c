@@ -187,6 +187,12 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
         .len = PAGE_SIZE,
         .prot = PROT_READ | PROT_WRITE,
     };
+    lr->mappings[lr->n_mappings++] = (struct vm_mmap){
+        .hyper = commpage,
+        .guest_va = _COMM_PAGE64_RO_ADDRESS,
+        .len = PAGE_SIZE,
+        .prot = PROT_READ,
+    };
     commpage_setup(commpage);
 
 	struct rlimit limit;

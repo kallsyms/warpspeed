@@ -18,6 +18,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/swap.h>
+#include <mach/vm_region.h>
+#include <mach/mach_vm.h>
+#include <mach/mach.h>
+
 #include <Hypervisor/Hypervisor.h>
 
 #include "loader.h"
@@ -34,9 +41,15 @@ const char brk_insns[4] = {0x00, 0x00, 0x20, 0xD4};
 const char hvc_insns[4] = {0x02, 0x00, 0x00, 0xD4};
 
 #define HV_PAGE_SIZE 16384
-#define PAGING_PA   (0x10000)
+#define PAGE_ALIGN(x) (x & ~(HV_PAGE_SIZE-1))
+#define PAGE_ROUNDUP(x) (((((x)-1) / HV_PAGE_SIZE)+1) * HV_PAGE_SIZE)
+#define PAGING_PA   (0x20000)
 #define VBAR_ADDR (0xffffffffffff0000ULL)
-#define VBAR_PA (0x20000)
+#define VBAR_PA (0x10000)
+
+// ghost: TODO Multiple return vals
+extern uint64_t syscall_t(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t num);
+extern int     __shared_region_check_np(uint64_t *startaddress);
 
 int main(int argc, char **argv)
 {
@@ -55,7 +68,7 @@ int main(int argc, char **argv)
     HYP_ASSERT_SUCCESS(hv_vm_create(NULL));
     HYP_ASSERT_SUCCESS(hv_vcpu_create(&vcpu, &vcpu_exit, NULL));
 
-    // Configure initial VBAR_EL1 to BRKs
+    // Configure initial VBAR_EL1 to HVCs
     uint32_t *vbar = mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     for (int i = 0; i < (HV_PAGE_SIZE / sizeof(hvc_insns)); i++) {
         memcpy(vbar + i, hvc_insns, sizeof(hvc_insns));
@@ -68,9 +81,55 @@ int main(int argc, char **argv)
         .prot = PROT_READ | PROT_EXEC,
     };
 
+    // TLS
+    uint64_t tpidrro_el0;
+    asm volatile("mrs %0, tpidrro_el0": "=r"(tpidrro_el0));
+    printf("tls %p\n", tpidrro_el0);
+    void *tls= mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    // copy out of the host TLS to ensure tid and similar are correct
+    // ghost: TODO: do we need to zero anything? locks?
+    memcpy(tls, PAGE_ALIGN(tpidrro_el0), HV_PAGE_SIZE);
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDRRO_EL0, tpidrro_el0));
+    res.mappings[res.n_mappings++] = (struct vm_mmap) {
+        .hyper = (void*)tls,
+        .guest_va = PAGE_ALIGN(tpidrro_el0),
+        .len = HV_PAGE_SIZE,
+        .prot = PROT_READ | PROT_WRITE,
+    };
+
+    /* // shared region */
+    /* uint64_t shared_base; */
+    /* __shared_region_check_np(&shared_base); */
+    /* mach_port_t task = mach_task_self(); */
+
+    /* // Get the virtual memory map for the task */
+    /* vm_region_basic_info_data_64_t info; */
+    /* mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; */
+    /* mach_vm_address_t address = (mach_vm_address_t)shared_base; */
+    /* mach_vm_size_t shared_size = 0; */
+    /* mach_port_t object_name; */
+
+    /* kern_return_t result = mach_vm_region(task, &address, &shared_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object_name); */
+    /* if (result != KERN_SUCCESS) { */
+    /*     exit(1); */
+    /* } */
+    /* printf("shared base: %p\n", shared_base); */
+    /* printf("shared size: %p\n", shared_size); */
+    /* printf("stuff: %llx\n", *(uint64_t*)shared_base); */
+
+    /* //shared_size = 0x571fc000; */
+    /* void *inner_sb = mmap(0, shared_size, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); */
+    /* memcpy(inner_sb, shared_base, shared_size); */
+    /* res.mappings[res.n_mappings++] = (struct vm_mmap) { */
+    /*     .hyper = (void*)inner_sb, */
+    /*     .guest_va = (void*)shared_base, */
+    /*     .len = shared_size, */
+    /*     .prot = PROT_READ | PROT_EXEC, */
+    /* }; */
+
     // Configure 1:1 translation tables
-    uint64_t *page_tables = mmap(0, HV_PAGE_SIZE * 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    HYP_ASSERT_SUCCESS(hv_vm_map(page_tables, (hv_ipa_t)PAGING_PA, HV_PAGE_SIZE * 4, PROT_READ | PROT_WRITE));
+    uint64_t *page_tables = mmap(0, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    HYP_ASSERT_SUCCESS(hv_vm_map(page_tables, (hv_ipa_t)PAGING_PA, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE));
 
     uint64_t dyn_pa_base = 0x13370000;  // if guest_pa is not explicitly set, the next available physical address to use
     uint16_t tblidx = 1;
@@ -80,7 +139,7 @@ int main(int argc, char **argv)
             m.guest_pa = dyn_pa_base;
             dyn_pa_base += m.len;
         }
-        fprintf(stderr, "mapping %p -> %p -> %p len:0x%lx prot:%x\n", m.hyper, m.guest_pa, m.guest_va, m.len);
+        fprintf(stderr, "mapping %p -> %p -> %p len:0x%lx\n", m.hyper, m.guest_pa, m.guest_va, m.len);
         HYP_ASSERT_SUCCESS(hv_vm_map(m.hyper, (hv_ipa_t)m.guest_pa, m.len, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC));
 
         for (size_t offset = 0; offset < m.len; offset += 0x1000) {
@@ -132,18 +191,23 @@ int main(int argc, char **argv)
         }
     }
 
+    //memcpy(res.entry_point + (0x000055f4 - 0x00004950), brk_insns, sizeof(brk_insns));
+
     // https://github.com/Impalabs/hyperpom/blob/85a4df8b6af2babf3689bd4c486fcbbd4c831f8a/src/memory.rs#L1836
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0x44));
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0xff));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, 0x10 | (0x10 << 16) | (0b10 << 30) | (1ULL << 39) | (1ULL << 40)));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, PAGING_PA));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, PAGING_PA));  // ghost: this should use 2 tables but ^ needs refactoring before that
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, 0x1005));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, (3 << 20)));
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c4));  // ghost: figure out why 3c0 causes faults
+    // (1 << 0) = SP_ELn
+    // (0 << 1) = 64-bit
+    // (0b01 << 2) = EL1
+    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5));  // ghost: figure out why 3c0 (running in el0) causes faults
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, VBAR_ADDR));
 
     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, res.entry_point));
-    HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, res.stack_top));
+    //HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, res.stack_top));
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, res.stack_top)); // ghost: when we go back to el0, remove
 
     HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_exceptions(vcpu, true));
@@ -170,6 +234,16 @@ int main(int argc, char **argv)
                 uint64_t esr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr));
                 printf("ESR: 0x%llx\n", esr);
+                uint64_t cpsr;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr));
+
+                printf("Reg dump:\n");
+                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
+                    uint64_t s;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
+                    printf("X%d: 0x%llx\n", reg, s);
+                }
+
 
                 if (esr == 0x56000080) {  // SVC in aarch64
                     uint64_t args[6];
@@ -178,10 +252,25 @@ int main(int argc, char **argv)
                     }
                     uint64_t num;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X16, &num));
-                    printf("forwarding syscall %d(%p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5]);
-                    uint64_t ret = syscall(num, args[0], args[1], args[2], args[3], args[4], args[5]);
-                    printf("ret: %p\n", ret);
+                    printf("forwarding syscall %p(%p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5]);
+                    uint64_t ret = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], num);
+                    uint64_t cflags;
+                    asm volatile ("mrs %0, NZCV" : "=r"(cflags));
+                    uint64_t ret1;
+                    // ghost: is this correct? binja says this is good
+                    asm volatile ("mov %0, x1" : "=r"(ret1));
+                    printf("ret: %p %p\n", ret, ret1);
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X0, ret));
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X1, ret1));
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, (cpsr & (~(0b1111ULL << 28))) | cflags));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, elr));
+
+                    uint64_t x;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x));
+                    printf("stack:\n");
+                    for (int offset = 0; offset > -0x20; offset -= 1) {
+                        printf("%d: %p\n", offset, ((uint64_t*)x)[offset]);
+                    }
                     continue;
                 }
 
@@ -192,15 +281,20 @@ int main(int argc, char **argv)
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
                 printf("ESR: 0x%llx\n", x);
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &x));
-                printf("sctlr %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x));
-                printf("cpacr %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &x));
-                printf("ttbr0 %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x));
-                printf("tcr %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_PAR_EL1, &x));
+                /* printf("sctlr %llx\n", x); */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x)); */
+                /* printf("cpacr %llx\n", x); */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &x)); */
+                /* printf("ttbr0 %llx\n", x); */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x)); */
+                /* printf("tcr %llx\n", x); */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_PAR_EL1, &x)); */
                 printf("par %llx\n", x);
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x));
+                printf("stack:\n");
+                for (int offset = 0; offset > -0x20; offset -= 1) {
+                    printf("%d: %p\n", offset, ((uint64_t*)x)[offset]);
+                }
 
                 break;
             } else if (ec == 0x17) {
@@ -240,13 +334,13 @@ int main(int argc, char **argv)
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
                 printf("ESR: 0x%llx\n", x);
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &x));
-                printf("sctlr %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x));
-                printf("cpacr %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &x));
-                printf("ttbr0 %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x));
-                printf("tcr %llx\n", x);
+                /* printf("sctlr %llx\n", x); */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x)); */
+                /* printf("cpacr %llx\n", x); */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &x)); */
+                /* printf("ttbr0 %llx\n", x); */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x)); */
+                /* printf("tcr %llx\n", x); */
                 break;
             } else {
                 uint64_t pc;

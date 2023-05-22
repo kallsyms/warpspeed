@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "common.h"
+
 static const char* SIGNATURE32 = "commpage 32-bit";
 static const char* SIGNATURE64 = "commpage 64-bit";
 
@@ -26,7 +28,7 @@ void commpage_setup(uint8_t *commpage)
 	uint8_t *physcpus, *logcpus;
 	uint8_t *user_page_shift, *kernel_page_shift;
 
-    fprintf(stderr, "Setting up commpage at %p\n", commpage);
+    LOG("Setting up commpage at %p\n", commpage);
 
 	signature = (char*)CGET(_COMM_PAGE_SIGNATURE);
 	version = (uint16_t*)CGET(_COMM_PAGE_VERSION);

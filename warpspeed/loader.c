@@ -11,6 +11,7 @@
 #include <string.h>
 #include <fcntl.h>
 
+#include "common.h"
 #include "commpage.h"
 #include "loader.h"
 
@@ -27,12 +28,12 @@ static void* compatible_mmap(struct load_results *lr, void *addr, size_t length,
     }
     length = PAGE_ROUNDUP(length);
 
-    fprintf(stderr, "alloc %lu = mmap(addr=%p, len=0x%lx, prot=0x%x, flags=0x%x, fd=%d, offset=%llx)\n", lr->n_mappings, addr, length, prot, flags, fd, offset);
+    LOG("alloc %lu = mmap(addr=%p, len=0x%lx, prot=0x%x, flags=0x%x, fd=%d, offset=%llx)\n", lr->n_mappings, addr, length, prot, flags, fd, offset);
 
     if (lr->n_mappings > 0 && lr->mappings[lr->n_mappings - 1].guest_va == addr) {
         struct vm_mmap prev = lr->mappings[lr->n_mappings - 1];
         if (prev.len != length || prev.prot != prot) {
-            fprintf(stderr, "prior %p alloc was ( %lx, %x), now is (%lx, %x)\n", addr, prev.len, prev.prot, length, prot);
+            LOG("prior %p alloc was ( %lx, %x), now is (%lx, %x)\n", addr, prev.len, prev.prot, length, prot);
         }
     } else {
         lr->mappings[lr->n_mappings++] = (struct vm_mmap){
@@ -70,7 +71,7 @@ static void load_fat(int fd, bool expect_dylinker, struct load_results* lr) {
 
 	if (read(fd, &fhdr, sizeof(fhdr)) != sizeof(fhdr))
 	{
-		fprintf(stderr, "Cannot read fat file header.\n");
+		LOG("Cannot read fat file header.\n");
 		exit(1);
 	}
 
@@ -96,7 +97,7 @@ static void load_fat(int fd, bool expect_dylinker, struct load_results* lr) {
 
 		if (read(fd, &arch, sizeof(arch)) != sizeof(arch))
 		{
-			fprintf(stderr, "Cannot read fat_arch header.\n");
+			LOG("Cannot read fat_arch header.\n");
 			exit(1);
 		}
 
@@ -111,10 +112,10 @@ static void load_fat(int fd, bool expect_dylinker, struct load_results* lr) {
 
         // ghost: !forced_arch removed - always look for arm64
         if (arch.cputype == CPU_TYPE_ARM64) {
-            fprintf(stderr, "Found arm64 part of fat binary\n");
+            LOG("Found arm64 part of fat binary\n");
             if (lseek(fd, arch.offset, SEEK_SET) == -1)
             {
-                fprintf(stderr, "Cannot seek to selected arch in fat binary.\n");
+                LOG("Cannot seek to selected arch in fat binary.\n");
                 exit(1);
             }
             load64(fd, expect_dylinker, lr);
@@ -122,7 +123,7 @@ static void load_fat(int fd, bool expect_dylinker, struct load_results* lr) {
         }
 	}
 
-    fprintf(stderr, "No supported architecture found in fat binary.\n");
+    LOG("No supported architecture found in fat binary.\n");
     exit(1);
 }
 
@@ -135,7 +136,7 @@ void load(const char* path, bool expect_dylinker, struct load_results* lr)
 	fd = open(path, O_RDONLY);
 	if (fd == -1)
 	{
-		fprintf(stderr, "Cannot open %s: %s\n", path, strerror(errno));
+		LOG("Cannot open %s: %s\n", path, strerror(errno));
 		exit(1);
 	}
 
@@ -147,25 +148,25 @@ void load(const char* path, bool expect_dylinker, struct load_results* lr)
 
 	if (read(fd, &magic, sizeof(magic)) != sizeof(magic))
 	{
-		fprintf(stderr, "Cannot read the file header of %s.\n", path);
+		LOG("Cannot read the file header of %s.\n", path);
 		exit(1);
 	}
 
 	if (magic == MH_MAGIC_64 || magic == MH_CIGAM_64)
 	{
 		lseek(fd, 0, SEEK_SET);
-        fprintf(stderr, "Loading 64bit binary %s\n", path);
+        LOG("Loading 64bit binary %s\n", path);
 		load64(fd, expect_dylinker, lr);
 	}
 	else if (magic == FAT_MAGIC || magic == FAT_CIGAM)
 	{
 		lseek(fd, 0, SEEK_SET);
-        fprintf(stderr, "Loading fat binary %s\n", path);
+        LOG("Loading fat binary %s\n", path);
 		load_fat(fd, expect_dylinker, lr);
 	}
 	else
 	{
-		fprintf(stderr, "Unknown file format: %s.\n", path);
+		LOG("Unknown file format: %s.\n", path);
 		exit(1);
 	}
 
@@ -173,12 +174,12 @@ void load(const char* path, bool expect_dylinker, struct load_results* lr)
 }
 
 static void setup_space(struct load_results* lr, bool is_64_bit) {
-    fprintf(stderr, "setup_space\n");
+    LOG("setup_space\n");
 
 	uint8_t *commpage = (uint8_t*) mmap((void*)0xf00d0000, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (commpage == MAP_FAILED)
 	{
-		fprintf(stderr, "Cannot mmap commpage: %s\n", strerror(errno));
+		LOG("Cannot mmap commpage: %s\n", strerror(errno));
 		exit(1);
 	}
     lr->mappings[lr->n_mappings++] = (struct vm_mmap){
@@ -207,7 +208,7 @@ static void setup_space(struct load_results* lr, bool is_64_bit) {
 	uint8_t *stack = (uint8_t*) mmap((void*)0xdead0000, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (stack == MAP_FAILED)
 	{
-		fprintf(stderr, "Cannot mmap stack: %s\n", strerror(errno));
+		LOG("Cannot mmap stack: %s\n", strerror(errno));
 		exit(1);
 	}
     lr->mappings[lr->n_mappings++] = (struct vm_mmap){
@@ -256,19 +257,19 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 	if (read(fd, &header, sizeof(header)) != sizeof(header))
 	{
-		fprintf(stderr, "Cannot read the mach header.\n");
+		LOG("Cannot read the mach header.\n");
 		exit(1);
 	}
 
 	if (header.filetype != (expect_dylinker ? MH_DYLINKER : MH_EXECUTE))
 	{
-		fprintf(stderr, "Found unexpected Mach-O file type: %u\n", header.filetype);
+		LOG("Found unexpected Mach-O file type: %u\n", header.filetype);
 		exit(1);
 	}
 
 	tmp_map_base = mmap(NULL, PAGE_ROUNDUP(sizeof(header) + header.sizeofcmds), PROT_READ, MAP_PRIVATE, fd, fat_offset);
 	if (tmp_map_base == MAP_FAILED) {
-		fprintf(stderr, "Failed to mmap header + commands\n");
+		LOG("Failed to mmap header + commands\n");
 		exit(1);
 	}
 
@@ -301,7 +302,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 		slide = (uintptr_t) mmap((void*) base, mmapSize, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_EXTRA, -1, 0);
 		if (slide == (uintptr_t)MAP_FAILED)
 		{
-			fprintf(stderr, "Cannot mmap anonymous memory range: %s\n", strerror(errno));
+			LOG("Cannot mmap anonymous memory range: %s\n", strerror(errno));
 			exit(1);
 		}
 
@@ -316,7 +317,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 		pie = true;
 	}
 
-    fprintf(stderr, "slide: %lx\n", slide);
+    LOG("slide: %lx\n", slide);
 
 	for (uint32_t i = 0, p = 0; i < header.ncmds && p < header.sizeofcmds; i++)
 	{
@@ -349,7 +350,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 							addr += slide;
 
 						// Some segments' filesize != vmsize, thus this mprotect().
-                        fprintf(stderr, "segment fsz<vmsz, slide\n");
+                        LOG("segment fsz<vmsz, slide\n");
 						rv = compatible_mmap(lr, (void*)addr, seg->vmsize, useprot, MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
 						if (rv == (void*)MAP_FAILED)
 						{
@@ -358,7 +359,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 								// if we can't map it, assume everything is fine and the system has already made that area inaccessible
 								rv = 0;
 							} else {
-								fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
+								LOG("Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
 								exit(1);
 							}
 						}
@@ -366,7 +367,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 					else
 					{
 						size_t size = seg->vmsize - seg->filesize;
-                        fprintf(stderr, "segment fsz<vmsz, no slide\n");
+                        LOG("segment fsz<vmsz, no slide\n");
 						rv = compatible_mmap(lr, (void*) PAGE_ALIGN(seg->vmaddr + seg->vmsize - size), PAGE_ROUNDUP(size), useprot,
 								MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
 						if (rv == (void*)MAP_FAILED)
@@ -376,7 +377,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 								// if we can't map it, assume everything is fine and the system has already made that area inaccessible
 								rv = 0;
 							} else {
-								fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
+								LOG("Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
 								exit(1);
 							}
 						}
@@ -390,7 +391,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 					if (seg->filesize < seg->vmsize) {
 						flag = MAP_FIXED;
 					}
-                    fprintf(stderr, "segment fsz>0\n");
+                    LOG("segment fsz>0\n");
 					rv = compatible_mmap(lr, (void*)addr, seg->filesize, useprot,
 							flag | MAP_PRIVATE, fd, seg->fileoff + fat_offset);
 					if (rv == (void*)MAP_FAILED)
@@ -400,7 +401,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 							// if we can't map it, assume everything is fine and the system has already made that area inaccessible
 							rv = 0;
 						} else {
-							fprintf(stderr, "Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
+							LOG("Cannot mmap segment %s at %p: %s\n", seg->segname, (void*)(uintptr_t)seg->vmaddr, strerror(errno));
 							exit(1);
 						}
 					}
@@ -438,11 +439,11 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
                     case ARM_THREAD_STATE64: {
                         entryPoint = ((uint32_t*)lc)[0x44];
                         entryPoint += slide;
-                        fprintf(stderr, "unixthread entrypoint: %p\n", entryPoint);
+                        LOG("unixthread entrypoint: %p\n", entryPoint);
                         break;
                     }
                     default:
-                        fprintf(stderr, "unhandled unixthread flavor %d\n", flavor);
+                        LOG("unhandled unixthread flavor %d\n", flavor);
                         exit(1);
                         break;
                 }
@@ -453,7 +454,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 				if (header.filetype != MH_EXECUTE)
 				{
 					// dylinker can't reference another dylinker
-					fprintf(stderr, "Dynamic linker can't reference another dynamic linker\n");
+					LOG("Dynamic linker can't reference another dynamic linker\n");
 					exit(1);
 				}
 
@@ -469,7 +470,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 					length = linker_len + root_len;
 					if (length > sizeof(path_buffer) - 1) {
-						fprintf(stderr, "Dynamic loader path too long");
+						LOG("Dynamic loader path too long");
 						exit(1);
 					}
 					path = path_buffer;
@@ -484,7 +485,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 				{
 					length = dy->cmdsize - dy->name.offset;
 					if (length > sizeof(path_buffer) - 1) {
-						fprintf(stderr, "Dynamic loader path too long");
+						LOG("Dynamic loader path too long");
 						exit(1);
 					}
 					path = path_buffer;
@@ -495,11 +496,11 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 
 				if (path == NULL)
 				{
-					fprintf(stderr, "Failed to load dynamic linker for executable\n");
+					LOG("Failed to load dynamic linker for executable\n");
 					exit(1);
 				}
 
-                fprintf(stderr, "Loading dylinker %s\n", path);
+                LOG("Loading dylinker %s\n", path);
 				load(path, true, lr);
 
 				break;
@@ -528,7 +529,7 @@ static void FUNCTION_NAME(int fd, bool expect_dylinker, struct load_results* lr)
 	if (header.filetype == MH_EXECUTE)
 		lr->mh = (uintptr_t) mappedHeader;
 	if (entryPoint && !lr->entry_point) {
-        fprintf(stderr, "setting entrypoint: %lx\n", entryPoint);
+        LOG("setting entrypoint: %lx\n", entryPoint);
 		lr->entry_point = entryPoint;
     }
 
@@ -581,7 +582,7 @@ void setup_stack64(const char* filepath, struct load_results* lr)
 	strncpy(executable_buf, filepath, 4096);
 	if (executable_buf[sizeof(executable_buf) - 1] != '\0')
 	{
-		fprintf(stderr, "File path was too big\n");
+		LOG("File path was too big\n");
 		exit(1);
 	}
 
@@ -641,12 +642,12 @@ void setup_stack64(const char* filepath, struct load_results* lr)
 	// XXX: skip this for static executables, but we don't support them anyway...
 	if (__put_user((user_long_t) lr->mh, sp++))
 	{
-		fprintf(stderr, "Failed to copy mach header address to stack\n");
+		LOG("Failed to copy mach header address to stack\n");
 		exit(1);
 	}
 	if (__put_user((user_long_t) lr->argc, sp++))
 	{
-		fprintf(stderr, "Failed to copy argument count to stack\n");
+		LOG("Failed to copy argument count to stack\n");
 		exit(1);
 	}
 
@@ -660,13 +661,13 @@ void setup_stack64(const char* filepath, struct load_results* lr)
 		}
 		if (__put_user((user_long_t) lr->argv[i], argv++))
 		{
-			fprintf(stderr, "Failed to copy an argument pointer to stack\n");
+			LOG("Failed to copy an argument pointer to stack\n");
 			exit(1);
 		}
 	}
 	if (__put_user((user_long_t) 0, argv++))
 	{
-		fprintf(stderr, "Failed to null-terminate the argument pointer array\n");
+		LOG("Failed to null-terminate the argument pointer array\n");
 		exit(1);
 	}
 
@@ -681,13 +682,13 @@ void setup_stack64(const char* filepath, struct load_results* lr)
 
 		if (__put_user((user_long_t) lr->envp[i], envp++))
 		{
-			fprintf(stderr, "Failed to copy an environment variable pointer to stack\n");
+			LOG("Failed to copy an environment variable pointer to stack\n");
 			exit(1);
 		}
 	}
 	if (__put_user((user_long_t) 0, envp++))
 	{
-		fprintf(stderr, "Failed to null-terminate the environment variable pointer array\n");
+		LOG("Failed to null-terminate the environment variable pointer array\n");
 		exit(1);
 	}
 
@@ -697,7 +698,7 @@ void setup_stack64(const char* filepath, struct load_results* lr)
 	{
 		if (__put_user((user_long_t)(unsigned long) applep_contents[i], applep++))
 		{
-			fprintf(stderr, "Failed to copy an applep value to stack\n");
+			LOG("Failed to copy an applep value to stack\n");
 			exit(1);
 		}
 	}

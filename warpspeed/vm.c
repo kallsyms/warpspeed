@@ -38,7 +38,7 @@ const char hvc_insns[4] = {0x02, 0x00, 0x00, 0xD4};
 #define VBAR_PA (0x10000)
 
 // ghost: TODO Multiple return vals
-extern uint64_t syscall_t(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t num);
+extern uint64_t syscall_t(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7, uint64_t num);
 extern int     __shared_region_check_np(uint64_t *startaddress);
 
 uint64_t dyn_pa_base = 0x13370000;  // if guest_pa is not explicitly set, the next available physical address to use
@@ -310,13 +310,13 @@ int main(int argc, char **argv)
                 }
 
                 if (esr == 0x56000080) {  // SVC in aarch64
-                    uint64_t args[6];
-                    for (int i = HV_REG_X0; i < HV_REG_X6; i++) {
+                    uint64_t args[8];
+                    for (int i = HV_REG_X0; i < HV_REG_X8; i++) {
                         HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, i, &args[i - HV_REG_X0]));
                     }
                     uint64_t num;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X16, &num));
-                    LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5]);
+                    LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
                     uint64_t cflags, ret0, ret1;
                     switch (num) {
                         case 0x126:  // shared_region_check_np
@@ -325,7 +325,8 @@ int main(int argc, char **argv)
                             ret1 = 0;
                             cflags = 0;
                             break;
-                        case 0x150: // proc_info
+                        case 0x150: // proc_info (PROC_INFO_CALL_SET_DYLD_IMAGES is what we really care about)
+                            assert(args[0] == 0xf);
                             ret0 = 0;
                             ret1 = 0;
                             cflags = 0;
@@ -337,7 +338,7 @@ int main(int argc, char **argv)
                             cflags = 0;
                             break;
                         default:
-                            ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], num);
+                            ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], num);
                             asm volatile ("mov %0, x1" : "=r"(ret1));
                             asm volatile ("mrs %0, NZCV" : "=r"(cflags));
                             switch (num) {
@@ -351,6 +352,38 @@ int main(int argc, char **argv)
                                         .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
                                     };
                                     do_map(m);
+                                    break;
+                                }
+                                case 0xffffffffffffffd1: { // mach_msg2
+                                    // ghost - TASK_DYLD_INFO hack
+                                    // let the kernel return a correct version, then adjust the addr
+                                    // commented code below is if we need to stub the trap entirely
+                                    /* uint32_t flavor = *(uint32_t*)((void*)args[0] + 0x20); */
+                                    /* assert(flavor == 0x11); */
+                                    /* // drop in a fake task_dyld_info */
+                                    /* // magic values here are copied from what xnu does for real. no idea. */
+                                    /* *(mach_msg_header_t*)args[0] = (mach_msg_header_t) { */
+                                    /*     .msgh_bits = 0x1200, */
+                                    /*     .msgh_size = 0x3c, */
+                                    /*     .msgh_remote_port = 0, */
+                                    /*     .msgh_local_port = ((mach_msg_header_t*)args[0])->msgh_remote_port, */
+                                    /*     .msgh_id = ((mach_msg_header_t*)args[0])->msgh_id + 100, */
+                                    /* }; */
+                                    uint32_t *inner = args[0] + sizeof(mach_msg_header_t);
+                                    /* inner[0] = 0; */
+                                    /* inner[1] = 1; */
+                                    /* inner[2] = 0; */
+                                    /* inner[3] = 5;  // sizeof(task_dyld_info) / sizeof(natural_t) */
+                                    struct task_dyld_info *out = &inner[4];
+                                    LOG("%d\n", *(uint32_t*)out->all_image_info_addr);
+                                    out->all_image_info_addr += shared_offset;
+                                    LOG("adjusted all_image_info to %p\n", out->all_image_info_addr);
+                                    LOG("%d\n", *(uint32_t*)out->all_image_info_addr);
+                                    /* out->all_image_info_size = 0x170; */
+                                    /* out->all_image_info_format = 1; */
+                                    /* ret0 = 0; */
+                                    /* ret1 = 0x200000003; */
+                                    /* cflags = 0xa0000000; */
                                     break;
                                 }
                                 case 0xfffffffffffffff6: { // mach_vm_allocate
@@ -370,15 +403,14 @@ int main(int argc, char **argv)
                             }
                             break;
                     }
-                    // ghost: is this correct? binja says this is good
-                    LOG("ret: %p %p\n", ret0, ret1);
+                    LOG("ret: %p %p %p\n", ret0, ret1, cflags);
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X0, ret0));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X1, ret1));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, (cpsr & (~(0b1111ULL << 28))) | cflags));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, elr));
 
-                    uint64_t x;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x));
+                    /* uint64_t x; */
+                    /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x)); */
                     /* LOG("stack:\n"); */
                     /* for (int offset = 0; offset > -0x20; offset -= 1) { */
                     /*     LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]); */

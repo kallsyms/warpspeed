@@ -1,14 +1,3 @@
-// simplevm.c: demonstrates Hypervisor.Framework usage in Apple Silicon
-// Based on the work by @zhuowei
-// @imbushuo - Nov 2020
-
-// To build:
-// Prepare the entitlement with BOTH com.apple.security.hypervisor and com.apple.vm.networking WHEN SIP IS OFF
-// Prepare the entitlement com.apple.security.hypervisor and NO com.apple.vm.networking WHEN SIP IS ON
-// ^ Per @never_released, tested on 11.0.1, idk why
-// clang -o simplevm -O2 -framework Hypervisor -mmacosx-version-min=11.0 simplevm.c
-// codesign --entitlements simplevm.entitlements --force -s - simplevm             
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,6 +102,37 @@ void do_map(struct vm_mmap m) {
     }
 }
 
+typedef struct {
+	char     magic[16];
+	uint32_t mappingOffset;
+	uint32_t mappingCount;
+	uint32_t imagesOffsetOld;
+	uint32_t imagesCountOld;
+	uint64_t dyldBaseAddress;
+	uint64_t codeSignatureOffset;
+	uint64_t codeSignatureSize;
+	uint64_t slideInfoOffset;
+	uint64_t slideInfoSize;
+	uint64_t localSymbolsOffset;
+	uint64_t localSymbolsSize;
+	uint8_t  uuid[16];
+	uint64_t cacheType;
+	uint32_t branchPoolsOffset;
+	uint32_t branchPoolsCount;
+	uint64_t accelerateInfoAddr;
+	uint64_t accelerateInfoSize;
+	uint64_t imagesTextOffset;
+	uint64_t imagesTextCount;
+} cache_hdr_t;
+
+typedef struct {
+	uint64_t address;
+	uint64_t size;
+	uint64_t fileOffset;
+	uint32_t maxProt;
+	uint32_t initProt;
+} cache_map_t;
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -159,35 +179,84 @@ int main(int argc, char **argv)
         .prot = PROT_READ | PROT_WRITE,
     };
 
-    /* // shared region */
-    /* uint64_t shared_base; */
-    /* __shared_region_check_np(&shared_base); */
-    /* mach_port_t task = mach_task_self(); */
+    // shared region
+    // ghost: this works for most stuff, but doesn't include the LINKEDIT section
+    uint64_t shared_base;
+    __shared_region_check_np(&shared_base);
+    LOG("shared base: %p\n", shared_base);
+    cache_hdr_t *hdr = (cache_hdr_t*)shared_base;
+    LOG("map offset %x\n", hdr->mappingOffset);
+    mach_port_t self = mach_task_self();
+    uint64_t addr;
+    for (int i = 0; i < hdr->mappingCount; i++) {
+        cache_map_t *map = (cache_map_t*)(shared_base + hdr->mappingOffset + i * sizeof(cache_map_t));
+        LOG("map %d: addr %p size %p foff %p\n", i, map->address, map->size, map->fileOffset);
 
-    /* // Get the virtual memory map for the task */
-    /* vm_region_basic_info_data_64_t info; */
-    /* mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; */
-    /* mach_vm_address_t address = (mach_vm_address_t)shared_base; */
-    /* mach_vm_size_t shared_size = 0; */
-    /* mach_port_t object_name; */
+        uint64_t start = 0;
+        uint64_t len = 0;
+        for (addr = map->address; addr < map->address + map->size; addr += HV_PAGE_SIZE) {
+            char tmp;
+            mach_vm_size_t outsize = 0;
+            bool addr_ok = (mach_vm_read_overwrite(self, addr, 1, &tmp, &outsize) == KERN_SUCCESS);
+            if (addr_ok) {
+                if (start == 0) {
+                    start = addr;
+                }
+                len += HV_PAGE_SIZE;
+            } else if (start && !addr_ok) {
+                LOG("adding contiguous mapping %p-%p\n", start, start+len);
+                void *shared_copy = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                memcpy(shared_copy, start, len);
+                res.mappings[res.n_mappings++] = (struct vm_mmap) {
+                    .hyper = (void*)shared_copy,
+                    .guest_va = (void*)start,
+                    .len = len,
+                    .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+                };
+                start = 0;
+                len = 0;
+            }
 
-    /* kern_return_t result = mach_vm_region(task, &address, &shared_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object_name); */
-    /* if (result != KERN_SUCCESS) { */
-    /*     exit(1); */
+        }
+
+        if (start) {
+            LOG("adding contiguous mapping %p-%p\n", start, start+len);
+            void *shared_copy = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            memcpy(shared_copy, start, len);
+            res.mappings[res.n_mappings++] = (struct vm_mmap) {
+                .hyper = (void*)shared_copy,
+                .guest_va = (void*)start,
+                .len = len,
+                .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+            };
+        }
+    }
+
+    /* for (int image_idx = 0; image_idx < _dyld_image_count(); image_idx++) { */
+    /*     uint64_t slide = _dyld_get_image_vmaddr_slide(image_idx); */
+    /*     const struct mach_header *header = _dyld_get_image_header(image_idx); */
+    /*     const char *name = _dyld_get_image_name(image_idx); */
+    /*     LOG("image %d: %p %s\n", image_idx, (void*)header + slide, name); */
+    /*     const struct load_command *cmds = (const struct load_command *)(header + sizeof(struct mach_header)); */
+
+    /*     for (int i = 0; i < header->ncmds; i++) */
+    /*     { */
+    /*         struct load_command* lc = (struct load_command*)&cmds[i]; */
+    /*         if (lc->cmd == LC_SEGMENT_64) { */
+    /*             const struct segment_command_64 *cmd = (const struct segment_command_64 *)lc; */
+    /*             LOG("  map %p-%p\n", cmd->vmaddr + slide, cmd->vmaddr + cmd->vmsize + slide); */
+    /*             res.mappings[res.n_mappings++] = (struct vm_mmap) { */
+    /*                 .hyper = (void*)cmd->vmaddr + slide, */
+    /*                 .guest_va = (void*)cmd->vmaddr + slide, */
+    /*                 .len = PAGE_ROUNDUP(cmd->vmsize), */
+    /*                 .prot = PROT_READ | PROT_WRITE | PROT_EXEC, */
+    /*             }; */
+    /*         } */
+    /*     } */
     /* } */
-    /* LOG("shared base: %p\n", shared_base); */
-    /* LOG("shared size: %p\n", shared_size); */
-    /* LOG("stuff: %llx\n", *(uint64_t*)shared_base); */
 
-    /* //shared_size = 0x571fc000; */
     /* void *inner_sb = mmap(0, shared_size, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); */
     /* memcpy(inner_sb, shared_base, shared_size); */
-    /* res.mappings[res.n_mappings++] = (struct vm_mmap) { */
-    /*     .hyper = (void*)inner_sb, */
-    /*     .guest_va = (void*)shared_base, */
-    /*     .len = shared_size, */
-    /*     .prot = PROT_READ | PROT_EXEC, */
-    /* }; */
 
     // Configure 1:1 translation tables
     page_tables = mmap(0, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -261,12 +330,12 @@ int main(int argc, char **argv)
                     LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5]);
                     uint64_t cflags, ret0, ret1;
                     switch (num) {
-                        case 0x126:  // shared_region_check_np
-                            *(uint64_t*)args[0] = 0;
-                            ret0 = EINVAL;
-                            ret1 = 0;
-                            cflags = (1 << 29);
-                            break;
+                        /* case 0x126:  // shared_region_check_np */
+                        /*     *(uint64_t*)args[0] = 0; */
+                        /*     ret0 = EINVAL; */
+                        /*     ret1 = 0; */
+                        /*     cflags = (1 << 29); */
+                        /*     break; */
                         default:
                             ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], num);
                             asm volatile ("mov %0, x1" : "=r"(ret1));

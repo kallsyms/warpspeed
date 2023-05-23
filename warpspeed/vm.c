@@ -86,9 +86,9 @@ void do_map(struct vm_mmap m) {
         }
         uint64_t *l2pt = (uint64_t*)((l1pt[l1idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
         if (!l2pt[l2idx]) {
-            LOG("creating l3pt at offset %d for l2idx %d\n", tblidx, l2idx);
+            //LOG("creating l3pt at offset %d for l2idx %d\n", tblidx, l2idx);
             l2pt[l2idx] = (uint64_t)(PAGING_PA + tblidx * (512 * sizeof(uint64_t)))| 0b11;
-            LOG("l3pt descriptor: %p\n", l2pt[l2idx]);
+            //LOG("l3pt descriptor: %p\n", l2pt[l2idx]);
             tblidx++;
         }
         uint64_t *l3pt = (uint64_t*)((l2pt[l2idx] & ~((1<<12)-1)) - PAGING_PA + (uint64_t)page_tables);
@@ -183,11 +183,25 @@ int main(int argc, char **argv)
     uint64_t shared_base;
     __shared_region_check_np(&shared_base);
     LOG("shared base: %p\n", shared_base);
+    int fd = open("/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e", O_RDONLY);
+    if (fd < 0) {
+        LOG("error opening cache: %s", strerror(errno));
+        exit(1);
+    }
+    void *shared_cache = mmap(0, 0x5f3f8000, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    res.mappings[res.n_mappings++] = (struct vm_mmap) {
+        .hyper = (void*)shared_cache,
+        .guest_va = (void*)shared_cache,
+        .len = 0x5f3f8000,
+        .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+    };
+    LOG("shared cache mapped at %p\n", shared_cache);
+    uint64_t shared_offset = shared_cache - shared_base;
 
     mach_port_t self = mach_task_self();
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_vm_address_t region_address = (mach_vm_address_t)shared_base;
+    mach_vm_address_t region_address = (mach_vm_address_t)shared_base + 0x5f3f8000;
     mach_vm_size_t region_size = 0;
     mach_port_t object_name;
 
@@ -210,11 +224,12 @@ int main(int argc, char **argv)
                 valid_len += HV_PAGE_SIZE;
             } else if (valid_start && !addr_ok) {
                 LOG("adding contiguous mapping %p-%p\n", valid_start, valid_start+valid_len);
-                void *shared_copy = mmap(0, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                void *shared_copy = mmap(valid_start + shared_offset, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+                LOG("%p\n", shared_copy);
                 memcpy(shared_copy, valid_start, valid_len);
                 res.mappings[res.n_mappings++] = (struct vm_mmap) {
                     .hyper = (void*)shared_copy,
-                    .guest_va = (void*)valid_start,
+                    .guest_va = (void*)shared_copy,
                     .len = valid_len,
                     .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
                 };
@@ -225,11 +240,12 @@ int main(int argc, char **argv)
 
         if (valid_start) {
             LOG("adding contiguous mapping %p-%p\n", valid_start, valid_start+valid_len);
-            void *shared_copy = mmap(0, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            void *shared_copy = mmap(valid_start + shared_offset, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
+            LOG("%p\n", shared_copy);
             memcpy(shared_copy, valid_start, valid_len);
             res.mappings[res.n_mappings++] = (struct vm_mmap) {
                 .hyper = (void*)shared_copy,
-                .guest_va = (void*)valid_start,
+                .guest_va = (void*)shared_copy,
                 .len = valid_len,
                 .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
             };
@@ -286,12 +302,12 @@ int main(int argc, char **argv)
                 uint64_t cpsr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr));
 
-                /* LOG("Reg dump:\n"); */
-                /* for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) { */
-                /*     uint64_t s; */
-                /*     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s)); */
-                /*     LOG("X%d: 0x%llx\n", reg, s); */
-                /* } */
+                LOG("Reg dump:\n");
+                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
+                    uint64_t s;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
+                    LOG("X%d: 0x%llx\n", reg, s);
+                }
 
                 if (esr == 0x56000080) {  // SVC in aarch64
                     uint64_t args[6];
@@ -303,12 +319,23 @@ int main(int argc, char **argv)
                     LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5]);
                     uint64_t cflags, ret0, ret1;
                     switch (num) {
-                        /* case 0x126:  // shared_region_check_np */
-                        /*     *(uint64_t*)args[0] = 0; */
-                        /*     ret0 = EINVAL; */
-                        /*     ret1 = 0; */
-                        /*     cflags = (1 << 29); */
-                        /*     break; */
+                        case 0x126:  // shared_region_check_np
+                            *(uint64_t*)args[0] = shared_cache;
+                            ret0 = 0;
+                            ret1 = 0;
+                            cflags = 0;
+                            break;
+                        case 0x150: // proc_info
+                            ret0 = 0;
+                            ret1 = 0;
+                            cflags = 0;
+                            break;
+                        case 0x203:  // ulock_wait -- ghost hack for mapping dyld ourselves causing kernel to -EFAULT
+                            *(uint32_t*)args[1] = 0;
+                            ret0 = 0;
+                            ret1 = 0;
+                            cflags = 0;
+                            break;
                         default:
                             ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], num);
                             asm volatile ("mov %0, x1" : "=r"(ret1));
@@ -405,9 +432,9 @@ int main(int argc, char **argv)
                     uint64_t s;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
                     LOG("X%d: 0x%llx\n", reg, s);
-                    if (reg == HV_REG_X19) {
-                        LOG("msg: %s\n", (char*)s);
-                    }
+                    /* if (reg == HV_REG_X19) { */
+                    /*     LOG("msg: %s\n", (char*)s); */
+                    /* } */
                 }
                 uint64_t pc;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));

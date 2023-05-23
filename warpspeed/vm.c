@@ -180,83 +180,63 @@ int main(int argc, char **argv)
     };
 
     // shared region
-    // ghost: this works for most stuff, but doesn't include the LINKEDIT section
     uint64_t shared_base;
     __shared_region_check_np(&shared_base);
     LOG("shared base: %p\n", shared_base);
-    cache_hdr_t *hdr = (cache_hdr_t*)shared_base;
-    LOG("map offset %x\n", hdr->mappingOffset);
-    mach_port_t self = mach_task_self();
-    uint64_t addr;
-    for (int i = 0; i < hdr->mappingCount; i++) {
-        cache_map_t *map = (cache_map_t*)(shared_base + hdr->mappingOffset + i * sizeof(cache_map_t));
-        LOG("map %d: addr %p size %p foff %p\n", i, map->address, map->size, map->fileOffset);
 
-        uint64_t start = 0;
-        uint64_t len = 0;
-        for (addr = map->address; addr < map->address + map->size; addr += HV_PAGE_SIZE) {
+    mach_port_t self = mach_task_self();
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_vm_address_t region_address = (mach_vm_address_t)shared_base;
+    mach_vm_size_t region_size = 0;
+    mach_port_t object_name;
+
+    while (region_address < 0x300000000) {
+        kern_return_t result = mach_vm_region(self, &region_address, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object_name);
+        if (result != KERN_SUCCESS) {
+            exit(1);
+        }
+
+        uint64_t valid_start = 0;
+        uint64_t valid_len = 0;
+        for (uint64_t addr = region_address; addr < region_address + region_size; addr += HV_PAGE_SIZE) {
             char tmp;
             mach_vm_size_t outsize = 0;
             bool addr_ok = (mach_vm_read_overwrite(self, addr, 1, &tmp, &outsize) == KERN_SUCCESS);
             if (addr_ok) {
-                if (start == 0) {
-                    start = addr;
+                if (valid_start == 0) {
+                    valid_start = addr;
                 }
-                len += HV_PAGE_SIZE;
-            } else if (start && !addr_ok) {
-                LOG("adding contiguous mapping %p-%p\n", start, start+len);
-                void *shared_copy = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-                memcpy(shared_copy, start, len);
+                valid_len += HV_PAGE_SIZE;
+            } else if (valid_start && !addr_ok) {
+                LOG("adding contiguous mapping %p-%p\n", valid_start, valid_start+valid_len);
+                void *shared_copy = mmap(0, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                memcpy(shared_copy, valid_start, valid_len);
                 res.mappings[res.n_mappings++] = (struct vm_mmap) {
                     .hyper = (void*)shared_copy,
-                    .guest_va = (void*)start,
-                    .len = len,
+                    .guest_va = (void*)valid_start,
+                    .len = valid_len,
                     .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
                 };
-                start = 0;
-                len = 0;
+                valid_start = 0;
+                valid_len = 0;
             }
-
         }
 
-        if (start) {
-            LOG("adding contiguous mapping %p-%p\n", start, start+len);
-            void *shared_copy = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-            memcpy(shared_copy, start, len);
+        if (valid_start) {
+            LOG("adding contiguous mapping %p-%p\n", valid_start, valid_start+valid_len);
+            void *shared_copy = mmap(0, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            memcpy(shared_copy, valid_start, valid_len);
             res.mappings[res.n_mappings++] = (struct vm_mmap) {
                 .hyper = (void*)shared_copy,
-                .guest_va = (void*)start,
-                .len = len,
+                .guest_va = (void*)valid_start,
+                .len = valid_len,
                 .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
             };
         }
+
+        region_address = region_address + region_size;
     }
-
-    /* for (int image_idx = 0; image_idx < _dyld_image_count(); image_idx++) { */
-    /*     uint64_t slide = _dyld_get_image_vmaddr_slide(image_idx); */
-    /*     const struct mach_header *header = _dyld_get_image_header(image_idx); */
-    /*     const char *name = _dyld_get_image_name(image_idx); */
-    /*     LOG("image %d: %p %s\n", image_idx, (void*)header + slide, name); */
-    /*     const struct load_command *cmds = (const struct load_command *)(header + sizeof(struct mach_header)); */
-
-    /*     for (int i = 0; i < header->ncmds; i++) */
-    /*     { */
-    /*         struct load_command* lc = (struct load_command*)&cmds[i]; */
-    /*         if (lc->cmd == LC_SEGMENT_64) { */
-    /*             const struct segment_command_64 *cmd = (const struct segment_command_64 *)lc; */
-    /*             LOG("  map %p-%p\n", cmd->vmaddr + slide, cmd->vmaddr + cmd->vmsize + slide); */
-    /*             res.mappings[res.n_mappings++] = (struct vm_mmap) { */
-    /*                 .hyper = (void*)cmd->vmaddr + slide, */
-    /*                 .guest_va = (void*)cmd->vmaddr + slide, */
-    /*                 .len = PAGE_ROUNDUP(cmd->vmsize), */
-    /*                 .prot = PROT_READ | PROT_WRITE | PROT_EXEC, */
-    /*             }; */
-    /*         } */
-    /*     } */
-    /* } */
-
-    /* void *inner_sb = mmap(0, shared_size, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); */
-    /* memcpy(inner_sb, shared_base, shared_size); */
 
     // Configure 1:1 translation tables
     page_tables = mmap(0, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -297,12 +277,6 @@ int main(int argc, char **argv)
             if (ec == 0x16) {
                 // Exception Class 0x16 is
                 // "HVC instruction execution in AArch64 state, when HVC is not disabled."
-                uint64_t x0;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
-                LOG("VM made an HVC call! x0 register holds 0x%llx\n", x0);
-                uint64_t pc;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
-                LOG("PC: 0x%llx\n", pc);
                 uint64_t elr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
                 LOG("ELR_EL1: 0x%llx\n", elr);
@@ -312,13 +286,12 @@ int main(int argc, char **argv)
                 uint64_t cpsr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr));
 
-                LOG("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
-                    uint64_t s;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
-                    LOG("X%d: 0x%llx\n", reg, s);
-                }
-
+                /* LOG("Reg dump:\n"); */
+                /* for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) { */
+                /*     uint64_t s; */
+                /*     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s)); */
+                /*     LOG("X%d: 0x%llx\n", reg, s); */
+                /* } */
 
                 if (esr == 0x56000080) {  // SVC in aarch64
                     uint64_t args[6];
@@ -379,10 +352,10 @@ int main(int argc, char **argv)
 
                     uint64_t x;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x));
-                    LOG("stack:\n");
-                    for (int offset = 0; offset > -0x20; offset -= 1) {
-                        LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]);
-                    }
+                    /* LOG("stack:\n"); */
+                    /* for (int offset = 0; offset > -0x20; offset -= 1) { */
+                    /*     LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]); */
+                    /* } */
                     continue;
                 }
 
@@ -403,10 +376,10 @@ int main(int argc, char **argv)
                 /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_PAR_EL1, &x)); */
                 LOG("par %llx\n", x);
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x));
-                LOG("stack:\n");
-                for (int offset = 0; offset > -0x20; offset -= 1) {
-                    LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]);
-                }
+                /* LOG("stack:\n"); */
+                /* for (int offset = 0; offset > -0x20; offset -= 1) { */
+                /*     LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]); */
+                /* } */
 
                 break;
             } else if (ec == 0x17) {
@@ -432,6 +405,9 @@ int main(int argc, char **argv)
                     uint64_t s;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
                     LOG("X%d: 0x%llx\n", reg, s);
+                    if (reg == HV_REG_X19) {
+                        LOG("msg: %s\n", (char*)s);
+                    }
                 }
                 uint64_t pc;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
@@ -453,6 +429,10 @@ int main(int argc, char **argv)
                 /* LOG("ttbr0 %llx\n", x); */
                 /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x)); */
                 /* LOG("tcr %llx\n", x); */
+                // ghost: continue here in case this entire thing is being run under lldb, which would insert a brk
+                // at __dyld_debugger_notification for its own purposes
+                /* pc += 4; */
+                /* HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc)); */
                 break;
             } else {
                 uint64_t pc;

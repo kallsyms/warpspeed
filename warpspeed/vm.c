@@ -278,13 +278,12 @@ int main(int argc, char **argv)
         do_map(res.mappings[i]);
     }
 
-    /* // ghost: dyld private hack: trap when we'd be setting result->slide (https://github.com/apple-oss-distributions/dyld/blob/c8a445f88f9fc1713db34674e79b00e30723e79d/dyld/SharedCacheRuntime.cpp#LL983C16-L983C16) */
-    /* memcpy(res.entry_point + (0x000352c0 - 0x00004950), brk_insns, sizeof(brk_insns)); */
-    // to overwrite archs keysOff=1, osBinariesOnly=1 in https://github.com/apple-oss-distributions/dyld/blob/c8a445f88f9fc1713db34674e79b00e30723e79d/dyld/DyldProcessConfig.cpp#L652
+    // ghost: to overwrite archs keysOff=1, osBinariesOnly=1 in https://github.com/apple-oss-distributions/dyld/blob/c8a445f88f9fc1713db34674e79b00e30723e79d/dyld/DyldProcessConfig.cpp#L652
     memcpy(res.entry_point + (0x00009514 - 0x00004950), brk_insns, sizeof(brk_insns));
-    // dbg hasExportedSymbol
-    memcpy(res.entry_point + (0x0001e938 - 0x00004950), brk_insns, sizeof(brk_insns));
-    //memcpy(res.entry_point + (0x0001ea70 - 0x00004950), brk_insns, sizeof(brk_insns));
+    /* // dbg hasExportedSymbol */
+    // ghost: fix up libdyld dyld4 section with correct load address
+    memcpy(res.entry_point + (0x00006c1c - 0x00004950), brk_insns, sizeof(brk_insns));
+    //memcpy(res.entry_point + (0x00006dd4 - 0x00004950), brk_insns, sizeof(brk_insns));
 
     // https://github.com/Impalabs/hyperpom/blob/85a4df8b6af2babf3689bd4c486fcbbd4c831f8a/src/memory.rs#L1836
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0xff));
@@ -317,19 +316,10 @@ int main(int argc, char **argv)
                 // "HVC instruction execution in AArch64 state, when HVC is not disabled."
                 uint64_t elr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
-                LOG("ELR_EL1: 0x%llx\n", elr);
                 uint64_t esr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr));
-                LOG("ESR: 0x%llx\n", esr);
                 uint64_t cpsr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr));
-
-                LOG("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
-                    uint64_t s;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
-                    LOG("X%d: 0x%llx\n", reg, s);
-                }
 
                 if (esr == 0x56000080) {  // SVC in aarch64
                     uint64_t args[8];
@@ -341,24 +331,6 @@ int main(int argc, char **argv)
                     LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
                     uint64_t cflags, ret0, ret1;
                     switch (num) {
-                        /* case 0x126:  // shared_region_check_np */
-                        /*     //*(uint64_t*)args[0] = shared_cache; */
-                        /*     ret0 = EFAULT; */
-                        /*     ret1 = 0; */
-                        /*     cflags = (1 << 29); */
-                        /*     break; */
-                        /* case 0x150: // proc_info (PROC_INFO_CALL_SET_DYLD_IMAGES is what we really care about) */
-                        /*     assert(args[0] == 0xf); */
-                        /*     ret0 = 0; */
-                        /*     ret1 = 0; */
-                        /*     cflags = 0; */
-                        /*     break; */
-                        /* case 0x203:  // ulock_wait -- ghost hack for mapping dyld ourselves causing kernel to -EFAULT */
-                        /*     *(uint32_t*)args[1] = 0; */
-                        /*     ret0 = 0; */
-                        /*     ret1 = 0; */
-                        /*     cflags = 0; */
-                        /*     break; */
                         default: {
                             if (num == 92 && args[1] == 0x62) {
                                 // fcntl(fd, F_CHECK_LV)
@@ -371,9 +343,10 @@ int main(int argc, char **argv)
                                 LOG("fixing up mmap\n");
                                 // ghost: mmap fixup for dyld loading non-aligned segments
                                 uint64_t aligned_addr = PAGE_ALIGN(args[0]);
-                                size_t aligned_size = PAGE_ROUNDUP(args[1]);
+                                size_t aligned_size = PAGE_ROUNDUP(args[0] + args[1]) - aligned_addr;
+                                LOG("new addr %p, size %p\n", aligned_addr, aligned_size);
                                 // map aligned addr/size from no fd
-                                ret0 = syscall_t(aligned_addr, aligned_size, args[2], MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0, 0, 0, num);
+                                ret0 = syscall_t(aligned_addr, aligned_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0, 0, 0, num);
                                 asm volatile ("mov %0, x1" : "=r"(ret1));
                                 asm volatile ("mrs %0, NZCV" : "=r"(cflags));
                                 LOG("aligned mmap returned %p\n", ret0);
@@ -387,8 +360,11 @@ int main(int argc, char **argv)
                                 // then read into correct offset if fd was set
                                 if (args[4] > 0) {
                                     // ghost: todo: ensure this is a full read
-                                    pread(args[4], ret0 + (args[0] - aligned_addr), args[1], (args[0] - aligned_addr));
+                                    fprintf(stderr, "pread %x bytes at off %x to %p\n", args[1], args[5], ret0 + (args[0] - aligned_addr));
+                                    ssize_t nread = pread(args[4], ret0 + (args[0] - aligned_addr), args[1], args[5]);
+                                    fprintf(stderr, "nread %x (err %s)\n", nread, strerror(errno));
                                 }
+                                ret0 = args[0];
                                 break;
                             }
                             ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], num);
@@ -414,38 +390,6 @@ int main(int argc, char **argv)
                                     }
                                     break;
                                 }
-                                /* case 0xffffffffffffffd1: { // mach_msg2 */
-                                /*     // ghost - TASK_DYLD_INFO hack */
-                                /*     // let the kernel return a correct version, then adjust the addr */
-                                /*     // commented code below is if we need to stub the trap entirely */
-                                /*     /1* uint32_t flavor = *(uint32_t*)((void*)args[0] + 0x20); *1/ */
-                                /*     /1* assert(flavor == 0x11); *1/ */
-                                /*     /1* // drop in a fake task_dyld_info *1/ */
-                                /*     /1* // magic values here are copied from what xnu does for real. no idea. *1/ */
-                                /*     /1* *(mach_msg_header_t*)args[0] = (mach_msg_header_t) { *1/ */
-                                /*     /1*     .msgh_bits = 0x1200, *1/ */
-                                /*     /1*     .msgh_size = 0x3c, *1/ */
-                                /*     /1*     .msgh_remote_port = 0, *1/ */
-                                /*     /1*     .msgh_local_port = ((mach_msg_header_t*)args[0])->msgh_remote_port, *1/ */
-                                /*     /1*     .msgh_id = ((mach_msg_header_t*)args[0])->msgh_id + 100, *1/ */
-                                /*     /1* }; *1/ */
-                                /*     uint32_t *inner = args[0] + sizeof(mach_msg_header_t); */
-                                /*     /1* inner[0] = 0; *1/ */
-                                /*     /1* inner[1] = 1; *1/ */
-                                /*     /1* inner[2] = 0; *1/ */
-                                /*     /1* inner[3] = 5;  // sizeof(task_dyld_info) / sizeof(natural_t) *1/ */
-                                /*     struct task_dyld_info *out = &inner[4]; */
-                                /*     LOG("%d\n", *(uint32_t*)out->all_image_info_addr); */
-                                /*     out->all_image_info_addr += shared_offset; */
-                                /*     LOG("adjusted all_image_info to %p\n", out->all_image_info_addr); */
-                                /*     LOG("%d\n", *(uint32_t*)out->all_image_info_addr); */
-                                /*     /1* out->all_image_info_size = 0x170; *1/ */
-                                /*     /1* out->all_image_info_format = 1; *1/ */
-                                /*     /1* ret0 = 0; *1/ */
-                                /*     /1* ret1 = 0x200000003; *1/ */
-                                /*     /1* cflags = 0xa0000000; *1/ */
-                                /*     break; */
-                                /* } */
                                 case 0xfffffffffffffff6: { // mach_vm_allocate
                                     uint64_t addr = *(uint64_t*)args[1];
                                     size_t size = args[2];
@@ -484,27 +428,20 @@ int main(int argc, char **argv)
                     continue;
                 }
 
+                LOG("FAULT!\n");
+
+                LOG("Reg dump:\n");
+                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
+                    uint64_t s;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
+                    LOG("X%d: 0x%llx\n", reg, s);
+                }
+
                 uint64_t far;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
                 LOG("FAR_EL1: 0x%llx\n", far);
-                uint64_t x;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
-                LOG("ESR: 0x%llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &x));
-                /* LOG("sctlr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x)); */
-                /* LOG("cpacr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &x)); */
-                /* LOG("ttbr0 %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x)); */
-                /* LOG("tcr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_PAR_EL1, &x)); */
-                LOG("par %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x));
-                /* LOG("stack:\n"); */
-                /* for (int offset = 0; offset > -0x20; offset -= 1) { */
-                /*     LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]); */
-                /* } */
+
+                LOG("ELR_EL1: 0x%llx\n", elr);
 
                 break;
             } else if (ec == 0x17) {
@@ -527,35 +464,7 @@ int main(int argc, char **argv)
                 LOG("VM made an BRK call!\n");
                 uint64_t pc;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
-                if ((pc & 0xfff) == 0x2c0) {
-                    /* uint64_t x8; */
-                    /* HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X19, &x8)); */
-                    /* uint64_t *x19; */
-                    /* HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X19, &x19)); */
-/* #define NEW_SLIDE (0x100000000ULL) */
-                    /* LOG("overwriting dyld private map result->slide to %p\n", NEW_SLIDE); */
-                    /* *x19 = x8; */
-                    /* *(x19 + 1)= NEW_SLIDE; */
-                    /* pc += 4; */
-                    /* HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc)); */
-                    /* continue; */
-                } else if ((pc & 0xfff) == 0x508) {
-                    uint64_t x0;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
-                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X1, x0));
-                    LOG("arch: %s\n", x0);
-                    pc += 4;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
-                    continue;
-                } else if ((pc & 0xfff) == 0x268) {  // compatibleSlice
-                    uint64_t x;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X6, &x));
-                    LOG("compat x6: %p\n", x);
-                    *(uint32_t*)pc = 0xd503237f;  // put the real insn back
-                    /* pc += 4; */
-                    /* HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc)); */
-                    continue;
-                } else if ((pc & 0xfff) == 0x514) {
+                if ((pc & 0xfff) == 0x514) {
                     // overwrite keysOff = true, platform = false
                     // otherise "mach-o file, but is an incompatible architecture (have 'arm64e', need 'arm64')"
                     // https://github.com/apple-oss-distributions/dyld/blob/c8a445f88f9fc1713db34674e79b00e30723e79d/common/MachOFile.cpp#L2654
@@ -564,15 +473,20 @@ int main(int argc, char **argv)
                     pc += 4;
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
                     continue;
-                } else if ((pc & 0xfff) == 0x938) {
-                    // hasExportedSymbol
-                    uint64_t x;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X3, &x));
-                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X24, x));
-                    uint64_t x0;
+                } else if ((pc & 0xfff) == 0xc1c) {
+                    LOG("Fixing up libdyld pointers\n");
+                    // instruction replacement
+                    uint64_t x20, x0;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X20, &x20));
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X0, &x0));
-                    uint16_t pathoff = *(uint16_t*)(x0 + 0x10);
-                    fprintf(stderr, "hasExportedSymbol: %s in %s\n", x, x0 + pathoff);
+                    *(uint64_t*)x0 = x20;
+
+                    // fixup argc, argv, etc.
+                    *(uint64_t*)(x0 + 0x18) = x0 - 0x506d00;
+                    *(uint64_t*)(x0 + 0x20) = x0 - 0x506d00 + 0x8;
+                    *(uint64_t*)(x0 + 0x28) = x0 - 0x506d00 + 0x10;
+                    *(uint64_t*)(x0 + 0x30) = x0 - 0x506d00 + 0x18;
+
                     pc += 4;
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
                     continue;

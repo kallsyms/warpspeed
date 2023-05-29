@@ -115,9 +115,28 @@ int main(int argc, char **argv)
     }
 
     struct load_results res = {};
+    res.argc = argc - 1;
+    uint64_t *guest_argv = mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    res.argv = guest_argv;
+    res.mappings[res.n_mappings++] = (struct vm_mmap) {
+        .hyper = guest_argv,
+        .guest_va = guest_argv,
+        .len = HV_PAGE_SIZE,
+        .prot = PROT_READ | PROT_EXEC,
+    };
+    char *argchar = &guest_argv[res.argc];
+
+    for (int i = 0; i < res.argc; i++) {
+        const char *arg = argv[i + 1];
+        LOG("arg: %s\n", arg);
+        guest_argv[i] = strcpy(argchar, arg);
+        argchar += strlen(arg) + 1;
+    }
+
     res.envc = 1;
     // ghost TODO: pass in via applep
     // https://github.com/apple-oss-distributions/libpthread/blob/67e155c94093be9a204b69637d198eceff2c7c46/src/pthread.c#LL1978C16-L1978C16
+    // this doesn't work rn
     char *PTHREAD_PTR_MUNGE_TOKEN_env = "PTHREAD_PTR_MUNGE_TOKEN=1234";
 
     uint64_t *env = mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);

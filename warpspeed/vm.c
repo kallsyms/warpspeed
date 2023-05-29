@@ -18,6 +18,10 @@
 
 #include "common.h"
 #include "loader.h"
+#include "dyld_cache_format.h"
+
+// fwd decl of shared_cache.c
+vm_address_t map_shared_cache(struct load_results *res);
 
 // Diagnostics
 #define HYP_ASSERT_SUCCESS(ret) do { \
@@ -39,6 +43,7 @@ const char hvc_insns[4] = {0x02, 0x00, 0x00, 0xD4};
 
 // ghost: TODO Multiple return vals
 extern uint64_t syscall_t(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7, uint64_t num);
+
 extern int     __shared_region_check_np(uint64_t *startaddress);
 
 uint64_t dyn_pa_base = 0x13370000;  // if guest_pa is not explicitly set, the next available physical address to use
@@ -102,37 +107,6 @@ void do_map(struct vm_mmap m) {
     }
 }
 
-typedef struct {
-	char     magic[16];
-	uint32_t mappingOffset;
-	uint32_t mappingCount;
-	uint32_t imagesOffsetOld;
-	uint32_t imagesCountOld;
-	uint64_t dyldBaseAddress;
-	uint64_t codeSignatureOffset;
-	uint64_t codeSignatureSize;
-	uint64_t slideInfoOffset;
-	uint64_t slideInfoSize;
-	uint64_t localSymbolsOffset;
-	uint64_t localSymbolsSize;
-	uint8_t  uuid[16];
-	uint64_t cacheType;
-	uint32_t branchPoolsOffset;
-	uint32_t branchPoolsCount;
-	uint64_t accelerateInfoAddr;
-	uint64_t accelerateInfoSize;
-	uint64_t imagesTextOffset;
-	uint64_t imagesTextCount;
-} cache_hdr_t;
-
-typedef struct {
-	uint64_t address;
-	uint64_t size;
-	uint64_t fileOffset;
-	uint32_t maxProt;
-	uint32_t initProt;
-} cache_map_t;
-
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -179,81 +153,12 @@ int main(int argc, char **argv)
         .prot = PROT_READ | PROT_WRITE,
     };
 
+    vm_address_t shared_cache_base = map_shared_cache(&res);
+    uint64_t outer_shared_base;
+    __shared_region_check_np(&outer_shared_base);
+    uint64_t shared_offset = shared_cache_base - outer_shared_base;
+
     // shared region
-    uint64_t shared_base;
-    __shared_region_check_np(&shared_base);
-    LOG("shared base: %p\n", shared_base);
-    int fd = open("/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e", O_RDONLY);
-    if (fd < 0) {
-        LOG("error opening cache: %s", strerror(errno));
-        exit(1);
-    }
-    void *shared_cache = mmap(0, 0x5f3f8000, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-    res.mappings[res.n_mappings++] = (struct vm_mmap) {
-        .hyper = (void*)shared_cache,
-        .guest_va = (void*)shared_cache,
-        .len = 0x5f3f8000,
-        .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
-    };
-    LOG("shared cache mapped at %p\n", shared_cache);
-    uint64_t shared_offset = shared_cache - shared_base;
-
-    mach_port_t self = mach_task_self();
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_vm_address_t region_address = (mach_vm_address_t)shared_base + 0x5f3f8000;
-    mach_vm_size_t region_size = 0;
-    mach_port_t object_name;
-
-    while (region_address < 0x300000000) {
-        kern_return_t result = mach_vm_region(self, &region_address, &region_size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object_name);
-        if (result != KERN_SUCCESS) {
-            exit(1);
-        }
-
-        uint64_t valid_start = 0;
-        uint64_t valid_len = 0;
-        for (uint64_t addr = region_address; addr < region_address + region_size; addr += HV_PAGE_SIZE) {
-            char tmp;
-            mach_vm_size_t outsize = 0;
-            bool addr_ok = (mach_vm_read_overwrite(self, addr, 1, &tmp, &outsize) == KERN_SUCCESS);
-            if (addr_ok) {
-                if (valid_start == 0) {
-                    valid_start = addr;
-                }
-                valid_len += HV_PAGE_SIZE;
-            } else if (valid_start && !addr_ok) {
-                LOG("adding contiguous mapping %p-%p\n", valid_start, valid_start+valid_len);
-                void *shared_copy = mmap(valid_start + shared_offset, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
-                LOG("%p\n", shared_copy);
-                memcpy(shared_copy, valid_start, valid_len);
-                res.mappings[res.n_mappings++] = (struct vm_mmap) {
-                    .hyper = (void*)shared_copy,
-                    .guest_va = (void*)shared_copy,
-                    .len = valid_len,
-                    .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
-                };
-                valid_start = 0;
-                valid_len = 0;
-            }
-        }
-
-        if (valid_start) {
-            LOG("adding contiguous mapping %p-%p\n", valid_start, valid_start+valid_len);
-            void *shared_copy = mmap(valid_start + shared_offset, valid_len, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
-            LOG("%p\n", shared_copy);
-            memcpy(shared_copy, valid_start, valid_len);
-            res.mappings[res.n_mappings++] = (struct vm_mmap) {
-                .hyper = (void*)shared_copy,
-                .guest_va = (void*)shared_copy,
-                .len = valid_len,
-                .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
-            };
-        }
-
-        region_address = region_address + region_size;
-    }
-
     // Configure 1:1 translation tables
     page_tables = mmap(0, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     HYP_ASSERT_SUCCESS(hv_vm_map(page_tables, (hv_ipa_t)PAGING_PA, HV_PAGE_SIZE * 1024, PROT_READ | PROT_WRITE));
@@ -295,19 +200,10 @@ int main(int argc, char **argv)
                 // "HVC instruction execution in AArch64 state, when HVC is not disabled."
                 uint64_t elr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
-                LOG("ELR_EL1: 0x%llx\n", elr);
                 uint64_t esr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr));
-                LOG("ESR: 0x%llx\n", esr);
                 uint64_t cpsr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr));
-
-                LOG("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
-                    uint64_t s;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
-                    LOG("X%d: 0x%llx\n", reg, s);
-                }
 
                 if (esr == 0x56000080) {  // SVC in aarch64
                     uint64_t args[8];
@@ -317,22 +213,21 @@ int main(int argc, char **argv)
                     uint64_t num;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X16, &num));
                     LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+                    LOG("ELR_EL1: 0x%llx\n", elr);
                     uint64_t cflags, ret0, ret1;
                     switch (num) {
                         case 0x126:  // shared_region_check_np
-                            *(uint64_t*)args[0] = shared_cache;
+                                     // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/vm/vm_unix.c#L2017
+                            if (args[0] != -1ull) {
+                                LOG("returning %p for shared region base\n", shared_cache_base);
+                                *(uint64_t*)args[0] = shared_cache_base;
+                            }
                             ret0 = 0;
                             ret1 = 0;
                             cflags = 0;
                             break;
                         case 0x150: // proc_info (PROC_INFO_CALL_SET_DYLD_IMAGES is what we really care about)
                             assert(args[0] == 0xf);
-                            ret0 = 0;
-                            ret1 = 0;
-                            cflags = 0;
-                            break;
-                        case 0x203:  // ulock_wait -- ghost hack for mapping dyld ourselves causing kernel to -EFAULT
-                            *(uint32_t*)args[1] = 0;
                             ret0 = 0;
                             ret1 = 0;
                             cflags = 0;
@@ -369,21 +264,25 @@ int main(int argc, char **argv)
                                     /*     .msgh_local_port = ((mach_msg_header_t*)args[0])->msgh_remote_port, */
                                     /*     .msgh_id = ((mach_msg_header_t*)args[0])->msgh_id + 100, */
                                     /* }; */
-                                    uint32_t *inner = args[0] + sizeof(mach_msg_header_t);
-                                    /* inner[0] = 0; */
-                                    /* inner[1] = 1; */
-                                    /* inner[2] = 0; */
-                                    /* inner[3] = 5;  // sizeof(task_dyld_info) / sizeof(natural_t) */
-                                    struct task_dyld_info *out = &inner[4];
-                                    LOG("%d\n", *(uint32_t*)out->all_image_info_addr);
-                                    out->all_image_info_addr += shared_offset;
-                                    LOG("adjusted all_image_info to %p\n", out->all_image_info_addr);
-                                    LOG("%d\n", *(uint32_t*)out->all_image_info_addr);
-                                    /* out->all_image_info_size = 0x170; */
-                                    /* out->all_image_info_format = 1; */
-                                    /* ret0 = 0; */
-                                    /* ret1 = 0x200000003; */
-                                    /* cflags = 0xa0000000; */
+                                    /* uint32_t *inner = args[0] + sizeof(mach_msg_header_t); */
+                                    /* /1* inner[0] = 0; *1/ */
+                                    /* /1* inner[1] = 1; *1/ */
+                                    /* /1* inner[2] = 0; *1/ */
+                                    /* /1* inner[3] = 5;  // sizeof(task_dyld_info) / sizeof(natural_t) *1/ */
+                                    /* struct task_dyld_info *out = &inner[4]; */
+                                    /* LOG("%d\n", *(uint32_t*)out->all_image_info_addr); */
+                                    /* // TODO: actually derive this from cache headers instead of sliding from hypervisor's */
+                                    /* out->all_image_info_addr += shared_offset; */
+                                    /* LOG("adjusted all_image_info to %p\n", out->all_image_info_addr); */
+                                    /* LOG("%d\n", *(uint32_t*)out->all_image_info_addr); */
+                                    /* /1* out->all_image_info_size = 0x170; *1/ */
+                                    /* /1* out->all_image_info_format = 1; *1/ */
+                                    /* /1* ret0 = 0; *1/ */
+                                    /* /1* ret1 = 0x200000003; *1/ */
+                                    /* /1* cflags = 0xa0000000; *1/ */
+                                    ret0 = KERN_NOT_FOUND;
+                                    ret1 = 0;
+                                    cflags = 0xa0000000;
                                     break;
                                 }
                                 case 0xfffffffffffffff6: { // mach_vm_allocate
@@ -418,23 +317,19 @@ int main(int argc, char **argv)
                     continue;
                 }
 
+                LOG("FAULT!\n");
+
                 uint64_t far;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
                 LOG("FAR_EL1: 0x%llx\n", far);
-                uint64_t x;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
-                LOG("ESR: 0x%llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &x));
-                /* LOG("sctlr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x)); */
-                /* LOG("cpacr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &x)); */
-                /* LOG("ttbr0 %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x)); */
-                /* LOG("tcr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_PAR_EL1, &x)); */
-                LOG("par %llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x));
+                LOG("ELR_EL1: 0x%llx\n", elr);
+                LOG("Reg dump:\n");
+                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
+                    uint64_t s;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
+                    LOG("X%d: 0x%llx\n", reg, s);
+                }
+
                 /* LOG("stack:\n"); */
                 /* for (int offset = 0; offset > -0x20; offset -= 1) { */
                 /*     LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]); */

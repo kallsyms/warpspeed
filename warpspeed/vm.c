@@ -157,11 +157,9 @@ int main(int argc, char **argv)
     // TLS
     uint64_t tpidrro_el0;
     asm volatile("mrs %0, tpidrro_el0": "=r"(tpidrro_el0));
-    LOG("tls %p\n", tpidrro_el0);
+    LOG("hv tls %p\n", tpidrro_el0);
     void *tls= mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    // copy out of the host TLS to ensure tid and similar are correct
-    // ghost: TODO: do we need to zero anything? locks?
-    //memcpy(tls, PAGE_ALIGN(tpidrro_el0), HV_PAGE_SIZE);
+    // ghost: TODO: do we need to copy anything out?
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDRRO_EL0, tpidrro_el0));
     res.mappings[res.n_mappings++] = (struct vm_mmap) {
         .hyper = (void*)tls,

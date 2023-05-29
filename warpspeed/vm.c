@@ -17,20 +17,14 @@
 #include <Hypervisor/Hypervisor.h>
 
 #include "common.h"
-#include "loader.h"
 #include "dyld_cache_format.h"
+#include "loader.h"
+#include "print_helpers.h"
 
 // fwd decl of shared_cache.c
 vm_address_t map_shared_cache(struct load_results *res);
 
 // Diagnostics
-#define HYP_ASSERT_SUCCESS(ret) do { \
-    if ((hv_return_t)(ret) != HV_SUCCESS) { \
-        LOG("%s:%d: %s = %x\n", __FILE__, __LINE__, #ret, (ret)); \
-        abort(); \
-    } \
-} while (0)
-
 const char brk_insns[4] = {0x00, 0x00, 0x20, 0xD4};
 const char hvc_insns[4] = {0x02, 0x00, 0x00, 0xD4};
 
@@ -59,11 +53,11 @@ void do_map(struct vm_mmap m) {
     for (size_t offset = 0; offset < m.len; offset += 0x1000) {
         uint64_t pa = (uint64_t)m.guest_pa + offset;
         if (pa > (1ULL << 48)) {
-            LOG("pa too big\n");
+            printf("pa too big\n");
             exit(1);
         }
         if (pa & ((1 << 12) - 1)) {
-            LOG("low bits in pa set\n");
+            printf("low bits in pa set\n");
             exit(1);
         }
         uint64_t va = (uint64_t)m.guest_va + offset;
@@ -108,7 +102,7 @@ void do_map(struct vm_mmap m) {
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        LOG("Usage: %s /path/to/bin [args...]", argv[0]);
+        fprintf(stderr, "Usage: %s /path/to/bin [args...]", argv[0]);
         exit(1);
     }
 
@@ -351,33 +345,15 @@ int main(int argc, char **argv)
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X1, ret1));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, (cpsr & (~(0b1111ULL << 28))) | cflags));
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, elr));
-
-                    /* uint64_t x; */
-                    /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL1, &x)); */
-                    /* LOG("stack:\n"); */
-                    /* for (int offset = 0; offset > -0x20; offset -= 1) { */
-                    /*     LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]); */
-                    /* } */
                     continue;
                 }
 
-                LOG("FAULT!\n");
+                printf("FAULT!\n");
 
                 uint64_t far;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
-                LOG("FAR_EL1: 0x%llx\n", far);
-                LOG("ELR_EL1: 0x%llx\n", elr);
-                LOG("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
-                    uint64_t s;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
-                    LOG("X%d: 0x%llx\n", reg, s);
-                }
-
-                /* LOG("stack:\n"); */
-                /* for (int offset = 0; offset > -0x20; offset -= 1) { */
-                /*     LOG("%d: %p\n", offset, ((uint64_t*)x)[offset]); */
-                /* } */
+                printf("Reg dump:\n");
+                print_vm_registers(vcpu, true);
 
                 break;
             } else if (ec == 0x17) {
@@ -413,49 +389,21 @@ int main(int argc, char **argv)
                     continue;
                 }
 
-                LOG("UNEXPECTED\n");
-                LOG("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
-                    uint64_t s;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
-                    LOG("X%d: 0x%llx\n", reg, s);
-                }
-                uint64_t elr;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
-                LOG("ELR_EL1: 0x%llx\n", elr);
-                uint64_t far;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
-                LOG("FAR_EL1: 0x%llx\n", far);
-                uint64_t x;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
-                LOG("ESR: 0x%llx\n", x);
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &x));
+                printf("Unexpected BRK\n");
+                printf("Reg dump:\n");
+                print_vm_registers(vcpu, true);
                 break;
             } else {
                 uint64_t pc;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
-                LOG("Unexpected VM exception: 0x%llx, EC 0x%x, VirtAddr 0x%llx, IPA 0x%llx\n",
+                printf("Unexpected VM exception: 0x%llx, EC 0x%x, VirtAddr 0x%llx, IPA 0x%llx\n",
                     syndrome,
                     ec,
                     vcpu_exit->exception.virtual_address,
                     vcpu_exit->exception.physical_address
                 );
-                LOG("Reg dump:\n");
-                for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
-                    uint64_t s;
-                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
-                    LOG("X%d: 0x%llx\n", reg, s);
-                }
-                LOG("PC: 0x%llx\n", pc);
-                uint64_t elr;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
-                LOG("ELR_EL1: 0x%llx\n", elr);
-                uint64_t far;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far));
-                LOG("FAR_EL1: 0x%llx\n", far);
-                uint64_t x;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
-                LOG("ESR: 0x%llx\n", x);
+                printf("Reg dump:\n");
+                print_vm_registers(vcpu, true);
                 break;
             }
         } else {

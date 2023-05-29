@@ -44,8 +44,6 @@ const char hvc_insns[4] = {0x02, 0x00, 0x00, 0xD4};
 // ghost: TODO Multiple return vals
 extern uint64_t syscall_t(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7, uint64_t num);
 
-extern int     __shared_region_check_np(uint64_t *startaddress);
-
 uint64_t dyn_pa_base = 0x13370000;  // if guest_pa is not explicitly set, the next available physical address to use
 size_t tblidx = 1;
 uint64_t *page_tables;
@@ -128,7 +126,6 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < res.argc; i++) {
         const char *arg = argv[i + 1];
-        LOG("arg: %s\n", arg);
         guest_argv[i] = strcpy(argchar, arg);
         argchar += strlen(arg) + 1;
     }
@@ -178,7 +175,7 @@ int main(int argc, char **argv)
     asm volatile("mrs %0, tpidrro_el0": "=r"(tpidrro_el0));
     LOG("hv tls %p\n", tpidrro_el0);
     void *tls= mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    // ghost: TODO: do we need to copy anything out?
+    // ghost: TODO: do we need to copy anything out of the hv's tls? pid/tid?
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDRRO_EL0, tpidrro_el0));
     res.mappings[res.n_mappings++] = (struct vm_mmap) {
         .hyper = (void*)tls,
@@ -188,9 +185,6 @@ int main(int argc, char **argv)
     };
 
     vm_address_t shared_cache_base = map_shared_cache(&res);
-    uint64_t outer_shared_base;
-    __shared_region_check_np(&outer_shared_base);
-    uint64_t shared_offset = shared_cache_base - outer_shared_base;
 
     // shared region
     // Configure 1:1 translation tables
@@ -201,7 +195,6 @@ int main(int argc, char **argv)
         do_map(res.mappings[i]);
     }
 
-    //memcpy(res.entry_point + (0x000055f4 - 0x00004950), brk_insns, sizeof(brk_insns));
     // pthread token == 0 bypass
     memcpy(0x2803c6e0c, brk_insns, sizeof(brk_insns));
     // objc init "task_restartable_ranges_register" bypass
@@ -308,8 +301,6 @@ int main(int argc, char **argv)
                                 handled = true;
                             }
                             break;
-                        case 0x17d:
-                            LOG("mac_syscall %s %d\n", args[0], args[1]);
                     }
                     if (!handled) {
                         LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);

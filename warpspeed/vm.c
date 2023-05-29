@@ -115,6 +115,23 @@ int main(int argc, char **argv)
     }
 
     struct load_results res = {};
+    res.envc = 1;
+    // ghost TODO: pass in via applep
+    // https://github.com/apple-oss-distributions/libpthread/blob/67e155c94093be9a204b69637d198eceff2c7c46/src/pthread.c#LL1978C16-L1978C16
+    char *PTHREAD_PTR_MUNGE_TOKEN_env = "PTHREAD_PTR_MUNGE_TOKEN=1234";
+
+    uint64_t *env = mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    res.envp = env;
+    res.mappings[res.n_mappings++] = (struct vm_mmap) {
+        .hyper = env,
+        .guest_va = env,
+        .len = HV_PAGE_SIZE,
+        .prot = PROT_READ | PROT_EXEC,
+    };
+    char *envchar = &env[res.envc];
+    env[0] = strcpy(envchar, PTHREAD_PTR_MUNGE_TOKEN_env);
+    envchar += strlen(PTHREAD_PTR_MUNGE_TOKEN_env) + 1;
+
     load(argv[1], false, &res);
     setup_stack64(argv[1], &res);
 
@@ -144,7 +161,7 @@ int main(int argc, char **argv)
     void *tls= mmap(0, HV_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     // copy out of the host TLS to ensure tid and similar are correct
     // ghost: TODO: do we need to zero anything? locks?
-    memcpy(tls, PAGE_ALIGN(tpidrro_el0), HV_PAGE_SIZE);
+    //memcpy(tls, PAGE_ALIGN(tpidrro_el0), HV_PAGE_SIZE);
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDRRO_EL0, tpidrro_el0));
     res.mappings[res.n_mappings++] = (struct vm_mmap) {
         .hyper = (void*)tls,
@@ -168,6 +185,10 @@ int main(int argc, char **argv)
     }
 
     //memcpy(res.entry_point + (0x000055f4 - 0x00004950), brk_insns, sizeof(brk_insns));
+    // pthread token == 0 bypass
+    memcpy(0x2803c6e0c, brk_insns, sizeof(brk_insns));
+    // objc init "task_restartable_ranges_register" bypass
+    memcpy(0x28005a1bc, brk_insns, sizeof(brk_insns));
 
     // https://github.com/Impalabs/hyperpom/blob/85a4df8b6af2babf3689bd4c486fcbbd4c831f8a/src/memory.rs#L1836
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0xff));
@@ -206,16 +227,25 @@ int main(int argc, char **argv)
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr));
 
                 if (esr == 0x56000080) {  // SVC in aarch64
+                    LOG("ELR_EL1: 0x%llx\n", elr);
+                    uint64_t lr;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_LR, &lr));
+                    LOG("LR: %p\n", lr);
+
                     uint64_t args[8];
                     for (int i = HV_REG_X0; i < HV_REG_X8; i++) {
                         HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, i, &args[i - HV_REG_X0]));
                     }
+
+                    uint64_t cflags, ret0, ret1;
+                    bool handled = false;
+
                     uint64_t num;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_X16, &num));
-                    LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
-                    LOG("ELR_EL1: 0x%llx\n", elr);
-                    uint64_t cflags, ret0, ret1;
                     switch (num) {
+                        case 0x5:
+                            LOG("open(%s)\n", args[0]);
+                            break;
                         case 0x126:  // shared_region_check_np
                                      // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/vm/vm_unix.c#L2017
                             if (args[0] != -1ull) {
@@ -225,82 +255,88 @@ int main(int argc, char **argv)
                             ret0 = 0;
                             ret1 = 0;
                             cflags = 0;
+                            handled = true;
                             break;
-                        case 0x150: // proc_info (PROC_INFO_CALL_SET_DYLD_IMAGES is what we really care about)
-                            assert(args[0] == 0xf);
-                            ret0 = 0;
-                            ret1 = 0;
-                            cflags = 0;
-                            break;
-                        default:
-                            ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], num);
-                            asm volatile ("mov %0, x1" : "=r"(ret1));
-                            asm volatile ("mrs %0, NZCV" : "=r"(cflags));
-                            switch (num) {
-                                case 0xc5: { // mmap
-                                    uint64_t addr = ret0;
-                                    size_t size = PAGE_ROUNDUP(args[1]);
-                                    struct vm_mmap m = (struct vm_mmap){
-                                        .hyper = (void*)addr,
-                                        .guest_va = (void*)addr,
-                                        .len = size,
-                                        .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
-                                    };
-                                    do_map(m);
-                                    break;
-                                }
-                                case 0xffffffffffffffd1: { // mach_msg2
-                                    // ghost - TASK_DYLD_INFO hack
-                                    // let the kernel return a correct version, then adjust the addr
-                                    // commented code below is if we need to stub the trap entirely
-                                    /* uint32_t flavor = *(uint32_t*)((void*)args[0] + 0x20); */
-                                    /* assert(flavor == 0x11); */
-                                    /* // drop in a fake task_dyld_info */
-                                    /* // magic values here are copied from what xnu does for real. no idea. */
-                                    /* *(mach_msg_header_t*)args[0] = (mach_msg_header_t) { */
-                                    /*     .msgh_bits = 0x1200, */
-                                    /*     .msgh_size = 0x3c, */
-                                    /*     .msgh_remote_port = 0, */
-                                    /*     .msgh_local_port = ((mach_msg_header_t*)args[0])->msgh_remote_port, */
-                                    /*     .msgh_id = ((mach_msg_header_t*)args[0])->msgh_id + 100, */
-                                    /* }; */
-                                    /* uint32_t *inner = args[0] + sizeof(mach_msg_header_t); */
-                                    /* /1* inner[0] = 0; *1/ */
-                                    /* /1* inner[1] = 1; *1/ */
-                                    /* /1* inner[2] = 0; *1/ */
-                                    /* /1* inner[3] = 5;  // sizeof(task_dyld_info) / sizeof(natural_t) *1/ */
-                                    /* struct task_dyld_info *out = &inner[4]; */
-                                    /* LOG("%d\n", *(uint32_t*)out->all_image_info_addr); */
-                                    /* // TODO: actually derive this from cache headers instead of sliding from hypervisor's */
-                                    /* out->all_image_info_addr += shared_offset; */
-                                    /* LOG("adjusted all_image_info to %p\n", out->all_image_info_addr); */
-                                    /* LOG("%d\n", *(uint32_t*)out->all_image_info_addr); */
-                                    /* /1* out->all_image_info_size = 0x170; *1/ */
-                                    /* /1* out->all_image_info_format = 1; *1/ */
-                                    /* /1* ret0 = 0; *1/ */
-                                    /* /1* ret1 = 0x200000003; *1/ */
-                                    /* /1* cflags = 0xa0000000; *1/ */
-                                    ret0 = KERN_NOT_FOUND;
-                                    ret1 = 0;
-                                    cflags = 0xa0000000;
-                                    break;
-                                }
-                                case 0xfffffffffffffff6: { // mach_vm_allocate
-                                    uint64_t addr = *(uint64_t*)args[1];
-                                    size_t size = args[2];
-                                    struct vm_mmap m = (struct vm_mmap){
-                                        .hyper = (void*)addr,
-                                        .guest_va = (void*)addr,
-                                        .len = size,
-                                        .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
-                                    };
-                                    do_map(m);
-                                    break;
-                                }
-                                default:
-                                    break;
+                        case 0x150: // proc_info
+                            if (args[0] == 0xf) {
+                                // "Handle" PROC_INFO_CALL_SET_DYLD_IMAGES
+                                // ghost TODO: this may be unused?
+                                LOG("Stub PROC_INFO_CALL_SET_DYLD_IMAGES\n");
+                                ret0 = 0;
+                                ret1 = 0;
+                                cflags = 0;
+                                handled = true;
                             }
                             break;
+                        case 0xffffffffffffffd1: { // mach_msg2
+                            // ghost - intercept TASK_DYLD_INFO
+                            // ghost: fail this to get around https://github.com/apple-oss-distributions/dyld/blob/c8a445f88f9fc1713db34674e79b00e30723e79d/dyld/dyldMain.cpp#L889
+                            uint32_t flavor = *(uint32_t*)((void*)args[0] + 0x20);
+                            // TODO: actually check for this being task_info
+                            if (flavor == 0x11) {
+                                LOG("Returning NOT_FOUND for TASK_DYLD_INFO\n");
+                                ret0 = KERN_NOT_FOUND;
+                                ret1 = 0;
+                                cflags = 0xa0000000;
+                                handled = true;
+                            }
+                            break;
+                        }
+                        case 0x10a:
+                            if (!strcmp(args[0], "com.apple.featureflags.shm")) {
+                                LOG("HACK denying shmget of %s\n", args[0]);
+                                ret0 = KERN_DENIED;
+                                ret1 = 0;
+                                cflags = 0xa0000000;
+                                handled = true;
+                            }
+                            break;
+                        case 0x17d:
+                            LOG("mac_syscall %s %d\n", args[0], args[1]);
+                    }
+                    if (!handled) {
+                        LOG("forwarding syscall %p(%p, %p, %p, %p, %p, %p, %p, %p)\n", num, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+                        ret0 = syscall_t(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], num);
+                        asm volatile ("mov %0, x1" : "=r"(ret1));
+                        asm volatile ("mrs %0, NZCV" : "=r"(cflags));
+                        switch (num) {
+                            case 0xc5: { // mmap
+                                uint64_t addr = ret0;
+                                size_t size = PAGE_ROUNDUP(args[1]);
+                                struct vm_mmap m = (struct vm_mmap){
+                                    .hyper = (void*)addr,
+                                    .guest_va = (void*)addr,
+                                    .len = size,
+                                    .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+                                };
+                                do_map(m);
+                                break;
+                            }
+                            case 0xfffffffffffffff6: { // mach_vm_allocate
+                                uint64_t addr = *(uint64_t*)args[1];
+                                size_t size = args[2];
+                                struct vm_mmap m = (struct vm_mmap){
+                                    .hyper = (void*)addr,
+                                    .guest_va = (void*)addr,
+                                    .len = size,
+                                    .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+                                };
+                                do_map(m);
+                                break;
+                            }
+                            case 0xfffffffffffffff1: { // mach_vm_map
+                                uint64_t addr = *(uint64_t*)args[1];
+                                size_t size = args[2];
+                                struct vm_mmap m = (struct vm_mmap){
+                                    .hyper = (void*)addr,
+                                    .guest_va = (void*)addr,
+                                    .len = size,
+                                    .prot = PROT_READ | PROT_WRITE | PROT_EXEC,
+                                };
+                                do_map(m);
+                                break;
+                            }
+                        }
                     }
                     LOG("ret: %p %p %p\n", ret0, ret1, cflags);
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_X0, ret0));
@@ -354,18 +390,28 @@ int main(int argc, char **argv)
             } else if (ec == 0x3C) {
                 // Exception Class 0x3C is BRK in AArch64 state
                 LOG("VM made an BRK call!\n");
+                uint64_t pc;
+                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
+                LOG("PC: 0x%llx\n", pc);
+                if ((pc & 0xfff) == 0xe0c) {
+                    // skip over token == 0 check in pthread
+                    LOG("Bypass: pthread token == 0\n");
+                    pc += 4;
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
+                    continue;
+                } else if ((pc & 0xfff) == 0x1bc) {
+                    LOG("Bypass: objc restartable ranges\n");
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, 0x28005a1d8));
+                    continue;
+                }
+
+                LOG("UNEXPECTED\n");
                 LOG("Reg dump:\n");
                 for (uint32_t reg = HV_REG_X0; reg <= HV_REG_X30; reg++) {
                     uint64_t s;
                     HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, reg, &s));
                     LOG("X%d: 0x%llx\n", reg, s);
-                    /* if (reg == HV_REG_X19) { */
-                    /*     LOG("msg: %s\n", (char*)s); */
-                    /* } */
                 }
-                uint64_t pc;
-                HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
-                LOG("PC: 0x%llx\n", pc);
                 uint64_t elr;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &elr));
                 LOG("ELR_EL1: 0x%llx\n", elr);
@@ -376,17 +422,6 @@ int main(int argc, char **argv)
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &x));
                 LOG("ESR: 0x%llx\n", x);
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &x));
-                /* LOG("sctlr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, &x)); */
-                /* LOG("cpacr %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &x)); */
-                /* LOG("ttbr0 %llx\n", x); */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, &x)); */
-                /* LOG("tcr %llx\n", x); */
-                // ghost: continue here in case this entire thing is being run under lldb, which would insert a brk
-                // at __dyld_debugger_notification for its own purposes
-                /* pc += 4; */
-                /* HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc)); */
                 break;
             } else {
                 uint64_t pc;

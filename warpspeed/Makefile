@@ -4,4 +4,4 @@ warpspeed: vm.c loader.c commpage.c
 
 .PHONY: clean
 clean:
-	rm -f warpspeed
+	rm -f warpspeed warpspeed.dSYM

@@ -34,25 +34,21 @@ fn main() {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
-    let _vm = av::VirtualMachine::new();
-    // Unused, but necessary global and local data structures.
     let gdata = macho_loader::GlobalData;
     let ldata = macho_loader::LocalData {
         // This is initialized by loader.map. Just needs to be here for access in hooks
         shared_cache_base: 0,
     };
-    // Instanciates the test loader with our assembled instructions.
+
     let loader = macho_loader::MachOLoader::new(&args.executable, &args.arguments)
         .expect("could not create loader");
-    // Builds a default configuration for the executor with an address space size of, at most,
-    // 0x10000000 bytes.
-    let config = ExecConfig::builder(0x10000000).build();
-    // Instanciates the executor with the values above.
+
+    let config = ExecConfig::builder(0x10_0000_0000).build();
+
     let mut executor =
         Executor::<_, _, _>::new(config, loader, ldata, gdata).expect("could not create executor");
+
     executor.init().expect("could not init executor");
-    // Runs the executor. It will stop automatically when the `ret` instruction is executed.
+    executor.vcpu.set_reg(av::Reg::LR, 0xdeadf000).unwrap();
     executor.run(None).expect("execution failed");
-    // Makes sure that we obtained the expected result of 0x42.
-    println!("X0 = {:#x}", executor.vcpu.get_reg(av::Reg::X0).unwrap());
 }

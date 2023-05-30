@@ -4,7 +4,6 @@ use std::ffi::CStr;
 use std::ffi::CString;
 
 use hyperpom::applevisor as av;
-use hyperpom::config::*;
 use hyperpom::core::*;
 use hyperpom::corpus::*;
 use hyperpom::coverage::*;
@@ -88,6 +87,7 @@ impl Loader for MachOLoader {
                     0,
                 )
             };
+            trace!("argv_page = {:x}", argv_page as u64);
             executor
                 .vma
                 .map_1to1(argv_page as u64, 0x10000, av::MemPerms::RW)?;
@@ -124,6 +124,7 @@ impl Loader for MachOLoader {
             executor
                 .vma
                 .map_1to1(tls_page as u64, 0x10000, av::MemPerms::RW)?;
+            trace!("tls_page = {:x}", tls_page as u64);
         }
 
         unsafe {
@@ -136,13 +137,35 @@ impl Loader for MachOLoader {
             executor.ldata.shared_cache_base = self.shared_cache_base;
         }
 
+        trace!("mappings: {:?}", res.mappings);
         for m_i in 0..res.n_mappings {
             let mapping = res.mappings[m_i as usize];
-            executor.vma.map_1to1(
-                mapping.hyper as u64,
-                round_virt_page!(mapping.len) as usize,
-                av::MemPerms::RWX,
-            )?;
+            if mapping.hyper == mapping.guest_va {
+                trace!(
+                    "creating 1:1 mapping at {:x} size {:x}",
+                    mapping.hyper as u64,
+                    mapping.len
+                );
+                executor.vma.map_1to1(
+                    mapping.hyper as u64,
+                    round_virt_page!(mapping.len) as usize,
+                    av::MemPerms::RWX,
+                )?;
+            } else {
+                trace!(
+                    "creating ** NON 1:1 ** mapping at {:x} size {:x}",
+                    mapping.hyper as u64,
+                    mapping.len
+                );
+                executor.vma.map(
+                    mapping.guest_va as u64,
+                    round_virt_page!(mapping.len) as usize,
+                    av::MemPerms::RWX,
+                )?;
+                executor.vma.write(mapping.guest_va as u64, unsafe {
+                    std::slice::from_raw_parts(mapping.hyper as _, mapping.len)
+                })?;
+            }
         }
 
         Ok(())

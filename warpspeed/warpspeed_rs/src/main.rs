@@ -37,7 +37,10 @@ fn main() {
     let _vm = av::VirtualMachine::new();
     // Unused, but necessary global and local data structures.
     let gdata = macho_loader::GlobalData;
-    let ldata = macho_loader::LocalData;
+    let ldata = macho_loader::LocalData {
+        // This is initialized by loader.map. Just needs to be here for access in hooks
+        shared_cache_base: 0,
+    };
     // Instanciates the test loader with our assembled instructions.
     let loader = macho_loader::MachOLoader::new(&args.executable, &args.arguments)
         .expect("could not create loader");

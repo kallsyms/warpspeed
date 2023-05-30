@@ -308,7 +308,7 @@ impl Loader for MachOLoader {
                     "svc #0x80",
                     "mov {ret0}, x0",
                     "mov {ret1}, x1",
-                    "mov {cflags}, NZCV",
+                    "mrs {cflags}, NZCV",
                     args0 = in(reg) args[0],
                     args1 = in(reg) args[1],
                     args2 = in(reg) args[2],

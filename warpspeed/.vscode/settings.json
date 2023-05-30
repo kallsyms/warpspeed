@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "./warpspeed_rs/Cargo.toml"
+    ]
+}

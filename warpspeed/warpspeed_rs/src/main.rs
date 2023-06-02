@@ -34,6 +34,7 @@ fn main() {
         .filter_level(args.verbose.log_level_filter())
         .init();
 
+    let _vm = av::VirtualMachine::new(); // DO NOT REMOVE
     let gdata = macho_loader::GlobalData;
     let ldata = macho_loader::LocalData {
         // This is initialized by loader.map. Just needs to be here for access in hooks
@@ -43,12 +44,15 @@ fn main() {
     let loader = macho_loader::MachOLoader::new(&args.executable, &args.arguments)
         .expect("could not create loader");
 
-    let config = ExecConfig::builder(0x10_0000_0000).build();
+    // dynamically allocated physical memory must be <0x1000_0000, which is where our 1:1 mappings begins
+    let config = ExecConfig::builder(0x1000_0000).coverage(false).build();
 
     let mut executor =
         Executor::<_, _, _>::new(config, loader, ldata, gdata).expect("could not create executor");
 
     executor.init().expect("could not init executor");
     executor.vcpu.set_reg(av::Reg::LR, 0xdeadf000).unwrap();
-    executor.run(None).expect("execution failed");
+    let ret = executor.run(None);
+    dbg!(ret);
+    error!("{}", executor.vcpu);
 }

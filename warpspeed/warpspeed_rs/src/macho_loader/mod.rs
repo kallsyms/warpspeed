@@ -36,6 +36,7 @@ pub struct MachOLoader {
 
     entry_point: u64,
     stack_pointer: u64,
+    tls: u64,
     shared_cache_base: u64,
 }
 
@@ -47,6 +48,7 @@ impl MachOLoader {
             arguments: args.clone(),
             entry_point: 0,
             stack_pointer: 0,
+            tls: 0,
             shared_cache_base: 0,
         })
     }
@@ -63,7 +65,7 @@ impl MachOLoader {
     ) -> Result<ExitKind> {
         debug!("objc task_restartable_ranges_register hook");
         args.vcpu
-            .set_reg(av::Reg::PC, args.ldata.shared_cache_base + 0x5a1d8)?;
+            .set_reg(av::Reg::PC, args.ldata.shared_cache_base + 0x5e570)?;
         Ok(ExitKind::Continue)
     }
 }
@@ -90,7 +92,7 @@ impl Loader for MachOLoader {
             trace!("argv_page = {:x}", argv_page as u64);
             executor
                 .vma
-                .map_1to1(argv_page as u64, 0x10000, av::MemPerms::RW)?;
+                .map_1to1(argv_page as u64, 0x10000, av::MemPerms::RWX)?;
             let argv_ptrs: &mut [*const u8] =
                 unsafe { std::slice::from_raw_parts_mut(argv_page as _, self.arguments.len()) };
             let mut argv_str: &mut [u8] = unsafe {
@@ -123,7 +125,8 @@ impl Loader for MachOLoader {
             };
             executor
                 .vma
-                .map_1to1(tls_page as u64, 0x10000, av::MemPerms::RW)?;
+                .map_1to1(tls_page as u64, 0x10000, av::MemPerms::RWX)?;
+            self.tls = tls_page as u64;
             trace!("tls_page = {:x}", tls_page as u64);
         }
 
@@ -137,24 +140,23 @@ impl Loader for MachOLoader {
             executor.ldata.shared_cache_base = self.shared_cache_base;
         }
 
-        trace!("mappings: {:?}", res.mappings);
         for m_i in 0..res.n_mappings {
             let mapping = res.mappings[m_i as usize];
             if mapping.hyper == mapping.guest_va {
                 trace!(
                     "creating 1:1 mapping at {:x} size {:x}",
-                    mapping.hyper as u64,
+                    mapping.guest_va as u64,
                     mapping.len
                 );
                 executor.vma.map_1to1(
-                    mapping.hyper as u64,
+                    mapping.guest_va as u64,
                     round_virt_page!(mapping.len) as usize,
                     av::MemPerms::RWX,
                 )?;
             } else {
                 trace!(
                     "creating ** NON 1:1 ** mapping at {:x} size {:x}",
-                    mapping.hyper as u64,
+                    mapping.guest_va as u64,
                     mapping.len
                 );
                 executor.vma.map(
@@ -168,22 +170,29 @@ impl Loader for MachOLoader {
             }
         }
 
+        trace!("map done");
         Ok(())
     }
 
-    // Sets PC to the entry point.
     fn pre_exec(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<ExitKind> {
+        debug!("Entry point: {:x}", self.entry_point);
+        debug!("Stack pointer: {:x}", self.stack_pointer);
+        debug!("TLS: {:x}", self.tls);
         executor.vcpu.set_reg(av::Reg::PC, self.entry_point)?;
         executor
             .vcpu
             .set_sys_reg(av::SysReg::SP_EL0, self.stack_pointer)?;
+        executor
+            .vcpu
+            .set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tls)?;
         Ok(ExitKind::Continue)
     }
 
     fn hooks(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
-        executor.add_custom_hook(self.shared_cache_base + 0x3c6e0c, MachOLoader::pthread_hook);
+        // ghost: TODO: these are probably wrong now since upgrade
+        executor.add_custom_hook(self.shared_cache_base + 0x3f9df8, MachOLoader::pthread_hook);
         executor.add_custom_hook(
-            self.shared_cache_base + 0x5a1bc,
+            self.shared_cache_base + 0x5e554,
             MachOLoader::objc_restartable_ranges_hook,
         );
         Ok(())
@@ -319,28 +328,19 @@ impl Loader for MachOLoader {
             debug!("Forwarding syscall {:x}(0x{:x?})", num, args);
             unsafe {
                 asm!(
-                    "mov x0, {args0}",
-                    "mov x1, {args1}",
-                    "mov x2, {args2}",
-                    "mov x3, {args3}",
-                    "mov x4, {args4}",
-                    "mov x5, {args5}",
-                    "mov x6, {args6}",
-                    "mov x7, {args7}",
-                    "mov x16, {num}",
                     "svc #0x80",
                     "mov {ret0}, x0",
                     "mov {ret1}, x1",
                     "mrs {cflags}, NZCV",
-                    args0 = in(reg) args[0],
-                    args1 = in(reg) args[1],
-                    args2 = in(reg) args[2],
-                    args3 = in(reg) args[3],
-                    args4 = in(reg) args[4],
-                    args5 = in(reg) args[5],
-                    args6 = in(reg) args[6],
-                    args7 = in(reg) args[7],
-                    num = in(reg) num,
+                    in("x0") args[0],
+                    in("x1") args[1],
+                    in("x2") args[2],
+                    in("x3") args[3],
+                    in("x4") args[4],
+                    in("x5") args[5],
+                    in("x6") args[6],
+                    in("x7") args[7],
+                    in("x16") num,
                     ret0 = out(reg) ret0,
                     ret1 = out(reg) ret1,
                     cflags = out(reg) cflags,
@@ -350,16 +350,25 @@ impl Loader for MachOLoader {
             match num {
                 0xc5 => {
                     // mmap
-                    vma.map_1to1(ret0, args[1] as usize, av::MemPerms::RWX)?;
+                    // applevisor (and therefore the round_phys_page macro) assumes 64k pages which isn't correct
+                    let size = ((args[1] + (0x4000 - 1)) & !(0x4000 - 1)) as usize;
+                    trace!("1:1 map of {:x} {:x} due to mmap", ret0, size);
+                    vma.map_1to1(ret0, size, av::MemPerms::RWX)?;
                 }
                 0xfffffffffffffff6 => {
                     // mach_vm_allocate
                     let addr: u64 = unsafe { *(args[1] as *const u64) };
+                    trace!(
+                        "1:1 map of {:x} {:x} due to mach_vm_allocate",
+                        addr,
+                        args[2]
+                    );
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
                 }
                 0xfffffffffffffff1 => {
                     // mach_vm_map
                     let addr: u64 = unsafe { *(args[1] as *const u64) };
+                    trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
                 }
                 _ => {}
@@ -369,11 +378,14 @@ impl Loader for MachOLoader {
         debug!("Returning {:x} {:x} {:x}", ret0, ret1, cflags);
         vcpu.set_reg(av::Reg::X0, ret0)?;
         vcpu.set_reg(av::Reg::X1, ret1)?;
+
+        // And jump back
         vcpu.set_reg(
             av::Reg::CPSR,
-            (vcpu.get_reg(av::Reg::CPSR)? & !(0b1111 << 28)) | cflags,
+            (vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags,
         )?;
         vcpu.set_reg(av::Reg::PC, elr)?;
+
         Ok(ExitKind::Continue)
     }
 }

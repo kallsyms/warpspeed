@@ -190,9 +190,9 @@ int main(int argc, char **argv)
     }
 
     // pthread token == 0 bypass
-    memcpy(0x2803c6e0c, brk_insns, sizeof(brk_insns));
+    memcpy(0x2803f9df8, brk_insns, sizeof(brk_insns));
     // objc init "task_restartable_ranges_register" bypass
-    memcpy(0x28005a1bc, brk_insns, sizeof(brk_insns));
+    memcpy(0x28005e554, brk_insns, sizeof(brk_insns));
 
     // https://github.com/Impalabs/hyperpom/blob/85a4df8b6af2babf3689bd4c486fcbbd4c831f8a/src/memory.rs#L1836
     HYP_ASSERT_SUCCESS(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0xff));
@@ -377,15 +377,15 @@ int main(int argc, char **argv)
                 uint64_t pc;
                 HYP_ASSERT_SUCCESS(hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc));
                 LOG("PC: 0x%llx\n", pc);
-                if ((pc & 0xfff) == 0xe0c) {
+                if ((pc & 0xfff) == 0xdf8) {
                     // skip over token == 0 check in pthread
                     LOG("Bypass: pthread token == 0\n");
                     pc += 4;
                     HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, pc));
                     continue;
-                } else if ((pc & 0xfff) == 0x1bc) {
+                } else if ((pc & 0xfff) == 0x554) {
                     LOG("Bypass: objc restartable ranges\n");
-                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, 0x28005a1d8));
+                    HYP_ASSERT_SUCCESS(hv_vcpu_set_reg(vcpu, HV_REG_PC, 0x28005e570));
                     continue;
                 }
 

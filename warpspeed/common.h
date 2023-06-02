@@ -2,7 +2,7 @@
 #define COMMON_H
 
 #ifdef DEBUG
-#define LOG(...) fprintf(stdout, __VA_ARGS__)
+#define LOG(...) fprintf(stderr, __VA_ARGS__)
 #else
 #define LOG(...)
 #endif

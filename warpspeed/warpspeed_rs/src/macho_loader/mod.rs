@@ -246,7 +246,7 @@ impl Loader for MachOLoader {
 
         // This is our syscall handler
         let num = vcpu.get_reg(av::Reg::X16)?;
-        let args: [u64; 8] = [
+        let args: [u64; 16] = [
             vcpu.get_reg(av::Reg::X0)?,
             vcpu.get_reg(av::Reg::X1)?,
             vcpu.get_reg(av::Reg::X2)?,
@@ -255,6 +255,14 @@ impl Loader for MachOLoader {
             vcpu.get_reg(av::Reg::X5)?,
             vcpu.get_reg(av::Reg::X6)?,
             vcpu.get_reg(av::Reg::X7)?,
+            vcpu.get_reg(av::Reg::X8)?,
+            vcpu.get_reg(av::Reg::X9)?,
+            vcpu.get_reg(av::Reg::X10)?,
+            vcpu.get_reg(av::Reg::X11)?,
+            vcpu.get_reg(av::Reg::X12)?,
+            vcpu.get_reg(av::Reg::X13)?,
+            vcpu.get_reg(av::Reg::X14)?,
+            vcpu.get_reg(av::Reg::X15)?,
         ];
 
         let mut ret0: u64 = 0;
@@ -340,6 +348,14 @@ impl Loader for MachOLoader {
                     in("x5") args[5],
                     in("x6") args[6],
                     in("x7") args[7],
+                    in("x8") args[8],
+                    in("x9") args[9],
+                    in("x10") args[10],
+                    in("x11") args[11],
+                    in("x12") args[12],
+                    in("x13") args[13],
+                    in("x14") args[14],
+                    in("x15") args[15],
                     in("x16") num,
                     ret0 = out(reg) ret0,
                     ret1 = out(reg) ret1,

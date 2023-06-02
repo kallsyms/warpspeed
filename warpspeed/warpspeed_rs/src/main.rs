@@ -28,7 +28,10 @@ pub struct Cli {
 }
 
 fn main() {
-    let args = Cli::parse();
+    let mut args = Cli::parse();
+    let target_args = args.arguments;
+    args.arguments = vec![args.executable.clone()];
+    args.arguments.extend(target_args);
 
     env_logger::Builder::new()
         .filter_level(args.verbose.log_level_filter())

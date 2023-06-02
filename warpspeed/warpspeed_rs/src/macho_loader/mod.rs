@@ -104,7 +104,8 @@ impl Loader for MachOLoader {
             };
             for i in 0..self.arguments.len() {
                 argv_ptrs[i] = argv_str.as_ptr();
-                argv_str.copy_from_slice(self.arguments[i].as_bytes());
+                argv_str[..self.arguments[i].as_bytes().len()]
+                    .copy_from_slice(self.arguments[i].as_bytes());
                 argv_str = &mut argv_str[self.arguments[i].len() + 1..];
             }
 

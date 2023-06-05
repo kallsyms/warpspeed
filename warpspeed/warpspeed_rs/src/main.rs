@@ -38,11 +38,8 @@ fn main() {
         .init();
 
     let _vm = av::VirtualMachine::new(); // DO NOT REMOVE
-    let gdata = macho_loader::GlobalData;
-    let ldata = macho_loader::LocalData {
-        // This is initialized by loader.map. Just needs to be here for access in hooks
-        shared_cache_base: 0,
-    };
+    let gdata: macho_loader::GlobalData = Default::default();
+    let ldata: macho_loader::LocalData = Default::default();
 
     let loader = macho_loader::MachOLoader::new(&args.executable, &args.arguments)
         .expect("could not create loader");

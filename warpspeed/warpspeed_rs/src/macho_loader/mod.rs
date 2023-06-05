@@ -1,5 +1,8 @@
 use log::{debug, error, info, trace, warn};
 use std::arch::asm;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::ffi::CString;
 
@@ -21,12 +24,13 @@ use crate::macho_loader::loader_ffi::KERN_NOT_FOUND;
 mod loader_ffi;
 
 // Empty global data.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct GlobalData;
 // Empty local data.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct LocalData {
     pub shared_cache_base: u64,
+    pub mappings: Vec<loader_ffi::vm_mmap>,
 }
 
 #[derive(Clone)]
@@ -67,6 +71,65 @@ impl MachOLoader {
         args.vcpu
             .set_reg(av::Reg::PC, args.ldata.shared_cache_base + 0x5e570)?;
         Ok(ExitKind::Continue)
+    }
+
+    fn is_mapped(addr: u64, ldata: &LocalData) -> bool {
+        for mapping in &ldata.mappings {
+            if addr >= mapping.guest_va as u64
+                && addr < mapping.guest_va as u64 + mapping.len as u64
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    // explore from the given set of potential pointers, returning a set of pages that are
+    // accessible from the set of pointers.
+    fn explore_pointers(
+        vma: &mut VirtMemAllocator,
+        ldata: &LocalData,
+        entry_points: &[u64],
+    ) -> HashSet<u64> {
+        let mut queue = entry_points
+            .iter()
+            .filter_map(|&addr| {
+                if Self::is_mapped(addr, ldata) {
+                    Some((addr, 0))
+                } else {
+                    None
+                }
+            })
+            .collect::<VecDeque<_>>();
+        let mut pages = HashSet::from_iter(queue.iter().map(|&(addr, _)| addr & !0xfff));
+
+        while let Some((start_addr, depth)) = queue.pop_front() {
+            let mut last_page = start_addr & !0xfff;
+            for addr in start_addr..start_addr + 0x200 {
+                // +0x200 can take us to a new, potentially unmapped page so we have to check.
+                // But we only have to do this when crossing the page boundry, not every time.
+                if addr & !0xfff != last_page {
+                    if !Self::is_mapped(addr, ldata) {
+                        break;
+                    } else {
+                        last_page = addr & !0xfff;
+                    }
+                }
+                let value = vma.read_qword(addr).unwrap();
+                if !Self::is_mapped(value, ldata) {
+                    continue;
+                }
+                let page_addr = value & !0xfff;
+                if !pages.contains(&page_addr) {
+                    pages.insert(page_addr);
+                    if depth < 2 {
+                        queue.push_back((value, depth + 1));
+                    }
+                }
+            }
+        }
+
+        pages
     }
 }
 
@@ -138,11 +201,10 @@ impl Loader for MachOLoader {
             self.entry_point = res.entry_point;
             self.stack_pointer = res.stack_top;
             self.shared_cache_base = loader_ffi::map_shared_cache(&mut res) as u64;
-            executor.ldata.shared_cache_base = self.shared_cache_base;
         }
 
-        for m_i in 0..res.n_mappings {
-            let mapping = res.mappings[m_i as usize];
+        let mappings = res.mappings[..res.n_mappings].to_vec();
+        for mapping in &mappings {
             if mapping.hyper == mapping.guest_va {
                 trace!(
                     "creating 1:1 mapping at {:x} size {:x}",
@@ -170,6 +232,9 @@ impl Loader for MachOLoader {
                 })?;
             }
         }
+
+        executor.ldata.mappings = mappings;
+        executor.ldata.shared_cache_base = self.shared_cache_base;
 
         trace!("map done");
         Ok(())
@@ -278,6 +343,16 @@ impl Loader for MachOLoader {
                     CStr::from_ptr(args[0] as _).to_string_lossy()
                 });
             }
+            0x49 => {
+                // munmap
+                if let Some(mapping_idx) = ldata.mappings.iter().position(|mapping| {
+                    mapping.guest_va as u64 == args[0] && mapping.len as u64 == args[1]
+                }) {
+                    trace!("munmap({:x}, {:x})", args[0], args[1]);
+                    ldata.mappings.remove(mapping_idx);
+                }
+                handled = true;
+            }
             0x10a => {
                 // shm_open
                 let name = unsafe { CStr::from_ptr(args[0] as _) };
@@ -334,6 +409,14 @@ impl Loader for MachOLoader {
         }
 
         if !handled {
+            // map of addr -> page contents
+            let mut before_pages = HashMap::new();
+            for page_addr in MachOLoader::explore_pointers(vma, ldata, &args) {
+                let mut contents: Vec<u8> = vec![0; 0x1000];
+                vma.read(page_addr, &mut contents)?;
+                before_pages.insert(page_addr, contents);
+            }
+
             debug!("Forwarding syscall {:x}(0x{:x?})", num, args);
             unsafe {
                 asm!(
@@ -363,6 +446,17 @@ impl Loader for MachOLoader {
                     cflags = out(reg) cflags,
                 );
             }
+
+            let mut changed_pages = HashMap::new();
+            for (page_addr, old_contents) in before_pages {
+                let mut new_contents: Vec<u8> = vec![0; 0x1000];
+                vma.read(page_addr, &mut new_contents)?;
+                if old_contents != new_contents {
+                    changed_pages.insert(page_addr, new_contents);
+                }
+            }
+
+            trace!("Changed pages: {:?}", changed_pages.keys());
 
             match num {
                 0xc5 => {

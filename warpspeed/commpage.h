@@ -7,7 +7,7 @@
 // Include commpage definitions
 #define PRIVATE
 #define _COMM_PAGE_LAYOUT_VERSION 0  // ghost: force non RO page pointers
-#include <arm/cpu_capabilities.h>
+#include "cpu_capabilities.h"
 
 #ifdef __cplusplus
 extern "C" {

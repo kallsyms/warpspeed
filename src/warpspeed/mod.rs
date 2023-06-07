@@ -18,8 +18,7 @@ use hyperpom::tracer::*;
 use hyperpom::utils::*;
 use hyperpom::*;
 
-use crate::macho_loader::loader_ffi::KERN_DENIED;
-use crate::macho_loader::loader_ffi::KERN_NOT_FOUND;
+use crate::recordable;
 
 mod loader_ffi;
 
@@ -29,6 +28,8 @@ pub struct GlobalData;
 // Empty local data.
 #[derive(Clone, Default)]
 pub struct LocalData {
+    pub trace: crate::recordable::Trace,
+
     pub shared_cache_base: u64,
     pub mappings: Vec<loader_ffi::vm_mmap>,
 }
@@ -334,6 +335,7 @@ impl Loader for MachOLoader {
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
+        let mut changed_pages = HashMap::new();
 
         let mut handled = false;
         match num {
@@ -359,7 +361,7 @@ impl Loader for MachOLoader {
                 trace!("shm_open({})", name.to_string_lossy());
                 if name.to_string_lossy() == "com.apple.featureflags.shm" {
                     debug!("Denying shm_open for featureflag");
-                    ret0 = KERN_DENIED as _;
+                    ret0 = loader_ffi::KERN_DENIED as _;
                     ret1 = 0;
                     cflags = 1 << 29;
                     handled = true;
@@ -399,7 +401,7 @@ impl Loader for MachOLoader {
                 // TODO: actually check for this being task_info
                 if flavor == 0x11 {
                     debug!("Returning NOT_FOUND for TASK_DYLD_INFO");
-                    ret0 = KERN_NOT_FOUND as _;
+                    ret0 = loader_ffi::KERN_NOT_FOUND as _;
                     ret1 = 0;
                     cflags = 1 << 29;
                     handled = true;
@@ -447,7 +449,6 @@ impl Loader for MachOLoader {
                 );
             }
 
-            let mut changed_pages = HashMap::new();
             for (page_addr, old_contents) in before_pages {
                 let mut new_contents: Vec<u8> = vec![0; 0x1000];
                 vma.read(page_addr, &mut new_contents)?;
@@ -486,11 +487,75 @@ impl Loader for MachOLoader {
             }
         }
 
+        let mut side_effects = vec![
+            recordable::SideEffect {
+                kind: Some(recordable::side_effect::Kind::Register(
+                    recordable::side_effect::Register {
+                        register: av::Reg::X0 as _,
+                        value: ret0,
+                    },
+                )),
+            },
+            recordable::SideEffect {
+                kind: Some(recordable::side_effect::Kind::Register(
+                    recordable::side_effect::Register {
+                        register: av::Reg::X1 as _,
+                        value: ret1,
+                    },
+                )),
+            },
+            recordable::SideEffect {
+                kind: Some(recordable::side_effect::Kind::Register(
+                    recordable::side_effect::Register {
+                        register: av::Reg::CPSR as _,
+                        value: cflags, // TODO: grab all flags and bitmask as we do below
+                    },
+                )),
+            },
+        ];
+
+        for (address, contents) in changed_pages {
+            side_effects.push(recordable::SideEffect {
+                kind: Some(recordable::side_effect::Kind::Memory(
+                    recordable::side_effect::Memory {
+                        address,
+                        value: contents,
+                    },
+                )),
+            });
+        }
+
+        // TODO: is there a reason to distinguish between syscall and trap at all?
+        if num < 0x8_0000_0000 {
+            // syscall
+            ldata.trace.events.push(recordable::LogEvent {
+                pc: elr,
+                register_state: args.to_vec(),
+                event: Some(recordable::log_event::Event::Syscall(
+                    recordable::syscall::Syscall {
+                        syscall_number: num as _,
+                        side_effects,
+                    },
+                )),
+            });
+        } else {
+            // trap
+            ldata.trace.events.push(recordable::LogEvent {
+                pc: elr,
+                register_state: args.to_vec(),
+                event: Some(recordable::log_event::Event::MachTrap(
+                    recordable::mach_trap::MachTrap {
+                        trap_number: num as _,
+                        side_effects,
+                    },
+                )),
+            });
+        }
+
+        // And jump back
         debug!("Returning {:x} {:x} {:x}", ret0, ret1, cflags);
         vcpu.set_reg(av::Reg::X0, ret0)?;
         vcpu.set_reg(av::Reg::X1, ret1)?;
-
-        // And jump back
         vcpu.set_reg(
             av::Reg::CPSR,
             (vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags,

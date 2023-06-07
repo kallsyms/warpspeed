@@ -2,11 +2,9 @@ syntax = "proto3";
 
 package mrr.recordable.mach_trap;
 
+import "src/recordable/side_effect.proto";
+
 message MachTrap {
   uint32 trap_number = 1;
-  message Timebase { bytes data = 1; }
-  oneof data {
-    uint64 return_only = 2;
-    Timebase timebase = 3;
-  }
+  repeated mrr.recordable.SideEffect side_effects = 2;
 }

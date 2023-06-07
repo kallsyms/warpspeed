@@ -1,18 +1,19 @@
 CODESIGN := codesign
 CARGO := cargo +nightly
 
-TARGET := warpspeed_rs
+TARGET := mrr
 TARGET_DEBUG := target/debug/$(TARGET)
+# TODO
 TARGET_TEST := target/debug/$(TARGET)
 TARGET_RELEASE := target/release/$(TARGET)
 
 .PHONY: build-debug
 build-debug:
 	$(CARGO) build
-	$(CODESIGN) --entitlements warpspeed.entitlements --force -s - "$(TARGET_DEBUG)"
+	$(CODESIGN) --entitlements mrr.entitlements --force -s - "$(TARGET_DEBUG)"
 
 .PHONY: test
 test:
 	$(CARGO) test --no-run
-	$(CODESIGN) --entitlements warpspeed.entitlements --force -s - "$(TARGET_TEST)"
+	$(CODESIGN) --entitlements mrr.entitlements --force -s - "$(TARGET_TEST)"
 	$(TARGET_TEST)

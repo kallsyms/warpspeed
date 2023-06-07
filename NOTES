@@ -1,3 +1,5 @@
+# COMPLETELY OUT OF DATE AS OF 2023-06-07
+
 # Exploratory Notes
 
 * Original idea is macos' ptrace_attachext "extension", in which we receive ptrace notifications over a mach port instead of signaling

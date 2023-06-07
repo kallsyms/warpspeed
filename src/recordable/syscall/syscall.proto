@@ -2,21 +2,9 @@ syntax = "proto3";
 
 package mrr.recordable.syscall;
 
+import "src/recordable/side_effect.proto";
+
 message Syscall {
   uint32 syscall_number = 1;
-
-  message ReturnOnly {
-    uint64 rv0 = 1;
-    uint64 rv1 = 2;
-  }
-  message Read {
-    oneof result {
-      uint64 error = 1;
-      bytes data = 2;
-    }
-  }
-  oneof data {
-    ReturnOnly return_only = 2;
-    Read read = 3;
-  }
+  repeated mrr.recordable.SideEffect side_effects = 2;
 }

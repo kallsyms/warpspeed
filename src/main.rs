@@ -7,6 +7,7 @@ mod record;
 mod recordable;
 mod replay;
 mod util;
+mod warpspeed;
 
 fn main() {
     let args = cli::Cli::parse();

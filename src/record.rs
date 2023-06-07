@@ -4,12 +4,11 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::cli;
-use crate::dtrace;
 use crate::mach;
 use crate::recordable;
 use crate::util;
+use crate::warpspeed;
 
-use mach::mach_check_return;
 use recordable::{log_event::Event, trace::Target, LogEvent, Trace};
 
 pub fn record(args: &cli::RecordArgs) {
@@ -21,252 +20,36 @@ pub fn record(args: &cli::RecordArgs) {
         environment: vec![], // TODO
     };
 
-    let child = util::spawn_target(&target);
-    info!("Child pid {}", child);
-
-    let mut trace = Trace {
-        target: Some(target),
-        events: vec![],
+    let _vm = hyperpom::applevisor::VirtualMachine::new(); // DO NOT REMOVE
+    let gdata: warpspeed::GlobalData = Default::default();
+    let ldata = warpspeed::LocalData {
+        trace: Trace {
+            target: Some(target),
+            events: vec![],
+        },
+        ..Default::default()
     };
 
-    let mut dtrace = dtrace::DTraceManager::new().unwrap();
+    let loader = warpspeed::MachOLoader::new(&args.executable, &args.arguments)
+        .expect("could not create loader");
 
-    // Thread monitor
-    // Record the new tid and the pc that the new thread is starting at.
-    let program = format!("/pid == {}/ {{ trace(uregs[R_PC]); stop(); }}", child);
-    dtrace
-        .register_program(
-            dtrace::ProbeDescription::new(
-                Some("proc"),
-                Some("mach_kernel"),
-                None,
-                Some("lwp-start"),
-            ),
-            &program,
-            |_task_port, thread_port, data| {
-                let pc = data[0];
-                Some(Event::Scheduling(recordable::scheduling::Scheduling {
-                    tid: thread_port,
-                    event: Some(recordable::scheduling::scheduling::Event::Start(
-                        recordable::scheduling::scheduling::NewThread { pc },
-                    )),
-                }))
-            },
-        )
+    // dynamically allocated physical memory must be <0x1000_0000, which is where our 1:1 mappings begins
+    let config = hyperpom::config::ExecConfig::builder(0x1000_0000)
+        .coverage(false)
+        .build();
+
+    let mut executor = hyperpom::core::Executor::<_, _, _>::new(config, loader, ldata, gdata)
+        .expect("could not create executor");
+
+    executor.init().expect("could not init executor");
+    executor
+        .vcpu
+        .set_reg(hyperpom::applevisor::Reg::LR, 0xdeadf000)
         .unwrap();
 
-    // Syscalls
-    // arm64 syscalls can return 2 results in x0 and x1
-    // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/dev/arm/systemcalls.c#L518
-    let program = format!(
-        "/pid == {}/ {{ self->x0 = uregs[0]; self->x1 = uregs[1]; }}",
-        child
-    );
-    dtrace
-        .register_program(
-            dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("entry")),
-            &program,
-            |_task_port, _thread_port, _data| None,
-        )
-        .unwrap();
-
-    let program = format!(
-        "/pid == {}/ {{ trace(self->x0); trace(self->x1); stop();}}",
-        child
-    );
-    dtrace
-        .register_program(
-            dtrace::ProbeDescription::new(Some("syscall"), None, None, Some("return")),
-            &program,
-            |task_port, thread_port, data| {
-                let clobbered_regs: [u64; 2] = [data[0], data[1]];
-                Some(Event::Syscall(recordable::syscall::record_syscall(
-                    task_port,
-                    thread_port,
-                    clobbered_regs,
-                )))
-            },
-        )
-        .unwrap();
-
-    // Mach Traps
-    // Mach traps/syscalls only return one value in x0
-    let program = format!("/pid == {}/ {{ self->x0 = uregs[0]; }}", child);
-    dtrace
-        .register_program(
-            dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("entry")),
-            &program,
-            |_task_port, _thread_port, _data| None,
-        )
-        .unwrap();
-
-    let program = format!("/pid == {}/ {{ trace(self->x0); stop(); }}", child);
-    dtrace
-        .register_program(
-            dtrace::ProbeDescription::new(Some("mach_trap"), None, None, Some("return")),
-            &program,
-            |task_port, thread_port, data| {
-                let clobbered_regs: [u64; 1] = [data[0]];
-                Some(Event::MachTrap(recordable::mach_trap::record_mach_trap(
-                    task_port,
-                    thread_port,
-                    clobbered_regs,
-                )))
-            },
-        )
-        .unwrap();
-
-    // Library interception
-    // Don't need to record any regs.
-    // let program = format!(
-    //     "pid{}:libsystem_kernel.dylib:mach_absolute_time:entry {{ stop(); }}",
-    //     child
-    // );
-    // dtrace.register_program(&program, dtrace::ProbeDescription::new(None, None, Some("mach_absolute_time"), None), |task_port, thread_port, aggdata| {
-    //     println!("mach_absolute_time");
-    //     None
-    // }).unwrap();
-
-    dtrace.enable().unwrap();
-
-    let mut child_task_port: mach::task_t = 0;
-    unsafe {
-        mach_check_return(mach::task_for_pid(
-            mach::mach_task_self(),
-            child.into(),
-            &mut child_task_port,
-        ))
-        .unwrap();
-    }
-
-    util::ptrace_attachexc(child).unwrap();
-    trace!("Attached");
-
-    let mut threadidx = 0;
-    let mut last_switch = std::time::Instant::now();
-    let mut known_threads: Vec<mach::thread_t> = mach::mrr_list_threads(child_task_port);
-
-    // TODO: deal with forks
-    loop {
-        // Spinloop until the child process is suspended.
-        let mut ti: mach::mach_task_basic_info = unsafe { std::mem::zeroed() };
-        let mut n: u32 = mach::TASK_INFO_MAX as u32;
-        if mach_check_return(unsafe {
-            mach::task_info(
-                child_task_port,
-                mach::MACH_TASK_BASIC_INFO as u32,
-                &mut ti as *mut _ as *mut i32,
-                &mut n,
-            )
-        })
-        .is_err()
-        {
-            break;
-        }
-
-        if ti.suspend_count == 0
-            && (known_threads.len() == 1
-                || last_switch.elapsed() < std::time::Duration::from_millis(1))
-        {
-            continue;
-        }
-
-        // First, suspend the child process (since it may be running in the case the timeout
-        // is what caused us to fall through).
-        let status = mach_check_return(unsafe { mach::task_suspend(child_task_port) });
-        // TODO: async read from the exception port to check if the process exited
-        if status.is_err() {
-            break;
-        }
-
-        // mach port to the thread that was last running
-        let last_thread = known_threads[threadidx];
-
-        // Suspend new threads since they start running.
-        let threads = mach::mrr_list_threads(child_task_port);
-
-        let new_threads: Vec<mach::thread_t> = threads
-            .iter()
-            .filter(|t| !known_threads.contains(t))
-            .copied()
-            .collect();
-        let exited_threads: Vec<mach::thread_t> = known_threads
-            .iter()
-            .filter(|t| !threads.contains(t))
-            .copied()
-            .collect();
-
-        for thread in &new_threads {
-            trace!("Suspending new thread: {}", *thread);
-            mach_check_return(unsafe { mach::thread_suspend(*thread) });
-        }
-
-        // Add new threads to the list of known threads
-        for thread in &new_threads {
-            known_threads.push(*thread);
-        }
-        // And remove exited threads
-        for thread in &exited_threads {
-            trace!("Thread exited: {}", thread);
-            known_threads.retain(|t| t != thread);
-        }
-
-        if !exited_threads.contains(&last_thread) {
-            // Suspend the thread that was just running
-            trace!("Suspending thread: {}", last_thread);
-            mach_check_return(unsafe { mach::thread_suspend(last_thread) }).unwrap();
-            // Then handle any events we got from dtrace.
-            let events = dtrace.dispatch(child_task_port, last_thread);
-            trace!("Events: {:?}", events);
-            for event in events {
-                let log_entry = LogEvent {
-                    pc: mach::mrr_get_regs(last_thread).__pc - 4,
-                    register_state: mach::mrr_get_regs(last_thread).__x.to_vec(),
-                    event: Some(event),
-                };
-                trace!("Logging: {:?}", log_entry);
-                trace.events.push(log_entry);
-            }
-        }
-
-        // Switch to the next thread
-        threadidx = (threadidx + 1) % known_threads.len();
-        let new_thread = known_threads[threadidx];
-        last_switch = std::time::Instant::now();
-
-        // known_threads.contains check is to ensure we don't try to probe a thread that has just exited
-        if new_thread != last_thread && !exited_threads.contains(&last_thread) {
-            trace.events.push(LogEvent {
-                pc: mach::mrr_get_regs(last_thread).__pc - 4,
-                register_state: mach::mrr_get_regs(last_thread).__x.to_vec(),
-                event: Some(Event::Scheduling(recordable::scheduling::Scheduling {
-                    tid: last_thread,
-                    event: Some(recordable::scheduling::scheduling::Event::Switch(
-                        recordable::scheduling::scheduling::SwitchCurrent {
-                            new_tid: new_thread,
-                        },
-                    )),
-                })),
-            });
-        }
-
-        // And resume it
-        trace!("Resuming thread: {}", new_thread);
-        mach_check_return(unsafe { mach::thread_resume(new_thread) }).unwrap();
-
-        // And resume the entire task
-        // (may require multiple resumes if the task was suspended by dtrace)
-        // +1 because we suspended the task after getting task info
-        for _ in 0..ti.suspend_count + 1 {
-            mach_check_return(unsafe { mach::task_resume(child_task_port) }).unwrap();
-        }
-    }
-
-    trace!("Cleaning up");
-
-    // TODO: close down ports? (maybe a drop impl on a mach port type?)
+    let ret = executor.run(None);
 
     output
-        .write_all(prost::Message::encode_to_vec(&trace).as_slice())
+        .write_all(prost::Message::encode_to_vec(&executor.ldata.trace).as_slice())
         .unwrap();
 }

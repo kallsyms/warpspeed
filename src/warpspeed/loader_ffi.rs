@@ -1,3 +1,3 @@
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, unused)]
 
-include!(concat!(env!("OUT_DIR"), "/loader_ffi.rs"));
+include!(concat!(env!("OUT_DIR"), "/warpspeed_loader_ffi.rs"));

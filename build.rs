@@ -54,7 +54,6 @@ fn main() {
     // Bindings for the generated mig header
     bindgen::Builder::default()
         .header(out_dir.join("mach_exc.h").to_str().unwrap())
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .generate()
         .expect("Unable to generate mig bindings")
         .write_to_file(out_dir.join("mach_exc.rs"))
@@ -109,7 +108,6 @@ fn main() {
     // Syscall numbers
     bindgen::Builder::default()
         .header(sdkroot.join("usr/include/sys/syscall.h").to_str().unwrap())
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .generate()
         .expect("Unable to generate syscall bindings")
         .write_to_file(out_dir.join("sysno.rs"))
@@ -119,11 +117,25 @@ fn main() {
     bindgen::Builder::default()
         .header(sdkroot.join("usr/include/dtrace.h").to_str().unwrap())
         .derive_eq(true)
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .generate()
         .expect("Unable to generate dtrace bindings")
         .write_to_file(out_dir.join("dtrace.rs"))
         .expect("Couldn't write dtrace bindings");
+
+    // Warpspeed loader
+    bindgen::Builder::default()
+        .header("src/warpspeed/loader/loader.h")
+        .header("src/warpspeed/loader/shared_cache.h")
+        .generate()
+        .expect("Unable to generate warpspeed loader bindings")
+        .write_to_file(out_dir.join("warpspeed_loader_ffi.rs"))
+        .expect("Couldn't write warpspeed loader bindings");
+
+    cc::Build::new()
+        .file("src/warpspeed/loader/loader.c")
+        .file("src/warpspeed/loader/commpage.c")
+        .file("src/warpspeed/loader/shared_cache.c")
+        .compile("warpspeed");
 
     // Recordable protobuf
     prost_build::compile_protos(&["src/recordable/recordable.proto"], &["."])

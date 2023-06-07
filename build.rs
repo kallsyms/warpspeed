@@ -135,7 +135,7 @@ fn main() {
         .file("src/warpspeed/loader/loader.c")
         .file("src/warpspeed/loader/commpage.c")
         .file("src/warpspeed/loader/shared_cache.c")
-        .compile("warpspeed");
+        .compile("warpspeed_loader");
 
     // Recordable protobuf
     prost_build::compile_protos(&["src/recordable/recordable.proto"], &["."])

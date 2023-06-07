@@ -142,6 +142,9 @@ impl Loader for MachOLoader {
     fn map(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
         let mut res: loader_ffi::load_results = unsafe { std::mem::zeroed() };
 
+        let mut argv_strs = vec![self.executable.clone()];
+        argv_strs.extend(self.arguments.clone());
+
         {
             let argv_page = unsafe {
                 nix::libc::mmap(
@@ -158,22 +161,20 @@ impl Loader for MachOLoader {
                 .vma
                 .map_1to1(argv_page as u64, 0x10000, av::MemPerms::RWX)?;
             let argv_ptrs: &mut [*const u8] =
-                unsafe { std::slice::from_raw_parts_mut(argv_page as _, self.arguments.len()) };
+                unsafe { std::slice::from_raw_parts_mut(argv_page as _, argv_strs.len()) };
             let mut argv_str: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(
-                    argv_page.offset((std::mem::size_of::<u64>() * self.arguments.len()) as isize)
-                        as _,
+                    argv_page.offset((std::mem::size_of::<u64>() * argv_strs.len()) as isize) as _,
                     0x10000,
                 )
             };
-            for i in 0..self.arguments.len() {
+            for i in 0..argv_strs.len() {
                 argv_ptrs[i] = argv_str.as_ptr();
-                argv_str[..self.arguments[i].as_bytes().len()]
-                    .copy_from_slice(self.arguments[i].as_bytes());
-                argv_str = &mut argv_str[self.arguments[i].len() + 1..];
+                argv_str[..argv_strs[i].as_bytes().len()].copy_from_slice(argv_strs[i].as_bytes());
+                argv_str = &mut argv_str[argv_strs[i].len() + 1..];
             }
 
-            res.argc = self.arguments.len();
+            res.argc = argv_strs.len();
             res.argv = argv_page as _;
         }
 

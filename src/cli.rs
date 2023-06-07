@@ -4,6 +4,9 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
+    #[clap(hide = true, long)]
+    pub stage2: bool,
+
     #[clap(flatten)]
     pub verbose: clap_verbosity_flag::Verbosity,
 

@@ -28,110 +28,112 @@ pub struct GlobalData;
 // Empty local data.
 #[derive(Clone, Default)]
 pub struct LocalData {
+    // Trace of the execution.
     pub trace: crate::recordable::Trace,
 
+    // Starting stack pointer.
+    pub stack_pointer: u64,
+    // Address of thread local storage.
+    pub tls: u64,
+    // Base address of the shared cache.
     pub shared_cache_base: u64,
+    // List of mappings in the guest.
     pub mappings: Vec<loader_ffi::vm_mmap>,
+}
+
+fn pthread_hook(args: &mut hooks::HookArgs<LocalData, GlobalData>) -> Result<ExitKind> {
+    debug!("pthread token == 0 hook");
+    args.vcpu
+        .set_reg(av::Reg::PC, args.vcpu.get_reg(av::Reg::PC).unwrap() + 4)?;
+    Ok(ExitKind::Continue)
+}
+
+fn objc_restartable_ranges_hook(
+    args: &mut hooks::HookArgs<LocalData, GlobalData>,
+) -> Result<ExitKind> {
+    debug!("objc task_restartable_ranges_register hook");
+    args.vcpu
+        .set_reg(av::Reg::PC, args.ldata.shared_cache_base + 0x5e570)?;
+    Ok(ExitKind::Continue)
+}
+
+fn is_mapped(addr: u64, ldata: &LocalData) -> bool {
+    for mapping in &ldata.mappings {
+        if addr >= mapping.guest_va as u64 && addr < mapping.guest_va as u64 + mapping.len as u64 {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone)]
 pub struct MachOLoader {
+    // Path to the executable.
     executable: String,
+    // Arguments to pass to the executable, not including argv[0].
     arguments: Vec<String>,
 
+    // Entry point of the executable.
     entry_point: u64,
-    stack_pointer: u64,
-    tls: u64,
-    shared_cache_base: u64,
 }
 
 impl MachOLoader {
     pub fn new(executable: &str, args: &Vec<String>) -> Result<Self> {
-        // TODO: parse macho, check for arm64
+        // TODO: parse macho, check for arm64 and error accordingly
         Ok(Self {
             executable: executable.to_string(),
             arguments: args.clone(),
             entry_point: 0,
-            stack_pointer: 0,
-            tls: 0,
-            shared_cache_base: 0,
         })
     }
+}
 
-    fn pthread_hook(args: &mut hooks::HookArgs<LocalData, GlobalData>) -> Result<ExitKind> {
-        debug!("pthread token == 0 hook");
-        args.vcpu
-            .set_reg(av::Reg::PC, args.vcpu.get_reg(av::Reg::PC).unwrap() + 4)?;
-        Ok(ExitKind::Continue)
-    }
-
-    fn objc_restartable_ranges_hook(
-        args: &mut hooks::HookArgs<LocalData, GlobalData>,
-    ) -> Result<ExitKind> {
-        debug!("objc task_restartable_ranges_register hook");
-        args.vcpu
-            .set_reg(av::Reg::PC, args.ldata.shared_cache_base + 0x5e570)?;
-        Ok(ExitKind::Continue)
-    }
-
-    fn is_mapped(addr: u64, ldata: &LocalData) -> bool {
-        for mapping in &ldata.mappings {
-            if addr >= mapping.guest_va as u64
-                && addr < mapping.guest_va as u64 + mapping.len as u64
-            {
-                return true;
+// explore from the given set of potential pointers, returning a set of pages that are
+// accessible from the set of pointers.
+fn explore_pointers(
+    vma: &mut VirtMemAllocator,
+    ldata: &LocalData,
+    entry_points: &[u64],
+) -> HashSet<u64> {
+    let mut queue = entry_points
+        .iter()
+        .filter_map(|&addr| {
+            if is_mapped(addr, ldata) {
+                Some((addr, 0))
+            } else {
+                None
             }
-        }
-        false
-    }
+        })
+        .collect::<VecDeque<_>>();
+    let mut pages = HashSet::from_iter(queue.iter().map(|&(addr, _)| addr & !0xfff));
 
-    // explore from the given set of potential pointers, returning a set of pages that are
-    // accessible from the set of pointers.
-    fn explore_pointers(
-        vma: &mut VirtMemAllocator,
-        ldata: &LocalData,
-        entry_points: &[u64],
-    ) -> HashSet<u64> {
-        let mut queue = entry_points
-            .iter()
-            .filter_map(|&addr| {
-                if Self::is_mapped(addr, ldata) {
-                    Some((addr, 0))
+    while let Some((start_addr, depth)) = queue.pop_front() {
+        let mut last_page = start_addr & !0xfff;
+        for addr in start_addr..start_addr + 0x200 {
+            // +0x200 can take us to a new, potentially unmapped page so we have to check.
+            // But we only have to do this when crossing the page boundry, not every time.
+            if addr & !0xfff != last_page {
+                if !is_mapped(addr, ldata) {
+                    break;
                 } else {
-                    None
+                    last_page = addr & !0xfff;
                 }
-            })
-            .collect::<VecDeque<_>>();
-        let mut pages = HashSet::from_iter(queue.iter().map(|&(addr, _)| addr & !0xfff));
-
-        while let Some((start_addr, depth)) = queue.pop_front() {
-            let mut last_page = start_addr & !0xfff;
-            for addr in start_addr..start_addr + 0x200 {
-                // +0x200 can take us to a new, potentially unmapped page so we have to check.
-                // But we only have to do this when crossing the page boundry, not every time.
-                if addr & !0xfff != last_page {
-                    if !Self::is_mapped(addr, ldata) {
-                        break;
-                    } else {
-                        last_page = addr & !0xfff;
-                    }
-                }
-                let value = vma.read_qword(addr).unwrap();
-                if !Self::is_mapped(value, ldata) {
-                    continue;
-                }
-                let page_addr = value & !0xfff;
-                if !pages.contains(&page_addr) {
-                    pages.insert(page_addr);
-                    if depth < 2 {
-                        queue.push_back((value, depth + 1));
-                    }
+            }
+            let value = vma.read_qword(addr).unwrap();
+            if !is_mapped(value, ldata) {
+                continue;
+            }
+            let page_addr = value & !0xfff;
+            if !pages.contains(&page_addr) {
+                pages.insert(page_addr);
+                if depth < 2 {
+                    queue.push_back((value, depth + 1));
                 }
             }
         }
-
-        pages
     }
+
+    pages
 }
 
 impl Loader for MachOLoader {
@@ -192,7 +194,7 @@ impl Loader for MachOLoader {
             executor
                 .vma
                 .map_1to1(tls_page as u64, 0x10000, av::MemPerms::RWX)?;
-            self.tls = tls_page as u64;
+            executor.ldata.tls = tls_page as u64;
             trace!("tls_page = {:x}", tls_page as u64);
         }
 
@@ -201,8 +203,8 @@ impl Loader for MachOLoader {
             loader_ffi::load(executable.as_ptr(), false, &mut res);
             loader_ffi::setup_stack64(executable.as_ptr(), &mut res);
             self.entry_point = res.entry_point;
-            self.stack_pointer = res.stack_top;
-            self.shared_cache_base = loader_ffi::map_shared_cache(&mut res) as u64;
+            executor.ldata.stack_pointer = res.stack_top;
+            executor.ldata.shared_cache_base = loader_ffi::map_shared_cache(&mut res) as u64;
         }
 
         let mappings = res.mappings[..res.n_mappings].to_vec();
@@ -236,7 +238,6 @@ impl Loader for MachOLoader {
         }
 
         executor.ldata.mappings = mappings;
-        executor.ldata.shared_cache_base = self.shared_cache_base;
 
         trace!("map done");
         Ok(())
@@ -244,24 +245,26 @@ impl Loader for MachOLoader {
 
     fn pre_exec(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<ExitKind> {
         debug!("Entry point: {:x}", self.entry_point);
-        debug!("Stack pointer: {:x}", self.stack_pointer);
-        debug!("TLS: {:x}", self.tls);
+        debug!("Stack pointer: {:x}", executor.ldata.stack_pointer);
+        debug!("TLS: {:x}", executor.ldata.tls);
         executor.vcpu.set_reg(av::Reg::PC, self.entry_point)?;
         executor
             .vcpu
-            .set_sys_reg(av::SysReg::SP_EL0, self.stack_pointer)?;
+            .set_sys_reg(av::SysReg::SP_EL0, executor.ldata.stack_pointer)?;
         executor
             .vcpu
-            .set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tls)?;
+            .set_sys_reg(av::SysReg::TPIDRRO_EL0, executor.ldata.tls)?;
         Ok(ExitKind::Continue)
     }
 
     fn hooks(&mut self, executor: &mut Executor<Self, Self::LD, Self::GD>) -> Result<()> {
-        // ghost: TODO: these are probably wrong now since upgrade
-        executor.add_custom_hook(self.shared_cache_base + 0x3f9df8, MachOLoader::pthread_hook);
+        // TODO: fix up applep so we don't need this
+        executor.add_custom_hook(executor.ldata.shared_cache_base + 0x3f9df8, pthread_hook);
+        // TODO: figure out where the actual call to set restartable ranges is
+        // and intercept that syscall instead
         executor.add_custom_hook(
-            self.shared_cache_base + 0x5e554,
-            MachOLoader::objc_restartable_ranges_hook,
+            executor.ldata.shared_cache_base + 0x5e554,
+            objc_restartable_ranges_hook,
         );
         Ok(())
     }
@@ -419,7 +422,7 @@ impl Loader for MachOLoader {
         if !handled {
             // map of addr -> page contents
             let mut before_pages = HashMap::new();
-            for page_addr in MachOLoader::explore_pointers(vma, ldata, &args) {
+            for page_addr in explore_pointers(vma, ldata, &args) {
                 let mut contents: Vec<u8> = vec![0; 0x1000];
                 vma.read(page_addr, &mut contents)?;
                 before_pages.insert(page_addr, contents);

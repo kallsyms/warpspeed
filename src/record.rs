@@ -1,16 +1,12 @@
 use log::debug;
-use log::{error, info, trace, warn};
 use std::fs::File;
 use std::io::Write;
-use std::time::Duration;
 
 use crate::cli;
-use crate::mach;
 use crate::recordable;
-use crate::util;
 use crate::warpspeed;
 
-use recordable::{log_event::Event, trace::Target, LogEvent, Trace};
+use recordable::{trace::Target, Trace};
 
 pub fn record(args: &cli::RecordArgs) {
     let target = Target {

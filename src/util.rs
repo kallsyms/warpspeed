@@ -4,14 +4,14 @@ use std::ffi::CString;
 
 use crate::recordable::trace::Target;
 
-struct CStringArray {
+pub struct CStringArray {
     // I think this can be done with lifetimes and phantomdata...
     _owned: Vec<CString>,
     pointers: Vec<*mut i8>,
 }
 
 impl CStringArray {
-    fn new(strings: &[String]) -> CStringArray {
+    pub fn new(strings: &[String]) -> CStringArray {
         let owned: Vec<CString> = strings
             .iter()
             .map(|a| CString::new(a.as_bytes()).unwrap())
@@ -26,7 +26,7 @@ impl CStringArray {
         }
     }
 
-    fn as_ptr(&self) -> *const *mut i8 {
+    pub fn as_ptr(&self) -> *const *mut i8 {
         self.pointers.as_ptr()
     }
 }
@@ -44,7 +44,7 @@ pub fn ptrace_attachexc(pid: nix::unistd::Pid) -> nix::Result<()> {
 }
 
 // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/sys/spawn.h#L62
-const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
+pub const _POSIX_SPAWN_DISABLE_ASLR: i32 = 0x0100;
 
 pub fn spawn_target(target: &Target) -> nix::unistd::Pid {
     unsafe {

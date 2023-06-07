@@ -340,6 +340,11 @@ impl Loader for MachOLoader {
 
         let mut handled = false;
         match num {
+            0x1 => {
+                // exit
+                // TODO: log trace
+                return Ok(ExitKind::Exit);
+            }
             0x5 => {
                 // open
                 debug!("open({})", unsafe {

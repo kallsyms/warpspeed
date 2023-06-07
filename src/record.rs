@@ -1,3 +1,4 @@
+use log::debug;
 use log::{error, info, trace, warn};
 use std::fs::File;
 use std::io::Write;
@@ -12,8 +13,6 @@ use crate::warpspeed;
 use recordable::{log_event::Event, trace::Target, LogEvent, Trace};
 
 pub fn record(args: &cli::RecordArgs) {
-    let mut output = File::create(&args.trace_filename).unwrap();
-
     let target = Target {
         path: args.executable.clone(),
         arguments: args.arguments.clone(),
@@ -48,7 +47,9 @@ pub fn record(args: &cli::RecordArgs) {
         .unwrap();
 
     let ret = executor.run(None);
+    debug!("executor returned: {:?}", ret);
 
+    let mut output = File::create(&args.trace_filename).unwrap();
     output
         .write_all(prost::Message::encode_to_vec(&executor.ldata.trace).as_slice())
         .unwrap();

@@ -15,3 +15,11 @@ prost = "0.11.8"
 bindgen = "0.63.0"
 cc = "1.0.76"
 prost-build = "0.11.8"
+
+[[bin]]
+name = "mrr"
+path = "src/main.rs"
+
+[[bin]]
+name = "demo_kdebug_blocking"
+path = "src/demos/kdebug_blocking.rs"

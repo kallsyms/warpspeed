@@ -25,7 +25,7 @@ pub fn record(args: &cli::RecordArgs) {
         ..Default::default()
     };
 
-    let loader = warpspeed::MachOLoader::new(&args.executable, &args.arguments)
+    let loader = warpspeed::MachOLoader::new_record_loader(&args.executable, &args.arguments)
         .expect("could not create loader");
 
     // dynamically allocated physical memory must be <0x1000_0000, which is where our 1:1 mappings begins

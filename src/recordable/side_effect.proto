@@ -17,8 +17,10 @@ message SideEffect {
     // The value that the address was changed to.
     bytes value = 2;
   }
+  message External { uint64 address = 1; }
   oneof kind {
     Register register = 1;
     Memory memory = 2;
+    External external = 3;
   }
 }

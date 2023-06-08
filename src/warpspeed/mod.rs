@@ -30,6 +30,8 @@ pub struct GlobalData;
 pub struct LocalData {
     // Trace of the execution.
     pub trace: crate::recordable::Trace,
+    // Current event index.
+    pub event_idx: usize,
 
     // Starting stack pointer.
     pub stack_pointer: u64,
@@ -59,15 +61,25 @@ fn objc_restartable_ranges_hook(
 
 fn is_mapped(addr: u64, ldata: &LocalData) -> bool {
     for mapping in &ldata.mappings {
-        if addr >= mapping.guest_va as u64 && addr < mapping.guest_va as u64 + mapping.len as u64 {
+        if addr >= mapping.guest_va as u64
+            && addr < mapping.guest_va as u64 + mapping.len as u64 - 8
+        {
             return true;
         }
     }
     false
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum LoaderMode {
+    Record,
+    Replay,
+}
+
 #[derive(Clone)]
 pub struct MachOLoader {
+    mode: LoaderMode,
+
     // Path to the executable.
     executable: String,
     // Arguments to pass to the executable, not including argv[0].
@@ -78,9 +90,20 @@ pub struct MachOLoader {
 }
 
 impl MachOLoader {
-    pub fn new(executable: &str, args: &Vec<String>) -> Result<Self> {
+    pub fn new_record_loader(executable: &str, args: &Vec<String>) -> Result<Self> {
         // TODO: parse macho, check for arm64 and error accordingly
         Ok(Self {
+            mode: LoaderMode::Record,
+            executable: executable.to_string(),
+            arguments: args.clone(),
+            entry_point: 0,
+        })
+    }
+
+    pub fn new_replay_loader(executable: &str, args: &Vec<String>) -> Result<Self> {
+        // TODO: parse macho, check for arm64 and error accordingly
+        Ok(Self {
+            mode: LoaderMode::Replay,
             executable: executable.to_string(),
             arguments: args.clone(),
             entry_point: 0,
@@ -194,8 +217,10 @@ impl Loader for MachOLoader {
             executor
                 .vma
                 .map_1to1(tls_page as u64, 0x10000, av::MemPerms::RWX)?;
-            executor.ldata.tls = tls_page as u64;
-            trace!("tls_page = {:x}", tls_page as u64);
+            // TODO: pthread init does tpidrro_el0 - 0xe0 and then writes to that.
+            // how is tls actually mapped?
+            executor.ldata.tls = tls_page as u64 + 0x8000;
+            trace!("tls_page = {:x}", executor.ldata.tls);
         }
 
         unsafe {
@@ -238,6 +263,7 @@ impl Loader for MachOLoader {
         }
 
         executor.ldata.mappings = mappings;
+        executor.ldata.mappings.reserve(1000);
 
         trace!("map done");
         Ok(())
@@ -266,6 +292,7 @@ impl Loader for MachOLoader {
             executor.ldata.shared_cache_base + 0x5e554,
             objc_restartable_ranges_hook,
         );
+
         Ok(())
     }
 
@@ -298,6 +325,21 @@ impl Loader for MachOLoader {
         Ok(vec![])
     }
 
+    fn exception_handler_sync_curel_spx(
+        &self,
+        vcpu: &mut applevisor::Vcpu,
+        _vma: &mut VirtMemAllocator,
+        _ldata: &mut Self::LD,
+        _gdata: &std::sync::RwLock<Self::GD>,
+    ) -> Result<ExitKind> {
+        let elr = vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
+        trace!("ELR_EL1: {:#x}", elr);
+
+        error!("SAME EL Fault!");
+        error!("{}", vcpu);
+        return Ok(ExitKind::Crash("Unhandled fault".to_string()));
+    }
+
     fn exception_handler_sync_lowerel_aarch64(
         &self,
         vcpu: &mut av::Vcpu,
@@ -317,7 +359,7 @@ impl Loader for MachOLoader {
 
         // This is our syscall handler
         let num = vcpu.get_reg(av::Reg::X16)?;
-        let args: [u64; 16] = [
+        let mut args: [u64; 16] = [
             vcpu.get_reg(av::Reg::X0)?,
             vcpu.get_reg(av::Reg::X1)?,
             vcpu.get_reg(av::Reg::X2)?,
@@ -335,11 +377,13 @@ impl Loader for MachOLoader {
             vcpu.get_reg(av::Reg::X14)?,
             vcpu.get_reg(av::Reg::X15)?,
         ];
+        debug!("Incoming syscall {:x}(0x{:x?})", num, args);
 
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
         let mut changed_pages = HashMap::new();
+        let mut side_effects = vec![];
 
         let mut handled = false;
         match num {
@@ -363,6 +407,19 @@ impl Loader for MachOLoader {
                     ldata.mappings.remove(mapping_idx);
                 }
                 handled = true;
+            }
+            0x4a => {
+                // mprotect
+                handled = true;
+            }
+            0xfffffffffffffff2 => {
+                // mach_vm_protect
+                handled = true;
+            }
+            0xfffffffffffffff4 => {
+                // mach_vm_deallocate
+                handled = true;
+                // TODO: remove from mappings
             }
             0x10a => {
                 // shm_open
@@ -420,53 +477,242 @@ impl Loader for MachOLoader {
         }
 
         if !handled {
-            // map of addr -> page contents
-            let mut before_pages = HashMap::new();
-            for page_addr in explore_pointers(vma, ldata, &args) {
-                let mut contents: Vec<u8> = vec![0; 0x1000];
-                vma.read(page_addr, &mut contents)?;
-                before_pages.insert(page_addr, contents);
-            }
+            match self.mode {
+                LoaderMode::Record => {
+                    // map of addr -> page contents
+                    let mut before_pages = HashMap::new();
+                    for page_addr in explore_pointers(vma, ldata, &args) {
+                        let mut contents: Vec<u8> = vec![0; 0x1000];
+                        vma.read(page_addr, &mut contents)?;
+                        before_pages.insert(page_addr, contents);
+                    }
 
-            debug!("Forwarding syscall {:x}(0x{:x?})", num, args);
-            unsafe {
-                asm!(
-                    "svc #0x80",
-                    "mov {ret0}, x0",
-                    "mov {ret1}, x1",
-                    "mrs {cflags}, NZCV",
-                    in("x0") args[0],
-                    in("x1") args[1],
-                    in("x2") args[2],
-                    in("x3") args[3],
-                    in("x4") args[4],
-                    in("x5") args[5],
-                    in("x6") args[6],
-                    in("x7") args[7],
-                    in("x8") args[8],
-                    in("x9") args[9],
-                    in("x10") args[10],
-                    in("x11") args[11],
-                    in("x12") args[12],
-                    in("x13") args[13],
-                    in("x14") args[14],
-                    in("x15") args[15],
-                    in("x16") num,
-                    ret0 = out(reg) ret0,
-                    ret1 = out(reg) ret1,
-                    cflags = out(reg) cflags,
-                );
-            }
+                    debug!(
+                        "{}: Forwarding syscall {:x}(0x{:x?})",
+                        ldata.trace.events.len(),
+                        num,
+                        args
+                    );
+                    unsafe {
+                        asm!(
+                            "svc #0x80",
+                            "mov {ret0}, x0",
+                            "mov {ret1}, x1",
+                            "mrs {cflags}, NZCV",
+                            in("x0") args[0],
+                            in("x1") args[1],
+                            in("x2") args[2],
+                            in("x3") args[3],
+                            in("x4") args[4],
+                            in("x5") args[5],
+                            in("x6") args[6],
+                            in("x7") args[7],
+                            in("x8") args[8],
+                            in("x9") args[9],
+                            in("x10") args[10],
+                            in("x11") args[11],
+                            in("x12") args[12],
+                            in("x13") args[13],
+                            in("x14") args[14],
+                            in("x15") args[15],
+                            in("x16") num,
+                            ret0 = out(reg) ret0,
+                            ret1 = out(reg) ret1,
+                            cflags = out(reg) cflags,
+                        );
+                    }
 
-            for (page_addr, old_contents) in before_pages {
-                let mut new_contents: Vec<u8> = vec![0; 0x1000];
-                vma.read(page_addr, &mut new_contents)?;
-                if old_contents != new_contents {
-                    changed_pages.insert(page_addr, new_contents);
+                    if num == 3 || num == 396 {
+                        for (page_addr, old_contents) in before_pages {
+                            let mut new_contents: Vec<u8> = vec![0; 0x1000];
+                            vma.read(page_addr, &mut new_contents)?;
+                            for i in 0..0x1000 {
+                                if old_contents[i] != new_contents[i] {
+                                    changed_pages
+                                        .insert(page_addr + i as u64, vec![new_contents[i]]);
+                                }
+                            }
+                        }
+                    }
+
+                    trace!("Changed pages: {:?}", changed_pages.keys());
+                }
+
+                LoaderMode::Replay => {
+                    let event = &ldata.trace.events[ldata.event_idx];
+                    if elr != event.pc {
+                        if num == 4 {
+                            trace!("msg: {:x?}", unsafe { CStr::from_ptr(args[1] as _) });
+                            vcpu.set_reg(av::Reg::X0, args[2])?;
+                            vcpu.set_reg(av::Reg::X1, 0)?;
+                            vcpu.set_reg(
+                                av::Reg::CPSR,
+                                vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28),
+                            )?;
+                            vcpu.set_reg(av::Reg::PC, elr)?;
+                            return Ok(ExitKind::Continue);
+                        }
+                        error!(
+                            "replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
+                            ldata.event_idx, event.pc, elr
+                        );
+                        return Ok(ExitKind::Exit);
+                    }
+
+                    match &event.event {
+                        Some(crate::recordable::log_event::Event::Syscall(syscall)) => {
+                            if num != syscall.syscall_number {
+                                error!(
+                                    "replay {}: syscall mismatch: expected 0x{:x}, got 0x{:x}",
+                                    ldata.event_idx, syscall.syscall_number, num
+                                );
+                            }
+                            for side_effect in &syscall.side_effects {
+                                match &side_effect.kind {
+                                    Some(crate::recordable::side_effect::Kind::Register(reg)) => {
+                                        trace!(
+                                            "replay {}: setting {:?} to 0x{:x}",
+                                            ldata.event_idx,
+                                            reg.register,
+                                            reg.value
+                                        );
+                                        match reg.register {
+                                            0x0 => ret0 = reg.value,
+                                            0x1 => ret1 = reg.value,
+                                            0x22 => cflags = reg.value,
+                                            _ => {
+                                                error!(
+                                                    "replay {}: unexpected register: {:?}",
+                                                    ldata.event_idx, reg.register
+                                                );
+                                                return Ok(ExitKind::Exit);
+                                            }
+                                        }
+                                    }
+                                    Some(crate::recordable::side_effect::Kind::Memory(mem)) => {
+                                        trace!(
+                                            "replay {}: writing to 0x{:x}",
+                                            ldata.event_idx,
+                                            mem.address
+                                        );
+                                        unsafe {
+                                            std::ptr::copy(
+                                                mem.value.as_ptr(),
+                                                mem.address as _,
+                                                mem.value.len(),
+                                            );
+                                        }
+                                    }
+                                    Some(crate::recordable::side_effect::Kind::External(ext)) => {
+                                        match num {
+                                            0xc5 => {
+                                                args[0] = ext.address;
+                                                args[2] = (nix::libc::PROT_READ
+                                                    | nix::libc::PROT_WRITE)
+                                                    as u64;
+                                                args[3] = nix::libc::MAP_FIXED as u64
+                                                    | nix::libc::MAP_ANONYMOUS as u64;
+                                                args[4] = -1 as i64 as u64;
+                                                // contents will be updated by subsequent memory sideeffect
+                                            }
+                                            0xfffffffffffffff6 => unsafe {
+                                                *(args[1] as *mut u64) = ext.address;
+                                                args[3] &= !0x1;
+                                            },
+                                            0xfffffffffffffff1 => unsafe {
+                                                *(args[1] as *mut u64) = ext.address;
+                                                args[4] &= !0x1;
+                                            },
+                                            _ => {}
+                                        }
+
+                                        debug!(
+                                            "replay {}: Forwarding syscall {:x}(0x{:x?})",
+                                            ldata.event_idx, num, args
+                                        );
+                                        unsafe {
+                                            asm!(
+                                                "svc #0x80",
+                                                "mov {ret0}, x0",
+                                                "mov {ret1}, x1",
+                                                "mrs {cflags}, NZCV",
+                                                in("x0") args[0],
+                                                in("x1") args[1],
+                                                in("x2") args[2],
+                                                in("x3") args[3],
+                                                in("x4") args[4],
+                                                in("x5") args[5],
+                                                in("x6") args[6],
+                                                in("x7") args[7],
+                                                in("x8") args[8],
+                                                in("x9") args[9],
+                                                in("x10") args[10],
+                                                in("x11") args[11],
+                                                in("x12") args[12],
+                                                in("x13") args[13],
+                                                in("x14") args[14],
+                                                in("x15") args[15],
+                                                in("x16") num,
+                                                ret0 = out(reg) ret0,
+                                                ret1 = out(reg) ret1,
+                                                cflags = out(reg) cflags,
+                                            );
+                                        }
+                                        match num {
+                                            0xc5 => {
+                                                let addr = ret0;
+                                                if addr != ext.address {
+                                                    error!(
+                                                        "replay {}: address mismatch: expected 0x{:x}, got 0x{:x}",
+                                                        ldata.event_idx,
+                                                        ext.address, addr
+                                                    );
+                                                }
+                                            }
+                                            0xfffffffffffffff6 => unsafe {
+                                                let addr = *(args[1] as *mut u64);
+                                                if addr != ext.address {
+                                                    error!(
+                                                        "replay {}: address mismatch: expected 0x{:x}, got 0x{:x}",
+                                                        ldata.event_idx,
+                                                        ext.address, addr
+                                                    );
+                                                }
+                                            },
+                                            0xfffffffffffffff1 => unsafe {
+                                                let addr = *(args[1] as *mut u64);
+                                                if addr != ext.address {
+                                                    error!(
+                                                        "replay {}: address mismatch: expected 0x{:x}, got 0x{:x}",
+                                                        ldata.event_idx,
+                                                        ext.address, addr
+                                                    );
+                                                }
+                                            },
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {
+                                        error!(
+                                            "replay {}: unexpected side effect kind: {:?}",
+                                            ldata.event_idx, side_effect.kind
+                                        );
+                                        return Ok(ExitKind::Exit);
+                                    }
+                                }
+                            }
+                        }
+                        //Some(crate::recordable::log_event::Event::MachTrap(trap)) => {}
+                        _ => {
+                            error!(
+                                "replay {}: unexpected event type: {:?}",
+                                ldata.event_idx, event.event
+                            );
+                            return Ok(ExitKind::Exit);
+                        }
+                    }
                 }
             }
-
-            trace!("Changed pages: {:?}", changed_pages.keys());
 
             match num {
                 0xc5 => {
@@ -475,6 +721,28 @@ impl Loader for MachOLoader {
                     let size = ((args[1] + (0x4000 - 1)) & !(0x4000 - 1)) as usize;
                     trace!("1:1 map of {:x} {:x} due to mmap", ret0, size);
                     vma.map_1to1(ret0, size, av::MemPerms::RWX)?;
+                    ldata.mappings.push(loader_ffi::vm_mmap {
+                        hyper: ret0 as _,
+                        guest_pa: 0 as _,
+                        guest_va: ret0 as _,
+                        len: size,
+                        prot: 0,
+                    });
+                    side_effects.push(recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::External(
+                            recordable::side_effect::External { address: ret0 },
+                        )),
+                    });
+                    let mut data = vec![0; size];
+                    vma.read(ret0, &mut data)?;
+                    side_effects.push(recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::Memory(
+                            recordable::side_effect::Memory {
+                                address: ret0,
+                                value: data,
+                            },
+                        )),
+                    });
                 }
                 0xfffffffffffffff6 => {
                     // mach_vm_allocate
@@ -485,90 +753,135 @@ impl Loader for MachOLoader {
                         args[2]
                     );
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
+                    ldata.mappings.push(loader_ffi::vm_mmap {
+                        hyper: addr as _,
+                        guest_pa: 0 as _,
+                        guest_va: addr as _,
+                        len: args[2] as _,
+                        prot: 0,
+                    });
+                    side_effects.push(recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::External(
+                            recordable::side_effect::External { address: addr },
+                        )),
+                    });
                 }
                 0xfffffffffffffff1 => {
                     // mach_vm_map
                     let addr: u64 = unsafe { *(args[1] as *const u64) };
                     trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
+                    ldata.mappings.push(loader_ffi::vm_mmap {
+                        hyper: addr as _,
+                        guest_pa: 0 as _,
+                        guest_va: addr as _,
+                        len: args[2] as _,
+                        prot: 0,
+                    });
+                    side_effects.push(recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::External(
+                            recordable::side_effect::External { address: addr },
+                        )),
+                    });
                 }
                 _ => {}
             }
         }
 
-        let mut side_effects = vec![
-            recordable::SideEffect {
-                kind: Some(recordable::side_effect::Kind::Register(
-                    recordable::side_effect::Register {
-                        register: av::Reg::X0 as _,
-                        value: ret0,
-                    },
-                )),
-            },
-            recordable::SideEffect {
-                kind: Some(recordable::side_effect::Kind::Register(
-                    recordable::side_effect::Register {
-                        register: av::Reg::X1 as _,
-                        value: ret1,
-                    },
-                )),
-            },
-            recordable::SideEffect {
-                kind: Some(recordable::side_effect::Kind::Register(
-                    recordable::side_effect::Register {
-                        register: av::Reg::CPSR as _,
-                        value: cflags, // TODO: grab all flags and bitmask as we do below
-                    },
-                )),
-            },
-        ];
+        let cpsr = (vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags;
 
-        for (address, contents) in changed_pages {
-            side_effects.push(recordable::SideEffect {
-                kind: Some(recordable::side_effect::Kind::Memory(
-                    recordable::side_effect::Memory {
-                        address,
-                        value: contents,
+        match self.mode {
+            LoaderMode::Record => {
+                side_effects.extend(vec![
+                    recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::Register(
+                            recordable::side_effect::Register {
+                                register: av::Reg::X0 as _,
+                                value: ret0,
+                            },
+                        )),
                     },
-                )),
-            });
+                    recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::Register(
+                            recordable::side_effect::Register {
+                                register: av::Reg::X1 as _,
+                                value: ret1,
+                            },
+                        )),
+                    },
+                    recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::Register(
+                            recordable::side_effect::Register {
+                                register: av::Reg::CPSR as _,
+                                value: cpsr,
+                            },
+                        )),
+                    },
+                ]);
+
+                for (address, contents) in changed_pages {
+                    side_effects.push(recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::Memory(
+                            recordable::side_effect::Memory {
+                                address,
+                                value: contents,
+                            },
+                        )),
+                    });
+                }
+
+                if num != 0x3  // read
+                    && num != 396  // read_nocancel
+                    && num != 0xc5 // mmap
+                    && num != 0xfffffffffffffff6  // vm_write
+                    && num != 0xfffffffffffffff1
+                // vm_map
+                {
+                    side_effects = vec![recordable::SideEffect {
+                        kind: Some(recordable::side_effect::Kind::External(
+                            recordable::side_effect::External { address: 0 },
+                        )),
+                    }];
+                }
+
+                // TODO: is there a reason to distinguish between syscall and trap at all?
+                //if num < 0x8_0000_0000 {
+                // syscall
+                ldata.trace.events.push(recordable::LogEvent {
+                    pc: elr,
+                    register_state: args.to_vec(),
+                    event: Some(recordable::log_event::Event::Syscall(
+                        recordable::syscall::Syscall {
+                            syscall_number: num as _,
+                            side_effects,
+                        },
+                    )),
+                });
+                /*
+                } else {
+                    // trap
+                    ldata.trace.events.push(recordable::LogEvent {
+                        pc: elr,
+                        register_state: args.to_vec(),
+                        event: Some(recordable::log_event::Event::MachTrap(
+                            recordable::mach_trap::MachTrap {
+                                trap_number: num as _,
+                                side_effects,
+                            },
+                        )),
+                    });
+                }
+                */
+            }
+            LoaderMode::Replay => {
+                ldata.event_idx += 1;
+            }
         }
 
-        // TODO: is there a reason to distinguish between syscall and trap at all?
-        if num < 0x8_0000_0000 {
-            // syscall
-            ldata.trace.events.push(recordable::LogEvent {
-                pc: elr,
-                register_state: args.to_vec(),
-                event: Some(recordable::log_event::Event::Syscall(
-                    recordable::syscall::Syscall {
-                        syscall_number: num as _,
-                        side_effects,
-                    },
-                )),
-            });
-        } else {
-            // trap
-            ldata.trace.events.push(recordable::LogEvent {
-                pc: elr,
-                register_state: args.to_vec(),
-                event: Some(recordable::log_event::Event::MachTrap(
-                    recordable::mach_trap::MachTrap {
-                        trap_number: num as _,
-                        side_effects,
-                    },
-                )),
-            });
-        }
-
-        // And jump back
-        debug!("Returning {:x} {:x} {:x}", ret0, ret1, cflags);
+        debug!("Returning {:x} {:x} {:x}", ret0, ret1, cpsr);
         vcpu.set_reg(av::Reg::X0, ret0)?;
         vcpu.set_reg(av::Reg::X1, ret1)?;
-        vcpu.set_reg(
-            av::Reg::CPSR,
-            (vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags,
-        )?;
+        vcpu.set_reg(av::Reg::CPSR, cpsr)?;
         vcpu.set_reg(av::Reg::PC, elr)?;
 
         Ok(ExitKind::Continue)

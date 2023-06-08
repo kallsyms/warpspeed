@@ -13,7 +13,7 @@ pub fn replay_syscall(
 ) -> bool {
     let mut regs = mach::mrr_get_regs(thread_port);
 
-    if regs.__x[16] as u32 != syscall.syscall_number {
+    if regs.__x[16] != syscall.syscall_number {
         panic!(
             "Syscall number mismatch: {:x} != {:x}",
             regs.__x[16], syscall.syscall_number

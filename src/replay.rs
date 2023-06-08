@@ -8,16 +8,17 @@ use crate::warpspeed;
 pub fn replay(args: &cli::ReplayArgs) {
     let trace_file = std::fs::read(&args.trace_filename).unwrap();
     let trace = Trace::decode(trace_file.as_slice()).unwrap();
+    debug!("Loaded trace with {} events", trace.events.len());
     let target = trace.target.clone().unwrap();
 
     let _vm = hyperpom::applevisor::VirtualMachine::new(); // DO NOT REMOVE
     let gdata: warpspeed::GlobalData = Default::default();
     let ldata = warpspeed::LocalData {
-        trace: trace,
+        trace,
         ..Default::default()
     };
 
-    let loader = warpspeed::MachOLoader::new(&target.path, &target.arguments)
+    let loader = warpspeed::MachOLoader::new_replay_loader(&target.path, &target.arguments)
         .expect("could not create loader");
 
     // dynamically allocated physical memory must be <0x1000_0000, which is where our 1:1 mappings begins

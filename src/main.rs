@@ -5,8 +5,6 @@ use log::debug;
 use nix::sys::wait;
 
 mod cli;
-mod dtrace;
-mod mach;
 mod record;
 mod recordable;
 mod replay;

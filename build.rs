@@ -122,21 +122,6 @@ fn main() {
         .write_to_file(out_dir.join("dtrace.rs"))
         .expect("Couldn't write dtrace bindings");
 
-    // Warpspeed loader
-    bindgen::Builder::default()
-        .header("src/warpspeed/loader/loader.h")
-        .header("src/warpspeed/loader/shared_cache.h")
-        .generate()
-        .expect("Unable to generate warpspeed loader bindings")
-        .write_to_file(out_dir.join("warpspeed_loader_ffi.rs"))
-        .expect("Couldn't write warpspeed loader bindings");
-
-    cc::Build::new()
-        .file("src/warpspeed/loader/loader.c")
-        .file("src/warpspeed/loader/commpage.c")
-        .file("src/warpspeed/loader/shared_cache.c")
-        .compile("warpspeed_loader");
-
     // Recordable protobuf
     prost_build::compile_protos(&["src/recordable/recordable.proto"], &["."])
         .expect("Failed to compile protos");

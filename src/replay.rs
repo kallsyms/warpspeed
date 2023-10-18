@@ -1,5 +1,7 @@
 use log::debug;
 use prost::Message;
+use std::cell::RefCell;
+use std::path::PathBuf;
 
 use crate::cli;
 use crate::recordable::Trace;
@@ -11,30 +13,16 @@ pub fn replay(args: &cli::ReplayArgs) {
     debug!("Loaded trace with {} events", trace.events.len());
     let target = trace.target.clone().unwrap();
 
-    let _vm = hyperpom::applevisor::VirtualMachine::new(); // DO NOT REMOVE
-    let gdata: warpspeed::GlobalData = Default::default();
-    let ldata = warpspeed::LocalData {
-        trace,
-        ..Default::default()
-    };
+    let warpspeed = RefCell::new(warpspeed::Warpspeed::new(trace, warpspeed::Mode::Replay));
 
-    let loader = warpspeed::MachOLoader::new_replay_loader(&target.path, &target.arguments)
-        .expect("could not create loader");
+    let mut app = appbox::AppBox::new(
+        &PathBuf::from(&target.path),
+        &target.arguments,
+        &target.environment,
+        warpspeed,
+    )
+    .unwrap();
 
-    // dynamically allocated physical memory must be <0x1000_0000, which is where our 1:1 mappings begins
-    let config = hyperpom::config::ExecConfig::builder(0x1000_0000)
-        .coverage(false)
-        .build();
-
-    let mut executor = hyperpom::core::Executor::<_, _, _>::new(config, loader, ldata, gdata)
-        .expect("could not create executor");
-
-    executor.init().expect("could not init executor");
-    executor
-        .vcpu
-        .set_reg(hyperpom::applevisor::Reg::LR, 0xdeadf000)
-        .unwrap();
-
-    let ret = executor.run(None);
+    let ret = app.run();
     debug!("executor returned: {:?}", ret);
 }

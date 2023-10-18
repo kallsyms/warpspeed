@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+appbox = {path = "src/appbox"}
 #hyperpom = { git = "https://github.com/kallsyms/hyperpom" }
 hyperpom = {path = "../hyperpom"}
 clap = {version = "4.2.7", features = ["derive"]}
@@ -15,7 +16,6 @@ prost = "0.11.8"
 
 [build-dependencies]
 bindgen = "0.63.0"
-cc = "1.0.76"
 prost-build = "0.11.8"
 
 [[bin]]

@@ -38,15 +38,15 @@ fn explore_pointers(vma: &mut VirtMemAllocator, entry_points: &[u64]) -> HashSet
         for addr in start_addr..start_addr + 0x200 {
             // +0x200 can take us to a new, potentially unmapped page so we have to check.
             // But we only have to do this when crossing the page boundry, not every time.
-            if addr & !0xfff != last_page {
-                if !vma.read_byte(addr).is_ok() {
+            if (addr + 8) & !0xfff != last_page {
+                if !vma.read_byte(addr + 8).is_ok() {
                     break;
                 } else {
-                    last_page = addr & !0xfff;
+                    last_page = (addr + 8) & !0xfff;
                 }
             }
             let value = vma.read_qword(addr).unwrap();
-            if !vma.read_byte(addr).is_ok() {
+            if !vma.read_byte(value).is_ok() {
                 continue;
             }
             let page_addr = value & !0xfff;

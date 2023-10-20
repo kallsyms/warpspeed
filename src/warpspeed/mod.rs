@@ -35,6 +35,7 @@ fn explore_pointers(vma: &mut VirtMemAllocator, entry_points: &[u64]) -> HashSet
 
     while let Some((start_addr, depth)) = queue.pop_front() {
         let mut last_page = start_addr & !0xfff;
+        // TODO: we can probably safely assume alignment here
         for addr in start_addr..start_addr + 0x200 {
             // +0x200 can take us to a new, potentially unmapped page so we have to check.
             // But we only have to do this when crossing the page boundry, not every time.
@@ -125,7 +126,7 @@ impl AppBoxTrapHandler for Warpspeed {
             vcpu.get_reg(av::Reg::X14)?,
             vcpu.get_reg(av::Reg::X15)?,
         ];
-        debug!("Incoming syscall {:x}(0x{:x?})", num, args);
+        debug!("Incoming syscall 0x{:x}(0x{:x?})", num, args);
 
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
@@ -496,6 +497,7 @@ impl AppBoxTrapHandler for Warpspeed {
                         addr,
                         args[2]
                     );
+
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
                     self.mappings.push((addr, args[2] as usize));
                     side_effects.push(recordable::SideEffect {

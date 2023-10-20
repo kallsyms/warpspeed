@@ -239,7 +239,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     }
 
                     debug!(
-                        "{}: Forwarding syscall {:x}(0x{:x?})",
+                        "{}: Forwarding syscall 0x{:x}(0x{:x?})",
                         self.trace.events.len(),
                         num,
                         args

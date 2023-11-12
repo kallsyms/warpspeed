@@ -63,19 +63,18 @@ fn explore_pointers(vma: &mut VirtMemAllocator, entry_points: &[u64]) -> HashSet
     pages
 }
 
-#[derive(Clone)]
 pub enum Mode {
     Record,
     Replay,
 }
 
-#[derive(Clone)]
 pub struct Warpspeed {
     pub trace: recordable::Trace,
     mode: Mode,
     event_idx: usize,
 
     mappings: Vec<(u64, usize)>,
+    tsd: u64,
 }
 
 impl Warpspeed {
@@ -85,6 +84,7 @@ impl Warpspeed {
             mode,
             event_idx: 0,
             mappings: vec![],
+            tsd: 0,
         }
     }
 }
@@ -138,14 +138,7 @@ impl AppBoxTrapHandler for Warpspeed {
         match num {
             0x1 => {
                 // exit
-                // TODO: log trace
                 return Ok(ExitKind::Exit);
-            }
-            0x5 => {
-                // open
-                debug!("open({})", unsafe {
-                    CStr::from_ptr(args[0] as _).to_string_lossy()
-                });
             }
             0x49 => {
                 // munmap
@@ -192,7 +185,6 @@ impl AppBoxTrapHandler for Warpspeed {
                         "Returning {:x} for shared_region_check_np",
                         load_info.shared_cache_base
                     );
-                    // *(uint64_t*)args[0] = shared_cache_base
                     unsafe {
                         *(args[0] as *mut u64) = load_info.shared_cache_base;
                     }
@@ -222,6 +214,25 @@ impl AppBoxTrapHandler for Warpspeed {
                     ret1 = 0;
                     cflags = 1 << 29;
                     handled = true;
+                }
+            }
+            0x8000_0000 => {
+                // platform_syscall
+                let code = args[3];
+                match code {
+                    2 => {
+                        // set_cthread_self (set tsd/tpidrro)
+                        self.tsd = args[0];
+                        handled = true;
+                    }
+                    3 => {
+                        // get_cthread_self (get tsd/tpidrro)
+                        ret0 = self.tsd;
+                        handled = true;
+                    }
+                    _ => {
+                        warn!("Unknown platform syscall {}", code);
+                    }
                 }
             }
             _ => {}
@@ -579,7 +590,7 @@ impl AppBoxTrapHandler for Warpspeed {
                 }
 
                 // TODO: is there a reason to distinguish between syscall and trap at all?
-                //if num < 0x8_0000_0000 {
+                //if num < 0x8000_0000 {
                 // syscall
                 self.trace.events.push(recordable::LogEvent {
                     pc: elr,
@@ -617,6 +628,7 @@ impl AppBoxTrapHandler for Warpspeed {
         vcpu.set_reg(av::Reg::X1, ret1)?;
         vcpu.set_reg(av::Reg::CPSR, cpsr)?;
         vcpu.set_reg(av::Reg::PC, elr)?;
+        vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tsd)?;
 
         Ok(ExitKind::Continue)
     }

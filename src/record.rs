@@ -1,8 +1,8 @@
 use log::debug;
-use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::cli;
 use crate::recordable;
@@ -19,13 +19,13 @@ pub fn record(args: &cli::RecordArgs) {
         environment: env.clone(),
     };
 
-    let warpspeed = RefCell::new(warpspeed::Warpspeed::new(
+    let warpspeed = Arc::new(Mutex::new(warpspeed::Warpspeed::new(
         Trace {
             target: Some(target),
             events: vec![],
         },
         warpspeed::Mode::Record,
-    ));
+    )));
 
     let mut app = appbox::AppBox::new(
         &PathBuf::from(&args.executable),
@@ -40,6 +40,6 @@ pub fn record(args: &cli::RecordArgs) {
 
     let mut output = File::create(&args.trace_filename).unwrap();
     output
-        .write_all(prost::Message::encode_to_vec(&warpspeed.borrow().trace).as_slice())
+        .write_all(prost::Message::encode_to_vec(&warpspeed.lock().unwrap().trace).as_slice())
         .unwrap();
 }

@@ -2,7 +2,6 @@ use std::ffi::CString;
 
 use clap::Parser;
 use log::debug;
-use nix::sys::wait;
 
 mod cli;
 mod record;

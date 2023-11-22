@@ -15,8 +15,23 @@ use appbox::{AppBoxTrapHandler, LoadInfo};
 use crate::recordable;
 
 // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/kern_return.h#L325
+const KERN_SUCCESS: u64 = 0;
 const KERN_DENIED: u64 = 53;
 const KERN_NOT_FOUND: u64 = 56;
+
+struct mach_msg_header_t {
+    msgh_bits: u32,
+    msgh_size: u32,
+    msgh_remote_port: u32,
+    msgh_local_port: u32,
+    msgh_reserved: u32,
+    msgh_id: u32,
+}
+struct mig_reply_error_t {
+    hdr: mach_msg_header_t,
+    ndr: u64,
+    ret_code: u32,
+}
 
 // explore from the given set of potential pointers, returning a set of pages that are
 // accessible from the set of pointers.
@@ -135,6 +150,11 @@ impl AppBoxTrapHandler for Warpspeed {
         let mut side_effects = vec![];
 
         let mut handled = false;
+        // See https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master
+        // and https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/syscall_sw.c#L105
+        // for numbering.
+        // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/arm64/sleh.c#L1686
+        // for dispatch code.
         match num {
             0x1 => {
                 // exit
@@ -173,7 +193,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     debug!("Denying shm_open for featureflag");
                     ret0 = KERN_DENIED;
                     ret1 = 0;
-                    cflags = 1 << 29;
+                    cflags = 1 << 29; // bit 29 (carry flag) is set when an error occurs.
                     handled = true;
                 }
             }
@@ -206,14 +226,47 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             0xffffffffffffffd1 => {
                 // mach_msg2
-                let flavor: u32 = unsafe { *((args[0] + 0x20) as *const u32) };
-                // TODO: actually check for this being task_info
-                if flavor == 0x11 {
-                    debug!("Returning NOT_FOUND for TASK_DYLD_INFO");
-                    ret0 = KERN_NOT_FOUND;
-                    ret1 = 0;
-                    cflags = 1 << 29;
-                    handled = true;
+                // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_traps.h#L465
+                // for trap argument layout.
+                let msgh_id = args[4] >> 32;
+                match msgh_id {
+                    // Subsystem task (3400), 6th routine.
+                    // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/task.defs#L69
+                    3405 => {
+                        let flavor: u32 = unsafe { *((args[0] + 0x20) as *const u32) };
+                        if flavor == 0x11 {
+                            debug!("Returning NOT_FOUND for task_info flavor TASK_DYLD_INFO");
+                            ret0 = KERN_NOT_FOUND;
+                            ret1 = 0;
+                            cflags = 1 << 29;
+                            handled = true;
+                        }
+                    }
+                    // Subsystem task_restartable (8000), 0th routine.
+                    8000 => {
+                        // Fake a MIG reply.
+                        debug!("Returning KERN_SUCCESS for task_restartable_ranges_register");
+                        unsafe {
+                            let reply = args[0] as *mut mig_reply_error_t;
+                            // Incoming msgh_bits is 0x1513.
+                            // On a real system, reply is 0x1200.
+                            // idk, maybe the remote bits (0x13=MACH_MSG_TYPE_COPY_SEND) gets reduced to
+                            // MACH_MSG_TYPE_PORT_SEND (0x12)?
+                            (*reply).hdr.msgh_bits = 0x1200;
+                            (*reply).hdr.msgh_size = 36;
+                            (*reply).hdr.msgh_remote_port = 0;
+                            // don't need to touch msgh_local_port
+                            (*reply).hdr.msgh_reserved = 0;
+                            (*reply).hdr.msgh_id = (*reply).hdr.msgh_id + 100;
+                            (*reply).ndr = 0x100000000;
+                            (*reply).ret_code = KERN_SUCCESS as _;
+                        }
+                        ret0 = KERN_SUCCESS;
+                        ret1 = 0;
+                        cflags = 0;
+                        handled = true;
+                    }
+                    _ => {}
                 }
             }
             0x8000_0000 => {

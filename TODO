@@ -1,1 +1,11 @@
-Allocate for mmap and mach_vm_allocate out of prealloced region
+Quick:
+* Allocate for mmap and mach_vm_allocate out of prealloced region
+* External effects shouldn't have an address - the args should be pre-munged at record time
+* Coalesce continuous changed mem addresses into a single side effect
+
+Bigger:
+* How to deal with blocking syscalls
+* Thread scheduling
+
+Probably will never get to but for technical completeness:
+* "Send" SIGILL/SIGSEGV to target (i.e. jump to handler if registered) if we get a corresponding trap

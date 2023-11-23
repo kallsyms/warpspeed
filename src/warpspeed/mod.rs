@@ -202,6 +202,7 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             0x49 => {
                 // munmap
+                // TODO: actually remove from vma.
                 // TODO: handle partial unmapping
                 if let Some(mapping_idx) = self
                     .mappings
@@ -279,7 +280,9 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             0x150 => {
                 // proc_info
-                // TODO: This doesn't appear to be strictly necessary.
+                // This should be ignored by the host anyways
+                // (https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/kern/task.c#L740)
+                // but stub it out for good measure.
                 if args[0] == 0xf {
                     debug!("Stubbing out proc_info for PROC_INFO_CALL_SET_DYLD_IMAGES");
                     ret0 = 0;

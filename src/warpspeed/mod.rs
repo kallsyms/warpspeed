@@ -127,6 +127,7 @@ pub struct Warpspeed {
     event_idx: usize,
 
     mappings: Vec<(u64, usize)>,
+    map_fixed_next: u64,
     tsd: u64,
 }
 
@@ -137,6 +138,7 @@ impl Warpspeed {
             mode,
             event_idx: 0,
             mappings: vec![],
+            map_fixed_next: 0x5_0000_0000, // 0x1_0000_0000 above allocation base in appbox
             tsd: 0,
         }
     }
@@ -223,6 +225,53 @@ impl AppBoxTrapHandler for Warpspeed {
                 ret1 = 0;
                 cflags = 0;
                 handled = true;
+            }
+            0xc5 => {
+                // mmap
+                // page align size
+                args[1] = (args[1] + (0x4000 - 1)) & !(0x4000 - 1);
+                // fake fixed address
+                if args[3] & nix::libc::MAP_FIXED as u64 == 0 {
+                    trace!("Fixing mmap address to {:x}", self.map_fixed_next);
+                    args[0] = self.map_fixed_next;
+                    self.map_fixed_next += args[1];
+                }
+            }
+            0xfffffffffffffff6 => {
+                // mach_vm_allocate
+                // TODO: ensure task is ourselves
+                // page align size
+                args[2] = (args[2] + (0x4000 - 1)) & !(0x4000 - 1);
+                // fake fixed address
+                // Check for VM_FLAGS_ANYWHERE being set
+                if args[3] & 1 != 0 {
+                    args[3] &= !1;
+                    trace!(
+                        "Fixing mach_vm_allocate address to {:x}",
+                        self.map_fixed_next
+                    );
+                    unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
+                    self.map_fixed_next += args[2];
+                }
+            }
+            0xfffffffffffffff1 => {
+                // mach_vm_map
+                // TODO: ensure task is ourselves
+                // page align size
+                args[2] = (args[2] + (0x4000 - 1)) & !(0x4000 - 1);
+                // fake fixed address
+                // Check for VM_FLAGS_ANYWHERE being set
+                if args[4] & 1 != 0 {
+                    args[4] &= !1;
+                    // If a mask is set greater than the 64k page we align to,
+                    // bump map_fixed_next to the next correctly aligned address.
+                    if args[3] > 0x3fff {
+                        self.map_fixed_next = (self.map_fixed_next + args[3]) & !args[3];
+                    }
+                    trace!("Fixing mach_vm_map address to {:x}", self.map_fixed_next);
+                    unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
+                    self.map_fixed_next += args[2];
+                }
             }
             0xfffffffffffffff2 => {
                 // mach_vm_protect
@@ -472,41 +521,6 @@ impl AppBoxTrapHandler for Warpspeed {
 
                                         debug!("replay syscall index {}", self.event_idx);
                                         (ret0, ret1, cflags) = forward_syscall(num, &args);
-
-                                        // TODO: this should be removed after allocating from fixed arena.
-                                        match num {
-                                            0xc5 => {
-                                                let addr = ret0;
-                                                if addr != ext.address {
-                                                    error!(
-                                                        "replay {}: address mismatch: expected 0x{:x}, got 0x{:x}",
-                                                        self.event_idx,
-                                                        ext.address, addr
-                                                    );
-                                                }
-                                            }
-                                            0xfffffffffffffff6 => unsafe {
-                                                let addr = *(args[1] as *mut u64);
-                                                if addr != ext.address {
-                                                    error!(
-                                                        "replay {}: address mismatch: expected 0x{:x}, got 0x{:x}",
-                                                        self.event_idx,
-                                                        ext.address, addr
-                                                    );
-                                                }
-                                            },
-                                            0xfffffffffffffff1 => unsafe {
-                                                let addr = *(args[1] as *mut u64);
-                                                if addr != ext.address {
-                                                    error!(
-                                                        "replay {}: address mismatch: expected 0x{:x}, got 0x{:x}",
-                                                        self.event_idx,
-                                                        ext.address, addr
-                                                    );
-                                                }
-                                            },
-                                            _ => {}
-                                        }
                                     }
                                     _ => {
                                         error!(
@@ -533,17 +547,15 @@ impl AppBoxTrapHandler for Warpspeed {
             match num {
                 0xc5 => {
                     // mmap
-                    // applevisor (and therefore the round_phys_page macro) assumes 64k pages which isn't correct
-                    let size = ((args[1] + (0x4000 - 1)) & !(0x4000 - 1)) as usize;
-                    trace!("1:1 map of {:x} {:x} due to mmap", ret0, size);
-                    vma.map_1to1(ret0, size, av::MemPerms::RWX)?;
-                    self.mappings.push((ret0, size));
+                    trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
+                    vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
+                    self.mappings.push((ret0, args[1] as _));
                     side_effects.push(recordable::SideEffect {
                         kind: Some(recordable::side_effect::Kind::External(
                             recordable::side_effect::External { address: ret0 },
                         )),
                     });
-                    let mut data = vec![0; size];
+                    let mut data = vec![0; args[1] as _];
                     vma.read(ret0, &mut data)?;
                     side_effects.push(recordable::SideEffect {
                         kind: Some(recordable::side_effect::Kind::Memory(

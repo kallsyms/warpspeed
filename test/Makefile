@@ -10,6 +10,9 @@ multithread: multithread.c
 time: time.c time.S
 	$(CC) -o $@ $^
 
+rand: rand.c
+	$(CC) -o $@ $^
+
 .PHONY: clean
 clean:
-	rm -f echo multithread time
+	rm -f echo multithread time rand

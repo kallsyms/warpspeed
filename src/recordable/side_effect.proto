@@ -11,13 +11,18 @@ message SideEffect {
     // The value that the register was changed to.
     uint64 value = 2;
   }
+
   message Memory {
     // The address that was changed.
     uint64 address = 1;
     // The value that the address was changed to.
     bytes value = 2;
   }
+
+  // An external side effect is one that must be replayed by the system at
+  // replay time. E.g. memory management, or a write to stdout.
   message External { uint64 address = 1; }
+
   oneof kind {
     Register register = 1;
     Memory memory = 2;

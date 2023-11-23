@@ -35,7 +35,7 @@ struct mig_reply_error_t {
 
 // explore from the given set of potential pointers, returning a set of pages that are
 // accessible from the set of pointers.
-fn explore_pointers(vma: &mut VirtMemAllocator, entry_points: &[u64]) -> HashSet<u64> {
+fn explore_pointers(vma: &VirtMemAllocator, entry_points: &[u64]) -> HashSet<u64> {
     let mut queue = entry_points
         .iter()
         .filter_map(|&addr| {
@@ -146,7 +146,7 @@ impl AppBoxTrapHandler for Warpspeed {
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
-        let mut changed_pages = HashMap::new();
+        let mut changed_mem = HashMap::new();
         let mut side_effects = vec![];
 
         let mut handled = false;
@@ -337,20 +337,17 @@ impl AppBoxTrapHandler for Warpspeed {
                         );
                     }
 
-                    if num == 3 || num == 396 {
-                        for (page_addr, old_contents) in before_pages {
-                            let mut new_contents: Vec<u8> = vec![0; 0x1000];
-                            vma.read(page_addr, &mut new_contents)?;
-                            for i in 0..0x1000 {
-                                if old_contents[i] != new_contents[i] {
-                                    changed_pages
-                                        .insert(page_addr + i as u64, vec![new_contents[i]]);
-                                }
+                    for (page_addr, old_contents) in before_pages {
+                        let mut new_contents: Vec<u8> = vec![0; 0x1000];
+                        vma.read(page_addr, &mut new_contents)?;
+                        for i in 0..0x1000 {
+                            if old_contents[i] != new_contents[i] {
+                                changed_mem.insert(page_addr + i as u64, vec![new_contents[i]]);
                             }
                         }
                     }
 
-                    trace!("Changed pages: {:?}", changed_pages.keys());
+                    trace!("Changed mem: {:?}", changed_mem.keys());
                 }
 
                 Mode::Replay => {
@@ -432,7 +429,7 @@ impl AppBoxTrapHandler for Warpspeed {
                                             }
                                             0xfffffffffffffff6 => unsafe {
                                                 *(args[1] as *mut u64) = ext.address;
-                                                args[3] &= !0x1;
+                                                args[3] &= !0x1; // Clear VM_FLAGS_ANYWHERE
                                             },
                                             0xfffffffffffffff1 => unsafe {
                                                 *(args[1] as *mut u64) = ext.address;
@@ -617,7 +614,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     },
                 ]);
 
-                for (address, contents) in changed_pages {
+                for (address, contents) in changed_mem {
                     side_effects.push(recordable::SideEffect {
                         kind: Some(recordable::side_effect::Kind::Memory(
                             recordable::side_effect::Memory {
@@ -628,12 +625,10 @@ impl AppBoxTrapHandler for Warpspeed {
                     });
                 }
 
-                if num != 0x3  // read
-                    && num != 396  // read_nocancel
-                    && num != 0xc5 // mmap
-                    && num != 0xfffffffffffffff6  // vm_write
-                    && num != 0xfffffffffffffff1
-                // vm_map
+                // These syscalls have external side-effects, so the syscall itself must be run on replay.
+                // N.B. mmap, mach_vm_allocate, and mach_vm_map are handled above.
+                if num == 0x18d
+                // write_nocancel
                 {
                     side_effects = vec![recordable::SideEffect {
                         kind: Some(recordable::side_effect::Kind::External(
@@ -642,9 +637,6 @@ impl AppBoxTrapHandler for Warpspeed {
                     }];
                 }
 
-                // TODO: is there a reason to distinguish between syscall and trap at all?
-                //if num < 0x8000_0000 {
-                // syscall
                 self.trace.events.push(recordable::LogEvent {
                     pc: elr,
                     register_state: args.to_vec(),
@@ -655,21 +647,6 @@ impl AppBoxTrapHandler for Warpspeed {
                         },
                     )),
                 });
-                /*
-                } else {
-                    // trap
-                    self.trace.events.push(recordable::LogEvent {
-                        pc: elr,
-                        register_state: args.to_vec(),
-                        event: Some(recordable::log_event::Event::MachTrap(
-                            recordable::mach_trap::MachTrap {
-                                trap_number: num as _,
-                                side_effects,
-                            },
-                        )),
-                    });
-                }
-                */
             }
             Mode::Replay => {
                 self.event_idx += 1;

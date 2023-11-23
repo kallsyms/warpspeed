@@ -2,7 +2,6 @@ syntax = "proto3";
 
 package mrr.recordable;
 
-import "src/recordable/mach_trap/mach_trap.proto";
 import "src/recordable/scheduling/scheduling.proto";
 import "src/recordable/syscall/syscall.proto";
 
@@ -28,7 +27,6 @@ message LogEvent {
   repeated uint64 register_state = 2;
   oneof event {
     mrr.recordable.syscall.Syscall syscall = 10;
-    mrr.recordable.mach_trap.MachTrap mach_trap = 11;
     mrr.recordable.scheduling.Scheduling scheduling = 12;
   }
 }

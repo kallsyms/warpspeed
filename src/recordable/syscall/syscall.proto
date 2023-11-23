@@ -4,6 +4,9 @@ package mrr.recordable.syscall;
 
 import "src/recordable/side_effect.proto";
 
+// A syscall recordable denotes the execution of a BSD syscall, mach trap, or
+// platform specific syscall.
+// Basically anything that is SVC'd into.
 message Syscall {
   uint64 syscall_number = 1;
   repeated mrr.recordable.SideEffect side_effects = 2;

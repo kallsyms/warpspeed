@@ -78,6 +78,44 @@ fn explore_pointers(vma: &VirtMemAllocator, entry_points: &[u64]) -> HashSet<u64
     pages
 }
 
+fn forward_syscall(num: u64, args: &[u64; 16]) -> (u64, u64, u64) {
+    let mut ret0: u64 = 0;
+    let mut ret1: u64 = 0;
+    let mut cflags: u64 = 0;
+
+    debug!("Forwarding syscall 0x{:x}(0x{:x?})", num, args);
+    unsafe {
+        asm!(
+            "svc #0x80",
+            "mov {ret0}, x0",
+            "mov {ret1}, x1",
+            "mrs {cflags}, NZCV",
+            in("x0") args[0],
+            in("x1") args[1],
+            in("x2") args[2],
+            in("x3") args[3],
+            in("x4") args[4],
+            in("x5") args[5],
+            in("x6") args[6],
+            in("x7") args[7],
+            in("x8") args[8],
+            in("x9") args[9],
+            in("x10") args[10],
+            in("x11") args[11],
+            in("x12") args[12],
+            in("x13") args[13],
+            in("x14") args[14],
+            in("x15") args[15],
+            in("x16") num,
+            ret0 = out(reg) ret0,
+            ret1 = out(reg) ret1,
+            cflags = out(reg) cflags,
+        );
+    }
+
+    (ret0, ret1, cflags)
+}
+
 pub enum Mode {
     Record,
     Replay,
@@ -121,7 +159,6 @@ impl AppBoxTrapHandler for Warpspeed {
             return Ok(ExitKind::Crash("Unhandled fault".to_string()));
         }
 
-        // This is our syscall handler
         let num = vcpu.get_reg(av::Reg::X16)?;
         let mut args: [u64; 16] = [
             vcpu.get_reg(av::Reg::X0)?,
@@ -149,7 +186,10 @@ impl AppBoxTrapHandler for Warpspeed {
         let mut changed_mem = HashMap::new();
         let mut side_effects = vec![];
 
+        // Stage 1: handle syscalls that need special handling.
+        // Optionally also useful for tossing in debugging statements on specific syscalls.
         let mut handled = false;
+
         // See https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master
         // and https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/syscall_sw.c#L105
         // for numbering.
@@ -162,6 +202,7 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             0x49 => {
                 // munmap
+                // TODO: handle partial unmapping
                 if let Some(mapping_idx) = self
                     .mappings
                     .iter()
@@ -170,23 +211,44 @@ impl AppBoxTrapHandler for Warpspeed {
                     trace!("munmap({:x}, {:x})", args[0], args[1]);
                     self.mappings.remove(mapping_idx);
                 }
+                ret0 = 0;
+                ret1 = 0;
+                cflags = 0;
                 handled = true;
             }
             0x4a => {
                 // mprotect
+                ret0 = 0;
+                ret1 = 0;
+                cflags = 0;
                 handled = true;
             }
             0xfffffffffffffff2 => {
                 // mach_vm_protect
+                ret0 = 0;
+                ret1 = 0;
+                cflags = 0;
                 handled = true;
             }
             0xfffffffffffffff4 => {
                 // mach_vm_deallocate
+                // TODO: handle partial unmapping
+                if let Some(mapping_idx) = self
+                    .mappings
+                    .iter()
+                    .position(|&(va, len)| va == args[1] && len as u64 == args[2])
+                {
+                    trace!("mach_vm_deallocate({:x}, {:x})", args[1], args[2]);
+                    self.mappings.remove(mapping_idx);
+                }
+                ret0 = 0;
+                ret1 = 0;
+                cflags = 0;
                 handled = true;
-                // TODO: remove from mappings
             }
             0x10a => {
                 // shm_open
+                // TODO: why was this needed?
                 let name = unsafe { CStr::from_ptr(args[0] as _) };
                 trace!("shm_open({})", name.to_string_lossy());
                 if name.to_string_lossy() == "com.apple.featureflags.shm" {
@@ -199,6 +261,7 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             0x126 => {
                 // shared_region_check_np
+                // Return where we loaded the dyld shared cache.
                 // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/vm/vm_unix.c#L2017
                 if args[0] != u64::MAX {
                     debug!(
@@ -216,6 +279,7 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             0x150 => {
                 // proc_info
+                // TODO: This doesn't appear to be strictly necessary.
                 if args[0] == 0xf {
                     debug!("Stubbing out proc_info for PROC_INFO_CALL_SET_DYLD_IMAGES");
                     ret0 = 0;
@@ -226,11 +290,13 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             0xffffffffffffffd1 => {
                 // mach_msg2
+                // We need to stub a few messages here.
                 // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_traps.h#L465
                 // for trap argument layout.
                 let msgh_id = args[4] >> 32;
                 match msgh_id {
-                    // Subsystem task (3400), 6th routine.
+                    // task_info with TASK_DYLD_INFO. Return NOT_FOUND.
+                    // Subsystem task (3400), 6th routine so id 3405.
                     // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/task.defs#L69
                     3405 => {
                         let flavor: u32 = unsafe { *((args[0] + 0x20) as *const u32) };
@@ -242,9 +308,9 @@ impl AppBoxTrapHandler for Warpspeed {
                             handled = true;
                         }
                     }
+                    // task_restartable_ranges_register. Fake return SUCCESS.
                     // Subsystem task_restartable (8000), 0th routine.
                     8000 => {
-                        // Fake a MIG reply.
                         debug!("Returning KERN_SUCCESS for task_restartable_ranges_register");
                         unsafe {
                             let reply = args[0] as *mut mig_reply_error_t;
@@ -291,6 +357,12 @@ impl AppBoxTrapHandler for Warpspeed {
             _ => {}
         }
 
+        // Stage 2: do the syscall.
+        // If recording:
+        //   1. Snapshot "reachable" memory before the syscall
+        //   2. Perform the syscall
+        //   3. Diff previously stored reachable pages now that the syscall is done, recording what memory changed.
+        // If replaying, make sure we're in the correct place and simply apply the side effects.
         if !handled {
             match self.mode {
                 Mode::Record => {
@@ -302,40 +374,8 @@ impl AppBoxTrapHandler for Warpspeed {
                         before_pages.insert(page_addr, contents);
                     }
 
-                    debug!(
-                        "{}: Forwarding syscall 0x{:x}(0x{:x?})",
-                        self.trace.events.len(),
-                        num,
-                        args
-                    );
-                    unsafe {
-                        asm!(
-                            "svc #0x80",
-                            "mov {ret0}, x0",
-                            "mov {ret1}, x1",
-                            "mrs {cflags}, NZCV",
-                            in("x0") args[0],
-                            in("x1") args[1],
-                            in("x2") args[2],
-                            in("x3") args[3],
-                            in("x4") args[4],
-                            in("x5") args[5],
-                            in("x6") args[6],
-                            in("x7") args[7],
-                            in("x8") args[8],
-                            in("x9") args[9],
-                            in("x10") args[10],
-                            in("x11") args[11],
-                            in("x12") args[12],
-                            in("x13") args[13],
-                            in("x14") args[14],
-                            in("x15") args[15],
-                            in("x16") num,
-                            ret0 = out(reg) ret0,
-                            ret1 = out(reg) ret1,
-                            cflags = out(reg) cflags,
-                        );
-                    }
+                    debug!("Syscall {}", self.trace.events.len());
+                    (ret0, ret1, cflags) = forward_syscall(num, &args);
 
                     for (page_addr, old_contents) in before_pages {
                         let mut new_contents: Vec<u8> = vec![0; 0x1000];
@@ -353,17 +393,6 @@ impl AppBoxTrapHandler for Warpspeed {
                 Mode::Replay => {
                     let event = &self.trace.events[self.event_idx];
                     if elr != event.pc {
-                        if num == 4 {
-                            trace!("msg: {:x?}", unsafe { CStr::from_ptr(args[1] as _) });
-                            vcpu.set_reg(av::Reg::X0, args[2])?;
-                            vcpu.set_reg(av::Reg::X1, 0)?;
-                            vcpu.set_reg(
-                                av::Reg::CPSR,
-                                vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28),
-                            )?;
-                            vcpu.set_reg(av::Reg::PC, elr)?;
-                            return Ok(ExitKind::Continue);
-                        }
                         error!(
                             "replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
                             self.event_idx, event.pc, elr
@@ -383,7 +412,7 @@ impl AppBoxTrapHandler for Warpspeed {
                                 match &side_effect.kind {
                                     Some(crate::recordable::side_effect::Kind::Register(reg)) => {
                                         trace!(
-                                            "replay {}: setting {:?} to 0x{:x}",
+                                            "replay {}: setting X{:?} to 0x{:x}",
                                             self.event_idx,
                                             reg.register,
                                             reg.value
@@ -438,38 +467,10 @@ impl AppBoxTrapHandler for Warpspeed {
                                             _ => {}
                                         }
 
-                                        debug!(
-                                            "replay {}: Forwarding syscall {:x}(0x{:x?})",
-                                            self.event_idx, num, args
-                                        );
-                                        unsafe {
-                                            asm!(
-                                                "svc #0x80",
-                                                "mov {ret0}, x0",
-                                                "mov {ret1}, x1",
-                                                "mrs {cflags}, NZCV",
-                                                in("x0") args[0],
-                                                in("x1") args[1],
-                                                in("x2") args[2],
-                                                in("x3") args[3],
-                                                in("x4") args[4],
-                                                in("x5") args[5],
-                                                in("x6") args[6],
-                                                in("x7") args[7],
-                                                in("x8") args[8],
-                                                in("x9") args[9],
-                                                in("x10") args[10],
-                                                in("x11") args[11],
-                                                in("x12") args[12],
-                                                in("x13") args[13],
-                                                in("x14") args[14],
-                                                in("x15") args[15],
-                                                in("x16") num,
-                                                ret0 = out(reg) ret0,
-                                                ret1 = out(reg) ret1,
-                                                cflags = out(reg) cflags,
-                                            );
-                                        }
+                                        debug!("replay syscall index {}", self.event_idx);
+                                        (ret0, ret1, cflags) = forward_syscall(num, &args);
+
+                                        // TODO: this should be removed after allocating from fixed arena.
                                         match num {
                                             0xc5 => {
                                                 let addr = ret0;
@@ -514,7 +515,6 @@ impl AppBoxTrapHandler for Warpspeed {
                                 }
                             }
                         }
-                        //Some(crate::recordable::log_event::Event::MachTrap(trap)) => {}
                         _ => {
                             error!(
                                 "replay {}: unexpected event type: {:?}",
@@ -526,6 +526,7 @@ impl AppBoxTrapHandler for Warpspeed {
                 }
             }
 
+            // Stage 2.5: map newly allocated memory into the VM as necessary.
             match num {
                 0xc5 => {
                     // mmap
@@ -583,6 +584,7 @@ impl AppBoxTrapHandler for Warpspeed {
             }
         }
 
+        // Stage 3: now that we've done the syscall, record the final state as side effects.
         let cpsr = (vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags;
 
         match self.mode {

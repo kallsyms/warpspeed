@@ -2,15 +2,16 @@ syntax = "proto3";
 
 package mrr.recordable;
 
-// A side effect is some userland-observable change that the associated event
+// Side effects are some userland-observable changes that the associated event
 // caused.
-message SideEffect {
+message SideEffects {
   message Register {
     // The register that was changed.
     uint32 register = 1;
     // The value that the register was changed to.
     uint64 value = 2;
   }
+  repeated Register registers = 1;
 
   message Memory {
     // The address that was changed.
@@ -18,14 +19,9 @@ message SideEffect {
     // The value that the address was changed to.
     bytes value = 2;
   }
+  repeated Memory memory = 2;
 
   // An external side effect is one that must be replayed by the system at
   // replay time. E.g. memory management, or a write to stdout.
-  message External { uint64 address = 1; }
-
-  oneof kind {
-    Register register = 1;
-    Memory memory = 2;
-    External external = 3;
-  }
+  bool external = 3;
 }

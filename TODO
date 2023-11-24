@@ -1,6 +1,4 @@
 Quick:
-* Allocate for mmap and mach_vm_allocate out of prealloced region
-* External effects shouldn't have an address - the args should be pre-munged at record time
 * Coalesce continuous changed mem addresses into a single side effect
 
 Bigger:

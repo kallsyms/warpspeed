@@ -13,6 +13,7 @@ use hyperpom::memory::*;
 use appbox::{AppBoxTrapHandler, LoadInfo};
 
 use crate::recordable;
+use crate::recordable::side_effects;
 
 // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/kern_return.h#L325
 const KERN_SUCCESS: u64 = 0;
@@ -186,7 +187,7 @@ impl AppBoxTrapHandler for Warpspeed {
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
         let mut changed_mem = HashMap::new();
-        let mut side_effects = vec![];
+        let mut side_effects = recordable::SideEffects::default();
 
         // Stage 1: handle syscalls that need special handling.
         // Optionally also useful for tossing in debugging statements on specific syscalls.
@@ -232,6 +233,7 @@ impl AppBoxTrapHandler for Warpspeed {
                 args[1] = (args[1] + (0x4000 - 1)) & !(0x4000 - 1);
                 // fake fixed address
                 if args[3] & nix::libc::MAP_FIXED as u64 == 0 {
+                    args[3] |= nix::libc::MAP_FIXED as u64;
                     trace!("Fixing mmap address to {:x}", self.map_fixed_next);
                     args[0] = self.map_fixed_next;
                     self.map_fixed_next += args[1];
@@ -460,75 +462,60 @@ impl AppBoxTrapHandler for Warpspeed {
                                     self.event_idx, syscall.syscall_number, num
                                 );
                             }
-                            for side_effect in &syscall.side_effects {
-                                match &side_effect.kind {
-                                    Some(crate::recordable::side_effect::Kind::Register(reg)) => {
-                                        trace!(
-                                            "replay {}: setting X{:?} to 0x{:x}",
-                                            self.event_idx,
-                                            reg.register,
-                                            reg.value
-                                        );
-                                        match reg.register {
-                                            0x0 => ret0 = reg.value,
-                                            0x1 => ret1 = reg.value,
-                                            0x22 => cflags = reg.value,
-                                            _ => {
-                                                error!(
-                                                    "replay {}: unexpected register: {:?}",
-                                                    self.event_idx, reg.register
-                                                );
-                                                return Ok(ExitKind::Exit);
-                                            }
-                                        }
-                                    }
-                                    Some(crate::recordable::side_effect::Kind::Memory(mem)) => {
-                                        trace!(
-                                            "replay {}: writing to 0x{:x}",
-                                            self.event_idx,
-                                            mem.address
-                                        );
-                                        unsafe {
-                                            std::ptr::copy(
-                                                mem.value.as_ptr(),
-                                                mem.address as _,
-                                                mem.value.len(),
+
+                            let side_effects = syscall.side_effects.as_ref().unwrap();
+
+                            // N.B. Do syscall first if required, as it may e.g. allocate memory
+                            // that we then need to write into below.
+                            if side_effects.external {
+                                trace!("replay syscall index {}", self.event_idx);
+                                (ret0, ret1, cflags) = forward_syscall(num, &args);
+                            }
+
+                            for reg in &side_effects.registers {
+                                trace!(
+                                    "replay {}: setting X{:?} to 0x{:x}",
+                                    self.event_idx,
+                                    reg.register,
+                                    reg.value
+                                );
+                                match reg.register {
+                                    0x0 => {
+                                        if side_effects.external && ret0 != reg.value {
+                                            error!(
+                                                "replay {}: syscall return value 0 mismatch: expected 0x{:x}, got 0x{:x}",
+                                                self.event_idx, reg.value, ret0
                                             );
                                         }
+                                        ret0 = reg.value
                                     }
-                                    Some(crate::recordable::side_effect::Kind::External(ext)) => {
-                                        match num {
-                                            0xc5 => {
-                                                args[0] = ext.address;
-                                                args[2] = (nix::libc::PROT_READ
-                                                    | nix::libc::PROT_WRITE)
-                                                    as u64;
-                                                args[3] = nix::libc::MAP_FIXED as u64
-                                                    | nix::libc::MAP_ANONYMOUS as u64;
-                                                args[4] = -1 as i64 as u64;
-                                                // contents will be updated by subsequent memory sideeffect
-                                            }
-                                            0xfffffffffffffff6 => unsafe {
-                                                *(args[1] as *mut u64) = ext.address;
-                                                args[3] &= !0x1; // Clear VM_FLAGS_ANYWHERE
-                                            },
-                                            0xfffffffffffffff1 => unsafe {
-                                                *(args[1] as *mut u64) = ext.address;
-                                                args[4] &= !0x1;
-                                            },
-                                            _ => {}
+                                    0x1 => {
+                                        if side_effects.external && ret1 != reg.value {
+                                            error!(
+                                                "replay {}: syscall return value 1 mismatch: expected 0x{:x}, got 0x{:x}",
+                                                self.event_idx, reg.value, ret1
+                                            );
                                         }
-
-                                        debug!("replay syscall index {}", self.event_idx);
-                                        (ret0, ret1, cflags) = forward_syscall(num, &args);
+                                        ret1 = reg.value
                                     }
+                                    0x22 => cflags = reg.value,
                                     _ => {
                                         error!(
-                                            "replay {}: unexpected side effect kind: {:?}",
-                                            self.event_idx, side_effect.kind
+                                            "replay {}: unexpected register: {:?}",
+                                            self.event_idx, reg.register
                                         );
                                         return Ok(ExitKind::Exit);
                                     }
+                                }
+                            }
+                            for mem in &side_effects.memory {
+                                trace!("replay {}: writing to 0x{:x}", self.event_idx, mem.address);
+                                unsafe {
+                                    std::ptr::copy(
+                                        mem.value.as_ptr(),
+                                        mem.address as _,
+                                        mem.value.len(),
+                                    );
                                 }
                             }
                         }
@@ -550,21 +537,17 @@ impl AppBoxTrapHandler for Warpspeed {
                     trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
                     vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
                     self.mappings.push((ret0, args[1] as _));
-                    side_effects.push(recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::External(
-                            recordable::side_effect::External { address: ret0 },
-                        )),
-                    });
-                    let mut data = vec![0; args[1] as _];
-                    vma.read(ret0, &mut data)?;
-                    side_effects.push(recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::Memory(
-                            recordable::side_effect::Memory {
-                                address: ret0,
-                                value: data,
-                            },
-                        )),
-                    });
+
+                    side_effects.external = true;
+
+                    // TODO: if this is mapped RO, when we go to replay this side effect
+                    // we'll segfault.
+                    // let mut data = vec![0; args[1] as _];
+                    // vma.read(ret0, &mut data)?;
+                    // side_effects.memory.push(recordable::side_effects::Memory {
+                    //     address: ret0,
+                    //     value: data,
+                    // });
                 }
                 0xfffffffffffffff6 => {
                     // mach_vm_allocate
@@ -577,11 +560,8 @@ impl AppBoxTrapHandler for Warpspeed {
 
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
                     self.mappings.push((addr, args[2] as usize));
-                    side_effects.push(recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::External(
-                            recordable::side_effect::External { address: addr },
-                        )),
-                    });
+
+                    side_effects.external = true;
                 }
                 0xfffffffffffffff1 => {
                     // mach_vm_map
@@ -589,11 +569,9 @@ impl AppBoxTrapHandler for Warpspeed {
                     trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
                     self.mappings.push((addr, args[2] as usize));
-                    side_effects.push(recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::External(
-                            recordable::side_effect::External { address: addr },
-                        )),
-                    });
+
+                    side_effects.external = true;
+                    // TODO: record memory contents?
                 }
                 _ => {}
             }
@@ -604,54 +582,36 @@ impl AppBoxTrapHandler for Warpspeed {
 
         match self.mode {
             Mode::Record => {
-                side_effects.extend(vec![
-                    recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::Register(
-                            recordable::side_effect::Register {
-                                register: av::Reg::X0 as _,
-                                value: ret0,
-                            },
-                        )),
+                side_effects.registers.extend(vec![
+                    recordable::side_effects::Register {
+                        register: av::Reg::X0 as _,
+                        value: ret0,
                     },
-                    recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::Register(
-                            recordable::side_effect::Register {
-                                register: av::Reg::X1 as _,
-                                value: ret1,
-                            },
-                        )),
+                    recordable::side_effects::Register {
+                        register: av::Reg::X1 as _,
+                        value: ret1,
                     },
-                    recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::Register(
-                            recordable::side_effect::Register {
-                                register: av::Reg::CPSR as _,
-                                value: cpsr,
-                            },
-                        )),
+                    recordable::side_effects::Register {
+                        register: av::Reg::CPSR as _,
+                        value: cpsr,
                     },
                 ]);
 
                 for (address, contents) in changed_mem {
-                    side_effects.push(recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::Memory(
-                            recordable::side_effect::Memory {
-                                address,
-                                value: contents,
-                            },
-                        )),
+                    side_effects.memory.push(recordable::side_effects::Memory {
+                        address,
+                        value: contents,
                     });
                 }
 
                 // These syscalls have external side-effects, so the syscall itself must be run on replay.
-                // N.B. mmap, mach_vm_allocate, and mach_vm_map are handled above.
-                if num == 0x18d
+                // mmap, mach_vm_allocate, and mach_vm_map already set this above.
+                if num == 0x5 // open
+                    || num == 0x6 // close
+                    || num == 0x18d
                 // write_nocancel
                 {
-                    side_effects = vec![recordable::SideEffect {
-                        kind: Some(recordable::side_effect::Kind::External(
-                            recordable::side_effect::External { address: 0 },
-                        )),
-                    }];
+                    side_effects.external = true;
                 }
 
                 self.trace.events.push(recordable::LogEvent {
@@ -660,7 +620,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     event: Some(recordable::log_event::Event::Syscall(
                         recordable::syscall::Syscall {
                             syscall_number: num as _,
-                            side_effects,
+                            side_effects: Some(side_effects),
                         },
                     )),
                 });

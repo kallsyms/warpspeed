@@ -606,6 +606,7 @@ impl AppBoxTrapHandler for Warpspeed {
 
                 // These syscalls have external side-effects, so the syscall itself must be run on replay.
                 // mmap, mach_vm_allocate, and mach_vm_map already set this above.
+                // TODO: open/close are needed so mmapping fds works, but these shouldn't be needed.
                 if num == 0x5 // open
                     || num == 0x6 // close
                     || num == 0x18d

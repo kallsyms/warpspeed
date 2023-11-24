@@ -1,9 +1,10 @@
 Quick:
-* Coalesce continuous changed mem addresses into a single side effect
+* Figure out how to best deal with mmap'd files
+    * Implicitly rewrite as MAP_ANON + memory writes?
 
 Bigger:
-* How to deal with blocking syscalls
 * Thread scheduling
+    * How to deal with blocking syscalls
 
 Probably will never get to but for technical completeness:
 * "Send" SIGILL/SIGSEGV to target (i.e. jump to handler if registered) if we get a corresponding trap

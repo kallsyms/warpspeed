@@ -117,6 +117,36 @@ fn forward_syscall(num: u64, args: &[u64; 16]) -> (u64, u64, u64) {
     (ret0, ret1, cflags)
 }
 
+fn diff_memory(page_addr: u64, old: &[u8], new: &[u8]) -> Vec<side_effects::Memory> {
+    let mut side_effects = vec![];
+
+    assert!(old.len() == new.len());
+
+    let mut start = None;
+    for (i, (a, b)) in old.iter().zip(new.iter()).enumerate() {
+        if a != b {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start {
+            side_effects.push(side_effects::Memory {
+                address: page_addr + s as u64,
+                value: new[start.unwrap()..i].to_vec(),
+            });
+            start = None;
+        }
+    }
+
+    if let Some(s) = start {
+        side_effects.push(side_effects::Memory {
+            address: page_addr + s as u64,
+            value: new[s..].to_vec(),
+        });
+    }
+
+    side_effects
+}
+
 pub enum Mode {
     Record,
     Replay,
@@ -186,7 +216,6 @@ impl AppBoxTrapHandler for Warpspeed {
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
-        let mut changed_mem = HashMap::new();
         let mut side_effects = recordable::SideEffects::default();
 
         // Stage 1: handle syscalls that need special handling.
@@ -434,14 +463,21 @@ impl AppBoxTrapHandler for Warpspeed {
                     for (page_addr, old_contents) in before_pages {
                         let mut new_contents: Vec<u8> = vec![0; 0x1000];
                         vma.read(page_addr, &mut new_contents)?;
-                        for i in 0..0x1000 {
-                            if old_contents[i] != new_contents[i] {
-                                changed_mem.insert(page_addr + i as u64, vec![new_contents[i]]);
-                            }
-                        }
+                        side_effects.memory.extend(diff_memory(
+                            page_addr,
+                            &old_contents,
+                            &new_contents,
+                        ));
                     }
 
-                    trace!("Changed mem: {:?}", changed_mem.keys());
+                    trace!(
+                        "Changed mem: {:?}",
+                        side_effects
+                            .memory
+                            .iter()
+                            .map(|m| (m.address, m.address + m.value.len() as u64))
+                            .collect::<Vec<_>>()
+                    );
                 }
 
                 Mode::Replay => {
@@ -596,13 +632,6 @@ impl AppBoxTrapHandler for Warpspeed {
                         value: cpsr,
                     },
                 ]);
-
-                for (address, contents) in changed_mem {
-                    side_effects.memory.push(recordable::side_effects::Memory {
-                        address,
-                        value: contents,
-                    });
-                }
 
                 // These syscalls have external side-effects, so the syscall itself must be run on replay.
                 // mmap, mach_vm_allocate, and mach_vm_map already set this above.

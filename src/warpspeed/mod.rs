@@ -14,6 +14,7 @@ use appbox::{AppBoxTrapHandler, LoadInfo};
 
 use crate::recordable;
 use crate::recordable::side_effects;
+use crate::recordable::syscall::sysno;
 
 // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/kern_return.h#L325
 const KERN_SUCCESS: u64 = 0;
@@ -34,13 +35,29 @@ struct mig_reply_error_t {
     ret_code: u32,
 }
 
-// explore from the given set of potential pointers, returning a set of pages that are
+fn check_ptr(vma: &VirtMemAllocator, ptr: u64, valid_pages: &mut HashSet<u64>) -> bool {
+    if valid_pages.contains(&(ptr & !0xfff)) && valid_pages.contains(&((ptr + 7) & !0xfff)) {
+        return true;
+    }
+    if vma.read_qword(ptr).is_ok() {
+        valid_pages.insert(ptr & !0xfff);
+        valid_pages.insert((ptr + 7) & !0xfff);
+        return true;
+    }
+    return false;
+}
+
+// Explore from the given set of potential pointers, returning a set of pages that are
 // accessible from the set of pointers.
+// Currently recurses up to 2 levels deep, as I can't think of any syscalls which would
+// pointer chase more than that.
 fn explore_pointers(vma: &VirtMemAllocator, entry_points: &[u64]) -> HashSet<u64> {
+    // TODO: we should get a list of allocations from AppBox and use that.
+    let mut valid_pages = HashSet::new();
     let mut queue = entry_points
         .iter()
         .filter_map(|&addr| {
-            if vma.read_byte(addr).is_ok() {
+            if check_ptr(vma, addr, &mut valid_pages) {
                 Some((addr, 0))
             } else {
                 None
@@ -50,27 +67,26 @@ fn explore_pointers(vma: &VirtMemAllocator, entry_points: &[u64]) -> HashSet<u64
     let mut pages = HashSet::from_iter(queue.iter().map(|&(addr, _)| addr & !0xfff));
 
     while let Some((start_addr, depth)) = queue.pop_front() {
-        let mut last_page = start_addr & !0xfff;
         // TODO: we can probably safely assume alignment here
+        // TODO: +0x200 is arbitrary
         for addr in start_addr..start_addr + 0x200 {
             // +0x200 can take us to a new, potentially unmapped page so we have to check.
             // But we only have to do this when crossing the page boundry, not every time.
-            if (addr + 8) & !0xfff != last_page {
-                if !vma.read_byte(addr + 8).is_ok() {
+            if (addr + 7) & !0xfff != addr & !0xfff {
+                if !check_ptr(vma, addr, &mut valid_pages) {
                     break;
-                } else {
-                    last_page = (addr + 8) & !0xfff;
                 }
+                pages.insert((addr + 7) & !0xfff);
             }
-            let value = vma.read_qword(addr).unwrap();
-            if !vma.read_byte(value).is_ok() {
+            let maybe_ptr = vma.read_qword(addr).unwrap();
+            if !vma.read_byte(maybe_ptr).is_ok() {
                 continue;
             }
-            let page_addr = value & !0xfff;
-            if !pages.contains(&page_addr) {
-                pages.insert(page_addr);
+            let ptr_page_addr = maybe_ptr & !0xfff;
+            if !pages.contains(&ptr_page_addr) {
+                pages.insert(ptr_page_addr);
                 if depth < 2 {
-                    queue.push_back((value, depth + 1));
+                    queue.push_back((maybe_ptr, depth + 1));
                 }
             }
         }
@@ -211,7 +227,12 @@ impl AppBoxTrapHandler for Warpspeed {
             vcpu.get_reg(av::Reg::X14)?,
             vcpu.get_reg(av::Reg::X15)?,
         ];
-        debug!("Incoming syscall 0x{:x}(0x{:x?})", num, args);
+        debug!(
+            "{}: Incoming syscall 0x{:x}(0x{:x?})",
+            self.trace.events.len(),
+            num,
+            args
+        );
 
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
@@ -228,12 +249,10 @@ impl AppBoxTrapHandler for Warpspeed {
         // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/arm64/sleh.c#L1686
         // for dispatch code.
         match num {
-            0x1 => {
-                // exit
+            sysno::SYS_exit => {
                 return Ok(ExitKind::Exit);
             }
-            0x49 => {
-                // munmap
+            sysno::SYS_munmap => {
                 // TODO: actually remove from vma.
                 // TODO: handle partial unmapping
                 if let Some(mapping_idx) = self
@@ -249,15 +268,13 @@ impl AppBoxTrapHandler for Warpspeed {
                 cflags = 0;
                 handled = true;
             }
-            0x4a => {
-                // mprotect
+            sysno::SYS_mprotect => {
                 ret0 = 0;
                 ret1 = 0;
                 cflags = 0;
                 handled = true;
             }
-            0xc5 => {
-                // mmap
+            sysno::SYS_mmap => {
                 // page align size
                 args[1] = (args[1] + (0x4000 - 1)) & !(0x4000 - 1);
                 // fake fixed address
@@ -268,8 +285,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     self.map_fixed_next += args[1];
                 }
             }
-            0xfffffffffffffff6 => {
-                // mach_vm_allocate
+            sysno::TRAP_mach_vm_allocate => {
                 // TODO: ensure task is ourselves
                 // page align size
                 args[2] = (args[2] + (0x4000 - 1)) & !(0x4000 - 1);
@@ -285,8 +301,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     self.map_fixed_next += args[2];
                 }
             }
-            0xfffffffffffffff1 => {
-                // mach_vm_map
+            sysno::TRAP_mach_vm_map => {
                 // TODO: ensure task is ourselves
                 // page align size
                 args[2] = (args[2] + (0x4000 - 1)) & !(0x4000 - 1);
@@ -304,15 +319,13 @@ impl AppBoxTrapHandler for Warpspeed {
                     self.map_fixed_next += args[2];
                 }
             }
-            0xfffffffffffffff2 => {
-                // mach_vm_protect
+            sysno::TRAP_mach_vm_protect => {
                 ret0 = 0;
                 ret1 = 0;
                 cflags = 0;
                 handled = true;
             }
-            0xfffffffffffffff4 => {
-                // mach_vm_deallocate
+            sysno::TRAP_mach_vm_deallocate => {
                 // TODO: handle partial unmapping
                 if let Some(mapping_idx) = self
                     .mappings
@@ -327,8 +340,7 @@ impl AppBoxTrapHandler for Warpspeed {
                 cflags = 0;
                 handled = true;
             }
-            0x10a => {
-                // shm_open
+            sysno::SYS_shm_open => {
                 // TODO: why was this needed?
                 let name = unsafe { CStr::from_ptr(args[0] as _) };
                 trace!("shm_open({})", name.to_string_lossy());
@@ -340,8 +352,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     handled = true;
                 }
             }
-            0x126 => {
-                // shared_region_check_np
+            sysno::SYS_shared_region_check_np => {
                 // Return where we loaded the dyld shared cache.
                 // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/vm/vm_unix.c#L2017
                 if args[0] != u64::MAX {
@@ -358,8 +369,7 @@ impl AppBoxTrapHandler for Warpspeed {
                 cflags = 0;
                 handled = true;
             }
-            0x150 => {
-                // proc_info
+            sysno::SYS_proc_info => {
                 // This should be ignored by the host anyways
                 // (https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/kern/task.c#L740)
                 // but stub it out for good measure.
@@ -371,8 +381,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     handled = true;
                 }
             }
-            0xffffffffffffffd1 => {
-                // mach_msg2
+            sysno::TRAP_mach_msg2 => {
                 // We need to stub a few messages here.
                 // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_traps.h#L465
                 // for trap argument layout.
@@ -457,17 +466,35 @@ impl AppBoxTrapHandler for Warpspeed {
                         before_pages.insert(page_addr, contents);
                     }
 
-                    debug!("Syscall {}", self.trace.events.len());
                     (ret0, ret1, cflags) = forward_syscall(num, &args);
 
-                    for (page_addr, old_contents) in before_pages {
-                        let mut new_contents: Vec<u8> = vec![0; 0x1000];
-                        vma.read(page_addr, &mut new_contents)?;
-                        side_effects.memory.extend(diff_memory(
-                            page_addr,
-                            &old_contents,
-                            &new_contents,
-                        ));
+                    // Special case easy syscalls, especially those which could
+                    // modify a significant (>1 page) amount of memory.
+                    match num {
+                        sysno::SYS_read
+                        | sysno::SYS_pread
+                        | sysno::SYS_read_nocancel
+                        | sysno::SYS_pread_nocancel => {
+                            let buf = args[1];
+                            let count = ret0;
+                            let mut data = vec![0; count as usize];
+                            vma.read(buf, &mut data)?;
+                            side_effects.memory.push(recordable::side_effects::Memory {
+                                address: buf,
+                                value: data,
+                            });
+                        }
+                        _ => {
+                            for (page_addr, old_contents) in before_pages {
+                                let mut new_contents: Vec<u8> = vec![0; 0x1000];
+                                vma.read(page_addr, &mut new_contents)?;
+                                side_effects.memory.extend(diff_memory(
+                                    page_addr,
+                                    &old_contents,
+                                    &new_contents,
+                                ));
+                            }
+                        }
                     }
 
                     trace!(
@@ -568,8 +595,7 @@ impl AppBoxTrapHandler for Warpspeed {
 
             // Stage 2.5: map newly allocated memory into the VM as necessary.
             match num {
-                0xc5 => {
-                    // mmap
+                sysno::SYS_mmap => {
                     trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
                     vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
                     self.mappings.push((ret0, args[1] as _));
@@ -585,8 +611,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     //     value: data,
                     // });
                 }
-                0xfffffffffffffff6 => {
-                    // mach_vm_allocate
+                sysno::TRAP_mach_vm_allocate => {
                     let addr: u64 = unsafe { *(args[1] as *const u64) };
                     trace!(
                         "1:1 map of {:x} {:x} due to mach_vm_allocate",
@@ -599,8 +624,7 @@ impl AppBoxTrapHandler for Warpspeed {
 
                     side_effects.external = true;
                 }
-                0xfffffffffffffff1 => {
-                    // mach_vm_map
+                sysno::TRAP_mach_vm_map => {
                     let addr: u64 = unsafe { *(args[1] as *const u64) };
                     trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
@@ -636,10 +660,9 @@ impl AppBoxTrapHandler for Warpspeed {
                 // These syscalls have external side-effects, so the syscall itself must be run on replay.
                 // mmap, mach_vm_allocate, and mach_vm_map already set this above.
                 // TODO: open/close are needed so mmapping fds works, but these shouldn't be needed.
-                if num == 0x5 // open
-                    || num == 0x6 // close
-                    || num == 0x18d
-                // write_nocancel
+                if num == sysno::SYS_open
+                    || num == sysno::SYS_close
+                    || num == sysno::SYS_write_nocancel
                 {
                     side_effects.external = true;
                 }

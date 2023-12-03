@@ -14,6 +14,7 @@ use appbox::{AppBoxTrapHandler, LoadInfo};
 
 use crate::recordable;
 use crate::recordable::side_effects;
+use crate::recordable::syscall::mig;
 use crate::recordable::syscall::sysno;
 
 // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/kern_return.h#L325
@@ -163,6 +164,7 @@ fn diff_memory(page_addr: u64, old: &[u8], new: &[u8]) -> Vec<side_effects::Memo
     side_effects
 }
 
+#[derive(PartialEq)]
 pub enum Mode {
     Record,
     Replay,
@@ -229,9 +231,7 @@ impl AppBoxTrapHandler for Warpspeed {
         ];
         debug!(
             "{}: Incoming syscall 0x{:x}(0x{:x?})",
-            self.trace.events.len(),
-            num,
-            args
+            self.event_idx, num, args
         );
 
         let mut ret0: u64 = 0;
@@ -242,6 +242,7 @@ impl AppBoxTrapHandler for Warpspeed {
         // Stage 1: handle syscalls that need special handling.
         // Optionally also useful for tossing in debugging statements on specific syscalls.
         let mut handled = false;
+        let mut deferred_map: Option<(u64, usize)> = None;
 
         // See https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master
         // and https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/syscall_sw.c#L105
@@ -284,6 +285,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     args[0] = self.map_fixed_next;
                     self.map_fixed_next += args[1];
                 }
+                deferred_map = Some((args[0], args[1] as usize));
             }
             sysno::TRAP_mach_vm_allocate => {
                 // TODO: ensure task is ourselves
@@ -300,6 +302,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
                     self.map_fixed_next += args[2];
                 }
+                deferred_map = Some((unsafe { *(args[1] as *mut u64) }, args[2] as usize));
             }
             sysno::TRAP_mach_vm_map => {
                 // TODO: ensure task is ourselves
@@ -309,7 +312,7 @@ impl AppBoxTrapHandler for Warpspeed {
                 // Check for VM_FLAGS_ANYWHERE being set
                 if args[4] & 1 != 0 {
                     args[4] &= !1;
-                    // If a mask is set greater than the 64k page we align to,
+                    // If a mask is set greater than the 16k page we align to,
                     // bump map_fixed_next to the next correctly aligned address.
                     if args[3] > 0x3fff {
                         self.map_fixed_next = (self.map_fixed_next + args[3]) & !args[3];
@@ -318,6 +321,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
                     self.map_fixed_next += args[2];
                 }
+                deferred_map = Some((unsafe { *(args[1] as *mut u64) }, args[2] as usize));
             }
             sysno::TRAP_mach_vm_protect => {
                 ret0 = 0;
@@ -342,6 +346,7 @@ impl AppBoxTrapHandler for Warpspeed {
             }
             sysno::SYS_shm_open => {
                 // TODO: why was this needed?
+                // Maybe shm isn't allowed to be mapped into VM?
                 let name = unsafe { CStr::from_ptr(args[0] as _) };
                 trace!("shm_open({})", name.to_string_lossy());
                 if name.to_string_lossy() == "com.apple.featureflags.shm" {
@@ -351,6 +356,10 @@ impl AppBoxTrapHandler for Warpspeed {
                     cflags = 1 << 29; // bit 29 (carry flag) is set when an error occurs.
                     handled = true;
                 }
+                ret0 = KERN_DENIED;
+                ret1 = 0;
+                cflags = 1 << 29; // bit 29 (carry flag) is set when an error occurs.
+                handled = true;
             }
             sysno::SYS_shared_region_check_np => {
                 // Return where we loaded the dyld shared cache.
@@ -400,6 +409,26 @@ impl AppBoxTrapHandler for Warpspeed {
                             handled = true;
                         }
                     }
+                    // mach_vm_map
+                    // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_vm.defs#L352
+                    4811 => unsafe {
+                        let req = args[0] as *mut mig::mach_vm::__Request___kernelrpc_mach_vm_map_t;
+                        (*req).size = ((*req).size + (0x4000 - 1)) & !(0x4000 - 1);
+                        if (*req).flags & 1 != 0 {
+                            (*req).flags &= !1;
+                            // If a mask is set greater than the 16k page we align to,
+                            // bump map_fixed_next to the next correctly aligned address.
+                            if (*req).mask > 0x3fff {
+                                self.map_fixed_next =
+                                    (self.map_fixed_next + (*req).mask) & !(*req).mask;
+                            }
+                            trace!("Fixing mach_vm_map address to {:x}", self.map_fixed_next);
+                            (*req).address = self.map_fixed_next;
+                            self.map_fixed_next += (*req).size;
+                        }
+
+                        deferred_map = Some(((*req).address, (*req).size as usize));
+                    },
                     // task_restartable_ranges_register. Fake return SUCCESS.
                     // Subsystem task_restartable (8000), 0th routine.
                     8000 => {
@@ -511,7 +540,7 @@ impl AppBoxTrapHandler for Warpspeed {
                     let event = &self.trace.events[self.event_idx];
                     if elr != event.pc {
                         error!(
-                            "replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
+                            "Replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
                             self.event_idx, event.pc, elr
                         );
                         return Ok(ExitKind::Exit);
@@ -521,7 +550,7 @@ impl AppBoxTrapHandler for Warpspeed {
                         Some(crate::recordable::log_event::Event::Syscall(syscall)) => {
                             if num != syscall.syscall_number {
                                 error!(
-                                    "replay {}: syscall mismatch: expected 0x{:x}, got 0x{:x}",
+                                    "Replay {}: syscall mismatch: expected 0x{:x}, got 0x{:x}",
                                     self.event_idx, syscall.syscall_number, num
                                 );
                             }
@@ -531,22 +560,17 @@ impl AppBoxTrapHandler for Warpspeed {
                             // N.B. Do syscall first if required, as it may e.g. allocate memory
                             // that we then need to write into below.
                             if side_effects.external {
-                                trace!("replay syscall index {}", self.event_idx);
+                                trace!("Replay syscall index {}", self.event_idx);
                                 (ret0, ret1, cflags) = forward_syscall(num, &args);
                             }
 
                             for reg in &side_effects.registers {
-                                trace!(
-                                    "replay {}: setting X{:?} to 0x{:x}",
-                                    self.event_idx,
-                                    reg.register,
-                                    reg.value
-                                );
+                                trace!("Setting X{:?} to 0x{:x}", reg.register, reg.value);
                                 match reg.register {
                                     0x0 => {
                                         if side_effects.external && ret0 != reg.value {
                                             error!(
-                                                "replay {}: syscall return value 0 mismatch: expected 0x{:x}, got 0x{:x}",
+                                                "Replay {}: syscall return value 0 mismatch: expected 0x{:x}, got 0x{:x}",
                                                 self.event_idx, reg.value, ret0
                                             );
                                         }
@@ -555,7 +579,7 @@ impl AppBoxTrapHandler for Warpspeed {
                                     0x1 => {
                                         if side_effects.external && ret1 != reg.value {
                                             error!(
-                                                "replay {}: syscall return value 1 mismatch: expected 0x{:x}, got 0x{:x}",
+                                                "Replay {}: syscall return value 1 mismatch: expected 0x{:x}, got 0x{:x}",
                                                 self.event_idx, reg.value, ret1
                                             );
                                         }
@@ -564,7 +588,7 @@ impl AppBoxTrapHandler for Warpspeed {
                                     0x22 => cflags = reg.value,
                                     _ => {
                                         error!(
-                                            "replay {}: unexpected register: {:?}",
+                                            "Replay {}: unexpected register: {:?}",
                                             self.event_idx, reg.register
                                         );
                                         return Ok(ExitKind::Exit);
@@ -572,7 +596,7 @@ impl AppBoxTrapHandler for Warpspeed {
                                 }
                             }
                             for mem in &side_effects.memory {
-                                trace!("replay {}: writing to 0x{:x}", self.event_idx, mem.address);
+                                trace!("Writing to 0x{:x}", mem.address);
                                 unsafe {
                                     std::ptr::copy(
                                         mem.value.as_ptr(),
@@ -594,94 +618,54 @@ impl AppBoxTrapHandler for Warpspeed {
             }
 
             // Stage 2.5: map newly allocated memory into the VM as necessary.
-            match num {
-                sysno::SYS_mmap => {
-                    trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
-                    vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
-                    self.mappings.push((ret0, args[1] as _));
-
-                    side_effects.external = true;
-
-                    // TODO: if this is mapped RO, when we go to replay this side effect
-                    // we'll segfault.
-                    // let mut data = vec![0; args[1] as _];
-                    // vma.read(ret0, &mut data)?;
-                    // side_effects.memory.push(recordable::side_effects::Memory {
-                    //     address: ret0,
-                    //     value: data,
-                    // });
-                }
-                sysno::TRAP_mach_vm_allocate => {
-                    let addr: u64 = unsafe { *(args[1] as *const u64) };
-                    trace!(
-                        "1:1 map of {:x} {:x} due to mach_vm_allocate",
-                        addr,
-                        args[2]
-                    );
-
-                    vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
-                    self.mappings.push((addr, args[2] as usize));
-
-                    side_effects.external = true;
-                }
-                sysno::TRAP_mach_vm_map => {
-                    let addr: u64 = unsafe { *(args[1] as *const u64) };
-                    trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
-                    vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
-                    self.mappings.push((addr, args[2] as usize));
-
-                    side_effects.external = true;
-                    // TODO: record memory contents?
-                }
-                _ => {}
+            if let Some((addr, size)) = deferred_map {
+                trace!("1:1 map of {:x} {:x}", addr, size);
+                vma.map_1to1(addr, size, av::MemPerms::RWX)?;
+                self.mappings.push((addr, size));
+                side_effects.external = true;
             }
         }
 
         // Stage 3: now that we've done the syscall, record the final state as side effects.
         let cpsr = (vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags;
 
-        match self.mode {
-            Mode::Record => {
-                side_effects.registers.extend(vec![
-                    recordable::side_effects::Register {
-                        register: av::Reg::X0 as _,
-                        value: ret0,
-                    },
-                    recordable::side_effects::Register {
-                        register: av::Reg::X1 as _,
-                        value: ret1,
-                    },
-                    recordable::side_effects::Register {
-                        register: av::Reg::CPSR as _,
-                        value: cpsr,
-                    },
-                ]);
+        if self.mode == Mode::Record {
+            side_effects.registers.extend(vec![
+                recordable::side_effects::Register {
+                    register: av::Reg::X0 as _,
+                    value: ret0,
+                },
+                recordable::side_effects::Register {
+                    register: av::Reg::X1 as _,
+                    value: ret1,
+                },
+                recordable::side_effects::Register {
+                    register: av::Reg::CPSR as _,
+                    value: cpsr,
+                },
+            ]);
 
-                // These syscalls have external side-effects, so the syscall itself must be run on replay.
-                // mmap, mach_vm_allocate, and mach_vm_map already set this above.
-                // TODO: open/close are needed so mmapping fds works, but these shouldn't be needed.
-                if num == sysno::SYS_open
-                    || num == sysno::SYS_close
-                    || num == sysno::SYS_write_nocancel
-                {
-                    side_effects.external = true;
-                }
+            // These syscalls have external side-effects, so the syscall itself must be run on replay.
+            // mmap, mach_vm_allocate, and mach_vm_map already set this above.
+            // TODO: open/close are needed so mmapping fds works, but these shouldn't be needed.
+            if num == sysno::SYS_open || num == sysno::SYS_close || num == sysno::SYS_write_nocancel
+            {
+                side_effects.external = true;
+            }
 
-                self.trace.events.push(recordable::LogEvent {
-                    pc: elr,
-                    register_state: args.to_vec(),
-                    event: Some(recordable::log_event::Event::Syscall(
-                        recordable::syscall::Syscall {
-                            syscall_number: num as _,
-                            side_effects: Some(side_effects),
-                        },
-                    )),
-                });
-            }
-            Mode::Replay => {
-                self.event_idx += 1;
-            }
+            self.trace.events.push(recordable::LogEvent {
+                pc: elr,
+                register_state: args.to_vec(),
+                event: Some(recordable::log_event::Event::Syscall(
+                    recordable::syscall::Syscall {
+                        syscall_number: num as _,
+                        side_effects: Some(side_effects),
+                    },
+                )),
+            });
         }
+
+        self.event_idx += 1;
 
         debug!("Returning {:x} {:x} {:x}", ret0, ret1, cpsr);
         vcpu.set_reg(av::Reg::X0, ret0)?;

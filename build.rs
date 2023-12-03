@@ -24,6 +24,21 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
+    Command::new("mig")
+        .current_dir(&out_dir)
+        .arg(sdkroot.join("usr/include/mach/mach_vm.defs"))
+        .status()
+        .expect("Failed to run mig");
+
+    // Bindings for the generated mig header
+    bindgen::Builder::default()
+        .header(out_dir.join("mach_vm.h").to_str().unwrap())
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .generate()
+        .expect("Unable to generate mach_vm mig bindings")
+        .write_to_file(out_dir.join("mig__mach_vm_defs.rs"))
+        .expect("Couldn't write mach_vm mig bindings");
+
     // Syscall numbers
     bindgen::Builder::default()
         .header(sdkroot.join("usr/include/sys/syscall.h").to_str().unwrap())

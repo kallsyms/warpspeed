@@ -242,7 +242,6 @@ impl AppBoxTrapHandler for Warpspeed {
         // Stage 1: handle syscalls that need special handling.
         // Optionally also useful for tossing in debugging statements on specific syscalls.
         let mut handled = false;
-        let mut deferred_map: Option<(u64, usize)> = None;
 
         // See https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master
         // and https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/syscall_sw.c#L105
@@ -285,7 +284,6 @@ impl AppBoxTrapHandler for Warpspeed {
                     args[0] = self.map_fixed_next;
                     self.map_fixed_next += args[1];
                 }
-                deferred_map = Some((args[0], args[1] as usize));
             }
             sysno::TRAP_mach_vm_allocate => {
                 // TODO: ensure task is ourselves
@@ -302,7 +300,6 @@ impl AppBoxTrapHandler for Warpspeed {
                     unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
                     self.map_fixed_next += args[2];
                 }
-                deferred_map = Some((unsafe { *(args[1] as *mut u64) }, args[2] as usize));
             }
             sysno::TRAP_mach_vm_map => {
                 // TODO: ensure task is ourselves
@@ -321,7 +318,6 @@ impl AppBoxTrapHandler for Warpspeed {
                     unsafe { *(args[1] as *mut u64) = self.map_fixed_next };
                     self.map_fixed_next += args[2];
                 }
-                deferred_map = Some((unsafe { *(args[1] as *mut u64) }, args[2] as usize));
             }
             sysno::TRAP_mach_vm_protect => {
                 ret0 = 0;
@@ -422,12 +418,15 @@ impl AppBoxTrapHandler for Warpspeed {
                                 self.map_fixed_next =
                                     (self.map_fixed_next + (*req).mask) & !(*req).mask;
                             }
-                            trace!("Fixing mach_vm_map address to {:x}", self.map_fixed_next);
+                            let size = (*req).size;
+                            trace!(
+                                "Fixing kernelrpc_mach_vm_map address to {:x} ({:?})",
+                                self.map_fixed_next,
+                                *req
+                            );
                             (*req).address = self.map_fixed_next;
                             self.map_fixed_next += (*req).size;
                         }
-
-                        deferred_map = Some(((*req).address, (*req).size as usize));
                     },
                     // task_restartable_ranges_register. Fake return SUCCESS.
                     // Subsystem task_restartable (8000), 0th routine.
@@ -618,11 +617,79 @@ impl AppBoxTrapHandler for Warpspeed {
             }
 
             // Stage 2.5: map newly allocated memory into the VM as necessary.
-            if let Some((addr, size)) = deferred_map {
-                trace!("1:1 map of {:x} {:x}", addr, size);
-                vma.map_1to1(addr, size, av::MemPerms::RWX)?;
-                self.mappings.push((addr, size));
-                side_effects.external = true;
+            match num {
+                sysno::SYS_mmap => {
+                    trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
+                    vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
+                    self.mappings.push((ret0, args[1] as _));
+
+                    side_effects.external = true;
+
+                    // TODO: if this is mapped RO, when we go to replay this side effect
+                    // we'll segfault.
+                    // let mut data = vec![0; args[1] as _];
+                    // vma.read(ret0, &mut data)?;
+                    // side_effects.memory.push(recordable::side_effects::Memory {
+                    //     address: ret0,
+                    //     value: data,
+                    // });
+                }
+                sysno::TRAP_mach_vm_allocate => {
+                    let addr: u64 = unsafe { *(args[1] as *const u64) };
+                    trace!(
+                        "1:1 map of {:x} {:x} due to mach_vm_allocate",
+                        addr,
+                        args[2]
+                    );
+
+                    vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
+                    self.mappings.push((addr, args[2] as usize));
+
+                    side_effects.external = true;
+                }
+                sysno::TRAP_mach_vm_map => {
+                    let addr: u64 = unsafe { *(args[1] as *const u64) };
+                    trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
+                    vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
+                    self.mappings.push((addr, args[2] as usize));
+
+                    side_effects.external = true;
+                    // TODO: record memory contents?
+                }
+                sysno::TRAP_mach_msg2 => {
+                    // We need to stub a few messages here.
+                    // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_traps.h#L465
+                    // for trap argument layout.
+                    let msgh_id = args[4] >> 32;
+                    match msgh_id {
+                        // mach_vm_map
+                        4811 => {
+                            let reply = unsafe {
+                                *(args[0] as *const mig::mach_vm::__Reply___kernelrpc_mach_vm_map_t)
+                            };
+                            let addr = reply.address;
+                            // TODO: this should be saved before syscall.
+                            // only works because this happens to not be overwritten
+                            let size = unsafe {
+                                (*(args[0]
+                                    as *const mig::mach_vm::__Request___kernelrpc_mach_vm_map_t))
+                                    .size
+                            };
+                            trace!(
+                                "1:1 map of {:x} {:x} due to __kernelrpc_mach_vm_map",
+                                addr,
+                                size
+                            );
+                            vma.map_1to1(addr, size as usize, av::MemPerms::RWX)?;
+                            self.mappings.push((addr, size as usize));
+
+                            side_effects.external = true;
+                            // TODO: record memory contents?
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
 

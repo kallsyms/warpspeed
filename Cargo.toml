@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-appbox = {path = "src/appbox"}
-#hyperpom = { git = "https://github.com/kallsyms/hyperpom" }
-hyperpom = {path = "../hyperpom"}
+#appbox = {git = "https://github.com/kallsyms/appbox"}
+appbox = {path = "../appbox"}
+hyperpom = { git = "https://github.com/kallsyms/hyperpom" }
 clap = {version = "4.2.7", features = ["derive"]}
 clap-verbosity-flag = "2.0.0"
 env_logger = "0.10.0"

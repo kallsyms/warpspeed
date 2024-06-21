@@ -520,22 +520,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mrr"
-version = "0.1.0"
-dependencies = [
- "appbox",
- "bindgen",
- "clap",
- "clap-verbosity-flag",
- "env_logger",
- "hyperpom",
- "log",
- "nix",
- "prost",
- "prost-build",
-]
-
-[[package]]
 name = "multimap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -896,6 +880,22 @@ name = "uuid"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88ad59a7560b41a70d191093a945f0b87bc1deeda46fb237479708a1d6b6cdfc"
+
+[[package]]
+name = "warpspeed"
+version = "0.1.0"
+dependencies = [
+ "appbox",
+ "bindgen",
+ "clap",
+ "clap-verbosity-flag",
+ "env_logger",
+ "hyperpom",
+ "log",
+ "nix",
+ "prost",
+ "prost-build",
+]
 
 [[package]]
 name = "which"

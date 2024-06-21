@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package mrr.recordable.syscall;
+package warpspeed.recordable.syscall;
 
 import "src/recordable/side_effects.proto";
 
@@ -9,5 +9,5 @@ import "src/recordable/side_effects.proto";
 // Basically anything that is SVC'd into.
 message Syscall {
   uint64 syscall_number = 1;
-  mrr.recordable.SideEffects side_effects = 2;
+  warpspeed.recordable.SideEffects side_effects = 2;
 }

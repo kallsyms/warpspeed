@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
-/// mRR, the macOS Record Replay Debugger
+/// Warpspeed, a macOS Record Replay Debugger
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
@@ -49,7 +49,7 @@ pub struct ReplayArgs {
 #[test]
 fn test_args() {
     let args = Cli::parse_from(vec![
-        "mrr",
+        "warpspeed",
         "record",
         "out.log",
         "executable",

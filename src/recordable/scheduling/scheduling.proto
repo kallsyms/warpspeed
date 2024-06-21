@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package mrr.recordable.scheduling;
+package warpspeed.recordable.scheduling;
 
 message Scheduling {
   uint32 tid = 1; // This is an opaque identifier for the thread.

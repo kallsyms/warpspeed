@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package mrr.recordable;
+package warpspeed.recordable;
 
 // Side effects are some userland-observable changes that the associated event
 // caused.

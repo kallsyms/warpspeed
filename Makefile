@@ -1,16 +1,16 @@
 CODESIGN := codesign
 CARGO := cargo +nightly
 
-TARGET := mrr
+TARGET := warpspeed
 TARGET_DEBUG := target/debug/$(TARGET)
 TARGET_RELEASE := target/release/$(TARGET)
 
 .PHONY: build-debug
 build-debug:
 	$(CARGO) build
-	$(CODESIGN) --entitlements mrr.entitlements --force -s - "$(TARGET_DEBUG)"
+	$(CODESIGN) --entitlements warpspeed.entitlements --force -s - "$(TARGET_DEBUG)"
 
 .PHONY: build-release
 build-release:
 	$(CARGO) build --release
-	$(CODESIGN) --entitlements mrr.entitlements --force -s - "$(TARGET_RELEASE)"
+	$(CODESIGN) --entitlements warpspeed.entitlements --force -s - "$(TARGET_RELEASE)"

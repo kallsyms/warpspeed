@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package mrr.recordable;
+package warpspeed.recordable;
 
 import "src/recordable/scheduling/scheduling.proto";
 import "src/recordable/syscall/syscall.proto";
@@ -26,7 +26,7 @@ message LogEvent {
   uint64 pc = 1;
   repeated uint64 register_state = 2;
   oneof event {
-    mrr.recordable.syscall.Syscall syscall = 10;
-    mrr.recordable.scheduling.Scheduling scheduling = 12;
+    warpspeed.recordable.syscall.Syscall syscall = 10;
+    warpspeed.recordable.scheduling.Scheduling scheduling = 12;
   }
 }

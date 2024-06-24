@@ -68,6 +68,7 @@ checksum = "a4668cab20f66d8d020e1fbc0ebe47217433c1b6c8f2040faf858554e394ace6"
 [[package]]
 name = "appbox"
 version = "0.1.0"
+source = "git+https://github.com/kallsyms/appbox#dcdd2735dcc6aa5cd05017babe08e66d7a88bd01"
 dependencies = [
  "anyhow",
  "bindgen",

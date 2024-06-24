@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::CStr;
+use warpspeed::recordable::syscall::mig::mach_vm::mig_get_reply_port;
 
 use hyperpom::applevisor as av;
 use hyperpom::crash::*;
@@ -409,24 +410,70 @@ impl AppBoxTrapHandler for Warpspeed {
                     // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_vm.defs#L352
                     4811 => unsafe {
                         let req = args[0] as *mut mig::mach_vm::__Request___kernelrpc_mach_vm_map_t;
+
+                        // dbg!(*req);
+                        // // (*req).Head.msgh_remote_port = nix::libc::mach_task_self();
+                        // // (*req).Head.msgh_local_port = mig_get_reply_port();
+                        // (*req).size = ((*req).size + (0x4000 - 1)) & !(0x4000 - 1);
+                        // if (*req).flags & 1 != 0 {
+                        //     (*req).flags &= !1;
+                        //     // If a mask is set greater than the 16k page we align to,
+                        //     // bump map_fixed_next to the next correctly aligned address.
+                        //     if (*req).mask > 0x3fff {
+                        //         self.map_fixed_next =
+                        //             (self.map_fixed_next + (*req).mask) & !(*req).mask;
+                        //     }
+                        //     let size = (*req).size;
+                        //     trace!(
+                        //         "Fixing kernelrpc_mach_vm_map address to {:x} ({:?})",
+                        //         self.map_fixed_next,
+                        //         *req
+                        //     );
+                        //     (*req).address = self.map_fixed_next;
+                        //     self.map_fixed_next += (*req).size;
+                        // }
+                        // dbg!(*req);
+
+                        // In macOS 14, the above does not work for some reason (returning MACH_SEND_INVALID_REPLY), but only on replay.
+                        // To get around this, emulate the map behavior with mmap.
+                        // TODO: this assumes object == 0.
+
                         (*req).size = ((*req).size + (0x4000 - 1)) & !(0x4000 - 1);
                         if (*req).flags & 1 != 0 {
-                            (*req).flags &= !1;
-                            // If a mask is set greater than the 16k page we align to,
-                            // bump map_fixed_next to the next correctly aligned address.
-                            if (*req).mask > 0x3fff {
-                                self.map_fixed_next =
-                                    (self.map_fixed_next + (*req).mask) & !(*req).mask;
-                            }
-                            let size = (*req).size;
                             trace!(
-                                "Fixing kernelrpc_mach_vm_map address to {:x} ({:?})",
-                                self.map_fixed_next,
-                                *req
+                                "Fixing kernelrpc_mach_vm_map address to {:x}",
+                                self.map_fixed_next
                             );
                             (*req).address = self.map_fixed_next;
                             self.map_fixed_next += (*req).size;
                         }
+                        let address = (*req).address;
+                        nix::libc::mmap(
+                            address as _,
+                            (*req).size as _,
+                            (*req).cur_protection as _,
+                            nix::libc::MAP_PRIVATE
+                                | nix::libc::MAP_ANONYMOUS
+                                | nix::libc::MAP_FIXED,
+                            -1,
+                            0,
+                        );
+                        vma.map_1to1(address, (*req).size as _, av::MemPerms::RWX)?;
+                        self.mappings.push((address, (*req).size as _));
+                        let reply = args[0] as *mut mig::mach_vm::__Reply___kernelrpc_mach_vm_map_t;
+                        (*reply).Head.msgh_bits = 0x1200;
+                        (*reply).Head.msgh_size = std::mem::size_of::<
+                            mig::mach_vm::__Reply___kernelrpc_mach_vm_map_t,
+                        >() as _;
+                        (*reply).Head.msgh_remote_port = 0;
+                        (*reply).Head.msgh_id += 100;
+                        (*reply).RetCode = KERN_SUCCESS as _;
+                        (*reply).address = address;
+
+                        ret0 = KERN_SUCCESS;
+
+                        side_effects.external = true;
+                        handled = true;
                     },
                     // task_restartable_ranges_register. Fake return SUCCESS.
                     // Subsystem task_restartable (8000), 0th routine.
@@ -680,8 +727,14 @@ impl AppBoxTrapHandler for Warpspeed {
                                 addr,
                                 size
                             );
-                            vma.map_1to1(addr, size as usize, av::MemPerms::RWX)?;
-                            self.mappings.push((addr, size as usize));
+                            // trace!("stuff: {:?}", unsafe {
+                            //     std::slice::from_raw_parts(addr as *const u64, 100)
+                            // });
+
+                            if self.mode == Mode::Record {
+                                vma.map_1to1(addr, size as usize, av::MemPerms::RWX)?;
+                                self.mappings.push((addr, size as usize));
+                            }
 
                             side_effects.external = true;
                             // TODO: record memory contents?
@@ -714,9 +767,24 @@ impl AppBoxTrapHandler for Warpspeed {
 
             // These syscalls have external side-effects, so the syscall itself must be run on replay.
             // mmap, mach_vm_allocate, and mach_vm_map already set this above.
-            // TODO: open/close are needed so mmapping fds works, but these shouldn't be needed.
-            if num == sysno::SYS_open || num == sysno::SYS_close || num == sysno::SYS_write_nocancel
+            // TODO: open/close and other fd manipulating calls are needed so mmapping fds works,
+            // but these shouldn't be needed eventually.
+            if num == sysno::SYS_open
+                || num == sysno::SYS_openat
+                || num == sysno::SYS_open_nocancel
+                || num == sysno::SYS_openat_nocancel
+                || num == sysno::SYS_close
+                || num == sysno::SYS_close_nocancel
+                || num == sysno::SYS_dup
+                || num == sysno::SYS_dup2
+                // and socket is needed so the fd table stays in sync
+                || num == sysno::SYS_socket
             {
+                side_effects.external = true;
+            }
+
+            // Also include write_nocancel so we can see stdout/stderr.
+            if num == sysno::SYS_write_nocancel && (args[0] == 1 || args[0] == 2) {
                 side_effects.external = true;
             }
 

@@ -11,11 +11,13 @@ use crate::warpspeed;
 use recordable::{trace::Target, Trace};
 
 pub fn record(args: &cli::RecordArgs) {
+    let mut argv = vec![args.executable.clone()];
+    argv.extend_from_slice(&args.arguments);
     let env = vec![]; // TODO
 
     let target = Target {
         path: args.executable.clone(),
-        arguments: args.arguments.clone(),
+        arguments: argv.clone(),
         environment: env.clone(),
     };
 
@@ -29,7 +31,7 @@ pub fn record(args: &cli::RecordArgs) {
 
     let mut app = appbox::AppBox::new(
         &PathBuf::from(&args.executable),
-        &args.arguments,
+        &argv,
         &env,
         warpspeed.clone(),
     )

@@ -1,3 +1,5 @@
+use appbox::hyperpom::memory::VirtMemAllocator;
+use appbox::loader::Loader;
 use log::{debug, error, info, trace, warn};
 use std::arch::asm;
 use std::collections::HashMap;
@@ -6,12 +8,8 @@ use std::collections::VecDeque;
 use std::ffi::CStr;
 use warpspeed::recordable::syscall::mig::mach_vm::mig_get_reply_port;
 
-use hyperpom::applevisor as av;
-use hyperpom::crash::*;
-use hyperpom::error::*;
-use hyperpom::memory::*;
-
-use appbox::{AppBoxTrapHandler, LoadInfo};
+use appbox::applevisor as av;
+use appbox::hyperpom::crash::ExitKind;
 
 use crate::recordable;
 use crate::recordable::side_effects;
@@ -192,15 +190,13 @@ impl Warpspeed {
             tsd: 0,
         }
     }
-}
 
-impl AppBoxTrapHandler for Warpspeed {
-    fn trap_handler(
+    pub fn trap_handler(
         &mut self,
         vcpu: &mut av::Vcpu,
         vma: &mut VirtMemAllocator,
-        load_info: &LoadInfo,
-    ) -> Result<ExitKind> {
+        loader: &Loader,
+    ) -> Result<ExitKind, appbox::hyperpom::error::Error> {
         let elr = vcpu.get_sys_reg(av::SysReg::ELR_EL1)?;
         trace!("ELR_EL1: {:#x}", elr);
         let esr = vcpu.get_sys_reg(av::SysReg::ESR_EL1)?;
@@ -364,10 +360,10 @@ impl AppBoxTrapHandler for Warpspeed {
                 if args[0] != u64::MAX {
                     debug!(
                         "Returning {:x} for shared_region_check_np",
-                        load_info.shared_cache_base
+                        loader.shared_cache.base_address() as u64
                     );
                     unsafe {
-                        *(args[0] as *mut u64) = load_info.shared_cache_base;
+                        *(args[0] as *mut u64) = loader.shared_cache.base_address() as u64;
                     }
                 }
                 ret0 = 0;

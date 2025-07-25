@@ -44,6 +44,14 @@ pub struct ReplayArgs {
     /// Input filename of the trace
     #[clap(required = true)]
     pub trace_filename: String,
+
+    /// Port to listen on for a gdb client
+    #[clap(long)]
+    pub gdb_port: Option<u16>,
+
+    /// Wait for gdb connection before running
+    #[clap(long)]
+    pub gdb_wait: bool,
 }
 
 #[test]

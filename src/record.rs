@@ -129,46 +129,46 @@ pub fn record(args: &cli::RecordArgs) {
             }
         }
 
-        while let Ok(cmd) = command_receiver.try_recv() {
-            match cmd {
-                appbox::gdb::GdbCommand::Continue => {
-                    // Remove single step breakpoint if it exists
-                    if let Some(addr) = single_step_breakpoint.take() {
-                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
-                    }
-                    break;
-                }
+        // while let Ok(cmd) = command_receiver.try_recv() {
+        //     match cmd {
+        //         appbox::gdb::GdbCommand::Continue => {
+        //             // Remove single step breakpoint if it exists
+        //             if let Some(addr) = single_step_breakpoint.take() {
+        //                 let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+        //             }
+        //             break;
+        //         }
 
-                appbox::gdb::GdbCommand::Step => {
-                    // Get current instruction to determine next PC
-                    let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
-                    let mut insn_bytes = [0; 4];
-                    vm.vma.read(pc, &mut insn_bytes).unwrap();
+        //         appbox::gdb::GdbCommand::Step => {
+        //             // Get current instruction to determine next PC
+        //             let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+        //             let mut insn_bytes = [0; 4];
+        //             vm.vma.read(pc, &mut insn_bytes).unwrap();
 
-                    // Remove previous single step breakpoint if it exists
-                    if let Some(addr) = single_step_breakpoint.take() {
-                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
-                    }
+        //             // Remove previous single step breakpoint if it exists
+        //             if let Some(addr) = single_step_breakpoint.take() {
+        //                 let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+        //             }
 
-                    // For now, assume next instruction is at PC + 4
-                    // TODO: Enhance this to handle branches properly by using instruction emulation
-                    let next_pc = pc + 4;
+        //             // For now, assume next instruction is at PC + 4
+        //             // TODO: Enhance this to handle branches properly by using instruction emulation
+        //             let next_pc = pc + 4;
 
-                    // Set new single step breakpoint
-                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
-                    single_step_breakpoint = Some(next_pc);
-                    break;
-                }
+        //             // Set new single step breakpoint
+        //             vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+        //             single_step_breakpoint = Some(next_pc);
+        //             break;
+        //         }
 
-                appbox::gdb::GdbCommand::Kill => {
-                    return;
-                }
+        //         appbox::gdb::GdbCommand::Kill => {
+        //             return;
+        //         }
 
-                _ => {
-                    handle_gdb_command(cmd, &mut vm, &response_sender);
-                }
-            }
-        }
+        //         _ => {
+        //             handle_gdb_command(cmd, &mut vm, &response_sender);
+        //         }
+        //     }
+        // }
 
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
         let exit = match exit_info.reason {
@@ -190,6 +190,7 @@ pub fn record(args: &cli::RecordArgs) {
                                 if let Ok(cmd) = command_receiver.recv() {
                                     match cmd {
                                         appbox::gdb::GdbCommand::Continue => break,
+                                        appbox::gdb::GdbCommand::Step => break,
                                         appbox::gdb::GdbCommand::Kill => return,
                                         _ => appbox::gdb::handle_command(
                                             cmd,
@@ -208,18 +209,34 @@ pub fn record(args: &cli::RecordArgs) {
 
                         // Check if this is our single step breakpoint
                         if Some(pc) == single_step_breakpoint {
-                            println!("Single step completed at {:#x}", pc);
+                            debug!("Single step completed at {:#x}", pc);
+                            vm.hooks
+                                .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
+                                .unwrap();
                             // Remove the single step breakpoint
                             vm.hooks.remove_breakpoint(pc, &mut vm.vma).unwrap();
                             single_step_breakpoint = None;
                             if let Some(ref sender) = notification_sender {
-                                appbox::gdb::send_sigsegv(sender);
+                                sender
+                                    .send(appbox::gdb::GdbNotification::Stop(
+                                        5, // SIGTRAP
+                                    ))
+                                    .unwrap();
                             }
                             // Enter GDB evaluation loop for system state inspection
                             loop {
                                 if let Ok(cmd) = command_receiver.recv() {
                                     match cmd {
                                         appbox::gdb::GdbCommand::Continue => break,
+                                        appbox::gdb::GdbCommand::Step => {
+                                            let next_pc = vm
+                                                .hooks
+                                                .compute_step_target(&vm.vcpu, &vm.vma)
+                                                .unwrap();
+                                            vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                                            single_step_breakpoint = Some(next_pc);
+                                            break;
+                                        }
                                         appbox::gdb::GdbCommand::Kill => return,
                                         _ => appbox::gdb::handle_command(
                                             cmd,
@@ -229,19 +246,36 @@ pub fn record(args: &cli::RecordArgs) {
                                     }
                                 }
                             }
+                            appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)
+                                .unwrap();
                             ExitKind::Continue
                         } else {
-                            println!("Breakpoint hit at {:#x}", pc);
-                            // TODO: restore insn before gdb eval. needs to be broken out from hooks otherwise vm state is pointing to the ic_ivau handler
-                            // TODO: only trigger gdb on bp stage 1
+                            debug!("Breakpoint hit at {:#x}", pc);
+                            // Restore original instruction
+                            vm.hooks
+                                .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
+                                .unwrap();
                             if let Some(ref sender) = notification_sender {
-                                appbox::gdb::send_sigsegv(sender);
+                                sender
+                                    .send(appbox::gdb::GdbNotification::Stop(
+                                        5, // SIGTRAP
+                                    ))
+                                    .unwrap();
                             }
                             // Enter GDB evaluation loop for system state inspection
                             loop {
                                 if let Ok(cmd) = command_receiver.recv() {
                                     match cmd {
                                         appbox::gdb::GdbCommand::Continue => break,
+                                        appbox::gdb::GdbCommand::Step => {
+                                            let next_pc = vm
+                                                .hooks
+                                                .compute_step_target(&vm.vcpu, &vm.vma)
+                                                .unwrap();
+                                            vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                                            single_step_breakpoint = Some(next_pc);
+                                            break;
+                                        }
                                         appbox::gdb::GdbCommand::Kill => return,
                                         _ => appbox::gdb::handle_command(
                                             cmd,
@@ -251,7 +285,8 @@ pub fn record(args: &cli::RecordArgs) {
                                     }
                                 }
                             }
-                            vm.hooks.handle(&mut vm.vcpu, &mut vm.vma).unwrap();
+                            appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)
+                                .unwrap();
                             ExitKind::Continue
                         }
                     }
@@ -269,6 +304,7 @@ pub fn record(args: &cli::RecordArgs) {
                             if let Ok(cmd) = command_receiver.recv() {
                                 match cmd {
                                     appbox::gdb::GdbCommand::Continue => break,
+                                    appbox::gdb::GdbCommand::Step => break,
                                     _ => {
                                         appbox::gdb::handle_command(cmd, &mut vm, &response_sender)
                                     }

@@ -189,7 +189,6 @@ pub fn replay(args: &cli::ReplayArgs) {
                             ExitKind::Continue
                         } else {
                             println!("Breakpoint hit at {:#x}", pc);
-                            vm.hooks.handle(&mut vm.vcpu, &mut vm.vma).unwrap();
                             ExitKind::Continue
                         }
                     }

@@ -34,6 +34,14 @@ pub struct RecordArgs {
     #[clap(required = true)]
     pub executable: String,
 
+    /// Port to listen on for a gdb client
+    #[clap(long)]
+    pub gdb_port: Option<u16>,
+
+    /// Wait for gdb connection before running
+    #[clap(long)]
+    pub gdb_wait: bool,
+
     /// Target arguments
     #[clap(allow_hyphen_values = true)]
     pub arguments: Vec<String>,

@@ -1,20 +1,20 @@
 use appbox::hyperpom::memory::VirtMemAllocator;
 use appbox::loader::Loader;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, trace, warn};
 use std::arch::asm;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::CStr;
-use warpspeed::recordable::syscall::mig::mach_vm::mig_get_reply_port;
+//use warpspeed::recordable::syscall::mig::mach_vm::mig_get_reply_port;
 
 use appbox::applevisor as av;
 use appbox::hyperpom::crash::ExitKind;
+use appbox::syscalls;
 
 use crate::recordable;
 use crate::recordable::side_effects;
 use crate::recordable::syscall::mig;
-use crate::recordable::syscall::sysno;
 
 // https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/kern_return.h#L325
 const KERN_SUCCESS: u64 = 0;
@@ -100,7 +100,7 @@ fn forward_syscall(num: u64, args: &[u64; 16]) -> (u64, u64, u64) {
     let mut ret1: u64 = 0;
     let mut cflags: u64 = 0;
 
-    debug!("Forwarding syscall 0x{:x}(0x{:x?})", num, args);
+    trace!("Forwarding syscall 0x{:x}(0x{:x?})", num, args);
     unsafe {
         asm!(
             "svc #0x80",
@@ -186,7 +186,7 @@ impl Warpspeed {
             mode,
             event_idx: 0,
             mappings: vec![],
-            map_fixed_next: 0x5_0000_0000, // 0x1_0000_0000 above allocation base in appbox
+            map_fixed_next: 0x6_0000_0000, // 0x1_0000_0000 above allocation base in appbox
             tsd: 0,
         }
     }
@@ -204,6 +204,7 @@ impl Warpspeed {
         if esr != 0x56000080 {
             error!("Fault!");
             error!("{}", vcpu);
+
             return Ok(ExitKind::Crash("Unhandled fault".to_string()));
         }
 
@@ -227,8 +228,11 @@ impl Warpspeed {
             vcpu.get_reg(av::Reg::X15)?,
         ];
         debug!(
-            "{}: Incoming syscall 0x{:x}(0x{:x?})",
-            self.event_idx, num, args
+            "{}: Incoming syscall ({}) {:x}(x{:x?})",
+            self.event_idx,
+            syscalls::syscall_name(num).unwrap_or("<unknown>"),
+            num,
+            args
         );
 
         let mut ret0: u64 = 0;
@@ -246,10 +250,10 @@ impl Warpspeed {
         // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/arm64/sleh.c#L1686
         // for dispatch code.
         match num {
-            sysno::SYS_exit => {
+            syscalls::SYS_exit => {
                 return Ok(ExitKind::Exit);
             }
-            sysno::SYS_munmap => {
+            syscalls::SYS_munmap => {
                 // TODO: actually remove from vma.
                 // TODO: handle partial unmapping
                 if let Some(mapping_idx) = self
@@ -265,13 +269,13 @@ impl Warpspeed {
                 cflags = 0;
                 handled = true;
             }
-            sysno::SYS_mprotect => {
+            syscalls::SYS_mprotect => {
                 ret0 = 0;
                 ret1 = 0;
                 cflags = 0;
                 handled = true;
             }
-            sysno::SYS_mmap => {
+            syscalls::SYS_mmap => {
                 // page align size
                 args[1] = (args[1] + (0x4000 - 1)) & !(0x4000 - 1);
                 // fake fixed address
@@ -282,7 +286,7 @@ impl Warpspeed {
                     self.map_fixed_next += args[1];
                 }
             }
-            sysno::TRAP_mach_vm_allocate => {
+            syscalls::TRAP_mach_vm_allocate => {
                 // TODO: ensure task is ourselves
                 // page align size
                 args[2] = (args[2] + (0x4000 - 1)) & !(0x4000 - 1);
@@ -298,7 +302,7 @@ impl Warpspeed {
                     self.map_fixed_next += args[2];
                 }
             }
-            sysno::TRAP_mach_vm_map => {
+            syscalls::TRAP_mach_vm_map => {
                 // TODO: ensure task is ourselves
                 // page align size
                 args[2] = (args[2] + (0x4000 - 1)) & !(0x4000 - 1);
@@ -316,13 +320,13 @@ impl Warpspeed {
                     self.map_fixed_next += args[2];
                 }
             }
-            sysno::TRAP_mach_vm_protect => {
+            syscalls::TRAP_mach_vm_protect => {
                 ret0 = 0;
                 ret1 = 0;
                 cflags = 0;
                 handled = true;
             }
-            sysno::TRAP_mach_vm_deallocate => {
+            syscalls::TRAP_mach_vm_deallocate => {
                 // TODO: handle partial unmapping
                 if let Some(mapping_idx) = self
                     .mappings
@@ -337,7 +341,7 @@ impl Warpspeed {
                 cflags = 0;
                 handled = true;
             }
-            sysno::SYS_shm_open => {
+            syscalls::SYS_shm_open => {
                 // TODO: why was this needed?
                 // Maybe shm isn't allowed to be mapped into VM?
                 let name = unsafe { CStr::from_ptr(args[0] as _) };
@@ -354,7 +358,7 @@ impl Warpspeed {
                 cflags = 1 << 29; // bit 29 (carry flag) is set when an error occurs.
                 handled = true;
             }
-            sysno::SYS_shared_region_check_np => {
+            syscalls::SYS_shared_region_check_np => {
                 // Return where we loaded the dyld shared cache.
                 // https://github.com/apple-oss-distributions/xnu/blob/5c2921b07a2480ab43ec66f5b9e41cb872bc554f/bsd/vm/vm_unix.c#L2017
                 if args[0] != u64::MAX {
@@ -371,7 +375,7 @@ impl Warpspeed {
                 cflags = 0;
                 handled = true;
             }
-            sysno::SYS_proc_info => {
+            syscalls::SYS_proc_info => {
                 // This should be ignored by the host anyways
                 // (https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/kern/task.c#L740)
                 // but stub it out for good measure.
@@ -383,7 +387,7 @@ impl Warpspeed {
                     handled = true;
                 }
             }
-            sysno::TRAP_mach_msg2 => {
+            syscalls::TRAP_mach_msg2 => {
                 // We need to stub a few messages here.
                 // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_traps.h#L465
                 // for trap argument layout.
@@ -542,10 +546,10 @@ impl Warpspeed {
                     // Special case easy syscalls, especially those which could
                     // modify a significant (>1 page) amount of memory.
                     match num {
-                        sysno::SYS_read
-                        | sysno::SYS_pread
-                        | sysno::SYS_read_nocancel
-                        | sysno::SYS_pread_nocancel => {
+                        syscalls::SYS_read
+                        | syscalls::SYS_pread
+                        | syscalls::SYS_read_nocancel
+                        | syscalls::SYS_pread_nocancel => {
                             let buf = args[1];
                             let count = ret0;
                             let mut data = vec![0; count as usize];
@@ -661,7 +665,7 @@ impl Warpspeed {
 
             // Stage 2.5: map newly allocated memory into the VM as necessary.
             match num {
-                sysno::SYS_mmap => {
+                syscalls::SYS_mmap => {
                     trace!("1:1 map of {:x} {:x} due to mmap", ret0, args[1]);
                     vma.map_1to1(ret0, args[1] as _, av::MemPerms::RWX)?;
                     self.mappings.push((ret0, args[1] as _));
@@ -677,7 +681,7 @@ impl Warpspeed {
                     //     value: data,
                     // });
                 }
-                sysno::TRAP_mach_vm_allocate => {
+                syscalls::TRAP_mach_vm_allocate => {
                     let addr: u64 = unsafe { *(args[1] as *const u64) };
                     trace!(
                         "1:1 map of {:x} {:x} due to mach_vm_allocate",
@@ -690,7 +694,7 @@ impl Warpspeed {
 
                     side_effects.external = true;
                 }
-                sysno::TRAP_mach_vm_map => {
+                syscalls::TRAP_mach_vm_map => {
                     let addr: u64 = unsafe { *(args[1] as *const u64) };
                     trace!("1:1 map of {:x} {:x} due to mach_vm_map", addr, args[2]);
                     vma.map_1to1(addr, args[2] as usize, av::MemPerms::RWX)?;
@@ -699,7 +703,7 @@ impl Warpspeed {
                     side_effects.external = true;
                     // TODO: record memory contents?
                 }
-                sysno::TRAP_mach_msg2 => {
+                syscalls::TRAP_mach_msg2 => {
                     // We need to stub a few messages here.
                     // See https://github.com/apple-oss-distributions/xnu/blob/1031c584a5e37aff177559b9f69dbd3c8c3fd30a/osfmk/mach/mach_traps.h#L465
                     // for trap argument layout.
@@ -765,22 +769,22 @@ impl Warpspeed {
             // mmap, mach_vm_allocate, and mach_vm_map already set this above.
             // TODO: open/close and other fd manipulating calls are needed so mmapping fds works,
             // but these shouldn't be needed eventually.
-            if num == sysno::SYS_open
-                || num == sysno::SYS_openat
-                || num == sysno::SYS_open_nocancel
-                || num == sysno::SYS_openat_nocancel
-                || num == sysno::SYS_close
-                || num == sysno::SYS_close_nocancel
-                || num == sysno::SYS_dup
-                || num == sysno::SYS_dup2
+            if num == syscalls::SYS_open
+                || num == syscalls::SYS_openat
+                || num == syscalls::SYS_open_nocancel
+                || num == syscalls::SYS_openat_nocancel
+                || num == syscalls::SYS_close
+                || num == syscalls::SYS_close_nocancel
+                || num == syscalls::SYS_dup
+                || num == syscalls::SYS_dup2
                 // and socket is needed so the fd table stays in sync
-                || num == sysno::SYS_socket
+                || num == syscalls::SYS_socket
             {
                 side_effects.external = true;
             }
 
             // Also include write_nocancel so we can see stdout/stderr.
-            if num == sysno::SYS_write_nocancel && (args[0] == 1 || args[0] == 2) {
+            if num == syscalls::SYS_write_nocancel && (args[0] == 1 || args[0] == 2) {
                 side_effects.external = true;
             }
 
@@ -798,7 +802,7 @@ impl Warpspeed {
 
         self.event_idx += 1;
 
-        debug!("Returning {:x} {:x} {:x}", ret0, ret1, cpsr);
+        debug!("Returning x0={:x} x1={:x} cpsr={:x}", ret0, ret1, cpsr);
         vcpu.set_reg(av::Reg::X0, ret0)?;
         vcpu.set_reg(av::Reg::X1, ret1)?;
         vcpu.set_reg(av::Reg::CPSR, cpsr)?;

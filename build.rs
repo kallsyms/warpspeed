@@ -39,15 +39,6 @@ fn main() {
         .write_to_file(out_dir.join("mig__mach_vm_defs.rs"))
         .expect("Couldn't write mach_vm mig bindings");
 
-    // Syscall numbers
-    bindgen::Builder::default()
-        .header(sdkroot.join("usr/include/sys/syscall.h").to_str().unwrap())
-        .parse_callbacks(Box::new(ParseCallbacks))
-        .generate()
-        .expect("Unable to generate syscall bindings")
-        .write_to_file(out_dir.join("syscall_h.rs"))
-        .expect("Couldn't write syscall bindings");
-
     // Recordable protobuf
     prost_build::compile_protos(&["src/recordable/recordable.proto"], &["."])
         .expect("Failed to compile protos");

@@ -26,7 +26,7 @@ pub fn replay(args: &cli::ReplayArgs) {
     debug!("Loaded trace with {} events", trace.events.len());
     let target = trace.target.clone().unwrap();
 
-    let mut warpspeed = warpspeed::Warpspeed::new(trace, warpspeed::Mode::Replay);
+    let mut warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
 
     let mut vm = VmManager::new().unwrap();
 
@@ -38,12 +38,34 @@ pub fn replay(args: &cli::ReplayArgs) {
     )
     .unwrap();
 
+    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point).unwrap();
+    vm.vcpu
+        .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)
+        .unwrap();
+
+    // Store initial state for backward execution
+    let initial_pc = loader.entry_point;
+    let initial_sp = loader.stack_pointer;
+
     // GDB server channels
     let (command_sender, command_receiver) = std::sync::mpsc::channel();
     let (response_sender, response_receiver) = std::sync::mpsc::channel();
 
     let notification_sender = if let Some(port) = args.gdb_port {
-        Some(appbox::gdb::start_gdb_server(port, command_sender, response_receiver, None).unwrap())
+        Some(
+            appbox::gdb::start_gdb_server(
+                port,
+                command_sender,
+                response_receiver,
+                None,
+                appbox::gdb::GdbFeatures {
+                    reverse_continue: true,
+                    reverse_step: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
     } else {
         None
     };
@@ -53,21 +75,17 @@ pub fn replay(args: &cli::ReplayArgs) {
             info!("Waiting for GDB connection...");
             loop {
                 if let Ok(cmd) = command_receiver.recv() {
-                    if let appbox::gdb::GdbCommand::Continue = cmd {
-                        break;
+                    match cmd {
+                        appbox::gdb::GdbCommand::Continue => break,
+                        appbox::gdb::GdbCommand::Kill => return,
+                        _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
                     }
-                    appbox::gdb::handle_command(cmd, &mut vm, &response_sender);
                 }
             }
         }
     }
 
     let mut single_step_breakpoint: Option<u64> = None;
-
-    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point).unwrap();
-    vm.vcpu
-        .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)
-        .unwrap();
 
     loop {
         vm.vcpu.run().unwrap();
@@ -103,8 +121,49 @@ pub fn replay(args: &cli::ReplayArgs) {
                     break;
                 }
 
+                appbox::gdb::GdbCommand::Kill => {
+                    return;
+                }
+
+                appbox::gdb::GdbCommand::BackwardsStep => {
+                    // Reset VM to initial state
+                    vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                    vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp).unwrap();
+
+                    // Reset warpspeed to beginning of trace
+                    warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
+
+                    // Remove any existing single step breakpoint
+                    if let Some(addr) = single_step_breakpoint.take() {
+                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                    }
+
+                    // Set breakpoint at PC - 4 (previous instruction)
+                    if initial_pc >= 4 {
+                        let prev_pc = initial_pc - 4;
+                        vm.hooks.add_breakpoint(prev_pc, &mut vm.vma).unwrap();
+                        single_step_breakpoint = Some(prev_pc);
+                    }
+                    break;
+                }
+
+                appbox::gdb::GdbCommand::BackwardsContinue => {
+                    // Reset VM to initial state
+                    vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                    vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp).unwrap();
+
+                    // Reset warpspeed to beginning of trace
+                    warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
+
+                    // Remove any existing single step breakpoint
+                    if let Some(addr) = single_step_breakpoint.take() {
+                        let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                    }
+                    break;
+                }
+
                 _ => {
-                    appbox::gdb::handle_command(cmd, &mut vm, &response_sender);
+                    handle_gdb_command(cmd, &mut vm, &response_sender);
                 }
             }
         }
@@ -148,9 +207,53 @@ pub fn replay(args: &cli::ReplayArgs) {
                             if let Ok(cmd) = command_receiver.recv() {
                                 match cmd {
                                     appbox::gdb::GdbCommand::Continue => break,
-                                    _ => {
-                                        appbox::gdb::handle_command(cmd, &mut vm, &response_sender)
+                                    appbox::gdb::GdbCommand::Kill => return,
+                                    appbox::gdb::GdbCommand::BackwardsStep => {
+                                        // Reset VM to initial state
+                                        vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                                        vm.vcpu
+                                            .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
+                                            .unwrap();
+
+                                        // Reset warpspeed to beginning of trace
+                                        warpspeed = warpspeed::Warpspeed::new(
+                                            trace.clone(),
+                                            warpspeed::Mode::Replay,
+                                        );
+
+                                        // Remove any existing single step breakpoint
+                                        if let Some(addr) = single_step_breakpoint.take() {
+                                            let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                                        }
+
+                                        // Set breakpoint at PC - 4 (previous instruction)
+                                        if initial_pc >= 4 {
+                                            let prev_pc = initial_pc - 4;
+                                            vm.hooks.add_breakpoint(prev_pc, &mut vm.vma).unwrap();
+                                            single_step_breakpoint = Some(prev_pc);
+                                        }
+                                        break;
                                     }
+                                    appbox::gdb::GdbCommand::BackwardsContinue => {
+                                        // Reset VM to initial state
+                                        vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                                        vm.vcpu
+                                            .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
+                                            .unwrap();
+
+                                        // Reset warpspeed to beginning of trace
+                                        warpspeed = warpspeed::Warpspeed::new(
+                                            trace.clone(),
+                                            warpspeed::Mode::Replay,
+                                        );
+
+                                        // Remove any existing single step breakpoint
+                                        if let Some(addr) = single_step_breakpoint.take() {
+                                            let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                                        }
+                                        break;
+                                    }
+                                    _ => handle_gdb_command(cmd, &mut vm, &response_sender),
                                 }
                             }
                         }

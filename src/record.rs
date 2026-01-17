@@ -3,7 +3,7 @@ use appbox::gdb::{GdbCommand, GdbResponse};
 use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
-use appbox::vm::VmManager;
+use appbox::vm::{VmManager, VmRunResult};
 use log::{debug, info, trace};
 use prost::Message;
 use std::fs::File;
@@ -109,25 +109,8 @@ pub fn record(args: &cli::RecordArgs) {
 
     loop {
         trace!("Running VCPU");
-        vm.vcpu.run().unwrap();
+        let run_result = vm.run().unwrap();
         trace!("VCPU exit");
-
-        let exit_info = vm.vcpu.get_exit_info();
-        let esr = vm.vcpu.get_sys_reg(av::SysReg::ESR_EL1).unwrap();
-        if exit_info.exception.syndrome & 0xf == 8  // Synchronous Exception from Lower EL using AArch64
-            && ExceptionClass::from(esr >> 26) == ExceptionClass::DataAbortLowerEl
-        {
-            let far = vm.vcpu.get_sys_reg(av::SysReg::FAR_EL1).unwrap();
-            if vm.vma.page_fault_dirty_state_handler(far) == Ok(true) {
-                trace!("Handled write page fault at {:#x}", far);
-                // Retry the instruction that caused the page fault
-                let elr = vm.vcpu.get_sys_reg(av::SysReg::ELR_EL1).unwrap();
-                vm.vcpu.set_reg(av::Reg::PC, elr).unwrap();
-                appbox::hyperpom::caches::Caches::tlbi_vaae1_on_fault(&mut vm.vcpu, &mut vm.vma)
-                    .unwrap();
-                continue;
-            }
-        }
 
         // while let Ok(cmd) = command_receiver.try_recv() {
         //     match cmd {
@@ -171,15 +154,112 @@ pub fn record(args: &cli::RecordArgs) {
         // }
 
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
-        let exit = match exit_info.reason {
-            av::ExitReason::EXCEPTION => {
-                match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
-                    ExceptionClass::HvcA64 => {
-                        let exit = warpspeed
-                            .trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)
-                            .unwrap();
+        let exit = match run_result {
+            VmRunResult::Svc => {
+                let exit = warpspeed
+                    .trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)
+                    .unwrap();
 
-                        if let ExitKind::Crash(_) = exit {
+                if let ExitKind::Crash(_) = exit {
+                    // Send SIGSEGV signal to GDB to indicate fault
+                    if let Some(ref sender) = notification_sender {
+                        appbox::gdb::send_sigsegv(sender);
+                    }
+
+                    // Enter GDB evaluation loop for system state inspection
+                    loop {
+                        if let Ok(cmd) = command_receiver.recv() {
+                            match cmd {
+                                appbox::gdb::GdbCommand::Continue => break,
+                                appbox::gdb::GdbCommand::Step => break,
+                                appbox::gdb::GdbCommand::Kill => return,
+                                _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
+                            }
+                        }
+                    }
+                }
+
+                exit
+            }
+            VmRunResult::Brk => {
+                let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+
+                // Check if this is our single step breakpoint
+                if Some(pc) == single_step_breakpoint {
+                    debug!("Single step completed at {:#x}", pc);
+                    vm.hooks
+                        .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
+                        .unwrap();
+                    // Remove the single step breakpoint
+                    vm.hooks.remove_breakpoint(pc, &mut vm.vma).unwrap();
+                    single_step_breakpoint = None;
+                    if let Some(ref sender) = notification_sender {
+                        sender
+                            .send(appbox::gdb::GdbNotification::Stop(
+                                5, // SIGTRAP
+                            ))
+                            .unwrap();
+                    }
+                    // Enter GDB evaluation loop for system state inspection
+                    loop {
+                        if let Ok(cmd) = command_receiver.recv() {
+                            match cmd {
+                                appbox::gdb::GdbCommand::Continue => break,
+                                appbox::gdb::GdbCommand::Step => {
+                                    let next_pc =
+                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma).unwrap();
+                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                                    single_step_breakpoint = Some(next_pc);
+                                    break;
+                                }
+                                appbox::gdb::GdbCommand::Kill => return,
+                                _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
+                            }
+                        }
+                    }
+                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma).unwrap();
+                    ExitKind::Continue
+                } else {
+                    debug!("Breakpoint hit at {:#x}", pc);
+                    // Restore original instruction
+                    vm.hooks
+                        .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
+                        .unwrap();
+                    if let Some(ref sender) = notification_sender {
+                        sender
+                            .send(appbox::gdb::GdbNotification::Stop(
+                                5, // SIGTRAP
+                            ))
+                            .unwrap();
+                    }
+                    // Enter GDB evaluation loop for system state inspection
+                    loop {
+                        if let Ok(cmd) = command_receiver.recv() {
+                            match cmd {
+                                appbox::gdb::GdbCommand::Continue => break,
+                                appbox::gdb::GdbCommand::Step => {
+                                    let next_pc =
+                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma).unwrap();
+                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                                    single_step_breakpoint = Some(next_pc);
+                                    break;
+                                }
+                                appbox::gdb::GdbCommand::Kill => return,
+                                _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
+                            }
+                        }
+                    }
+                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma).unwrap();
+                    ExitKind::Continue
+                }
+            }
+            VmRunResult::Other(exit_info) => match exit_info.reason {
+                av::ExitReason::EXCEPTION => {
+                    match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
+                        ExceptionClass::InsAbortLowerEl => {
+                            let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                            println!("Instruction Abort (Lower EL) at {:#x}", pc);
+
                             // Send SIGSEGV signal to GDB to indicate fault
                             if let Some(ref sender) = notification_sender {
                                 appbox::gdb::send_sigsegv(sender);
@@ -191,7 +271,6 @@ pub fn record(args: &cli::RecordArgs) {
                                     match cmd {
                                         appbox::gdb::GdbCommand::Continue => break,
                                         appbox::gdb::GdbCommand::Step => break,
-                                        appbox::gdb::GdbCommand::Kill => return,
                                         _ => appbox::gdb::handle_command(
                                             cmd,
                                             &mut vm,
@@ -200,133 +279,23 @@ pub fn record(args: &cli::RecordArgs) {
                                     }
                                 }
                             }
-                        }
 
-                        exit
+                            // Always crash after inspection - no recovery possible
+                            ExitKind::Crash("Instruction Abort".to_string())
+                        }
+                        _ => Err(ExceptionError::UnimplementedException(
+                            exit_info.exception.syndrome,
+                        ))
+                        .unwrap(),
                     }
-                    ExceptionClass::BrkA64 => {
-                        let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
-
-                        // Check if this is our single step breakpoint
-                        if Some(pc) == single_step_breakpoint {
-                            debug!("Single step completed at {:#x}", pc);
-                            vm.hooks
-                                .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
-                                .unwrap();
-                            // Remove the single step breakpoint
-                            vm.hooks.remove_breakpoint(pc, &mut vm.vma).unwrap();
-                            single_step_breakpoint = None;
-                            if let Some(ref sender) = notification_sender {
-                                sender
-                                    .send(appbox::gdb::GdbNotification::Stop(
-                                        5, // SIGTRAP
-                                    ))
-                                    .unwrap();
-                            }
-                            // Enter GDB evaluation loop for system state inspection
-                            loop {
-                                if let Ok(cmd) = command_receiver.recv() {
-                                    match cmd {
-                                        appbox::gdb::GdbCommand::Continue => break,
-                                        appbox::gdb::GdbCommand::Step => {
-                                            let next_pc = vm
-                                                .hooks
-                                                .compute_step_target(&vm.vcpu, &vm.vma)
-                                                .unwrap();
-                                            vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
-                                            single_step_breakpoint = Some(next_pc);
-                                            break;
-                                        }
-                                        appbox::gdb::GdbCommand::Kill => return,
-                                        _ => appbox::gdb::handle_command(
-                                            cmd,
-                                            &mut vm,
-                                            &response_sender,
-                                        ),
-                                    }
-                                }
-                            }
-                            appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)
-                                .unwrap();
-                            ExitKind::Continue
-                        } else {
-                            debug!("Breakpoint hit at {:#x}", pc);
-                            // Restore original instruction
-                            vm.hooks
-                                .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
-                                .unwrap();
-                            if let Some(ref sender) = notification_sender {
-                                sender
-                                    .send(appbox::gdb::GdbNotification::Stop(
-                                        5, // SIGTRAP
-                                    ))
-                                    .unwrap();
-                            }
-                            // Enter GDB evaluation loop for system state inspection
-                            loop {
-                                if let Ok(cmd) = command_receiver.recv() {
-                                    match cmd {
-                                        appbox::gdb::GdbCommand::Continue => break,
-                                        appbox::gdb::GdbCommand::Step => {
-                                            let next_pc = vm
-                                                .hooks
-                                                .compute_step_target(&vm.vcpu, &vm.vma)
-                                                .unwrap();
-                                            vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
-                                            single_step_breakpoint = Some(next_pc);
-                                            break;
-                                        }
-                                        appbox::gdb::GdbCommand::Kill => return,
-                                        _ => appbox::gdb::handle_command(
-                                            cmd,
-                                            &mut vm,
-                                            &response_sender,
-                                        ),
-                                    }
-                                }
-                            }
-                            appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)
-                                .unwrap();
-                            ExitKind::Continue
-                        }
-                    }
-                    ExceptionClass::InsAbortLowerEl => {
-                        let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
-                        println!("Instruction Abort (Lower EL) at {:#x}", pc);
-
-                        // Send SIGSEGV signal to GDB to indicate fault
-                        if let Some(ref sender) = notification_sender {
-                            appbox::gdb::send_sigsegv(sender);
-                        }
-
-                        // Enter GDB evaluation loop for system state inspection
-                        loop {
-                            if let Ok(cmd) = command_receiver.recv() {
-                                match cmd {
-                                    appbox::gdb::GdbCommand::Continue => break,
-                                    appbox::gdb::GdbCommand::Step => break,
-                                    _ => {
-                                        appbox::gdb::handle_command(cmd, &mut vm, &response_sender)
-                                    }
-                                }
-                            }
-                        }
-
-                        // Always crash after inspection - no recovery possible
-                        ExitKind::Crash("Instruction Abort".to_string())
-                    }
-                    _ => Err(ExceptionError::UnimplementedException(
-                        exit_info.exception.syndrome,
-                    ))
-                    .unwrap(),
                 }
-            }
-            av::ExitReason::CANCELED => ExitKind::Timeout,
-            av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-            av::ExitReason::UNKNOWN => panic!(
-                "Vcpu exited unexpectedly at address {:#x}",
-                vm.vcpu.get_reg(av::Reg::PC).unwrap()
-            ),
+                av::ExitReason::CANCELED => ExitKind::Timeout,
+                av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
+                av::ExitReason::UNKNOWN => panic!(
+                    "Vcpu exited unexpectedly at address {:#x}",
+                    vm.vcpu.get_reg(av::Reg::PC).unwrap()
+                ),
+            },
         };
 
         match exit {

@@ -1,5 +1,5 @@
 CODESIGN := codesign
-CARGO := cargo +nightly
+CARGO := cargo
 
 TARGET := warpspeed
 TARGET_RELEASE := target/release/$(TARGET)

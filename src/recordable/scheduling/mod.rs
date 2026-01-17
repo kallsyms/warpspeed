@@ -1,1 +1,4 @@
-include!(concat!(env!("OUT_DIR"), "/warpspeed.recordable.scheduling.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/warpspeed.recordable.scheduling.rs"
+));

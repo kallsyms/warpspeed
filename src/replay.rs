@@ -3,7 +3,7 @@ use appbox::gdb::{GdbCommand, GdbResponse};
 use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
-use appbox::vm::VmManager;
+use appbox::vm::{VmManager, VmRunResult};
 use log::{debug, info};
 use prost::Message;
 use std::path::PathBuf;
@@ -88,7 +88,7 @@ pub fn replay(args: &cli::ReplayArgs) {
     let mut single_step_breakpoint: Option<u64> = None;
 
     loop {
-        vm.vcpu.run().unwrap();
+        let run_result = vm.run().unwrap();
 
         while let Ok(cmd) = command_receiver.try_recv() {
             match cmd {
@@ -169,109 +169,114 @@ pub fn replay(args: &cli::ReplayArgs) {
         }
 
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
-        let exit_info = vm.vcpu.get_exit_info();
-        let exit = match exit_info.reason {
-            av::ExitReason::EXCEPTION => {
-                match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
-                    ExceptionClass::HvcA64 => warpspeed
-                        .trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)
-                        .unwrap(),
-                    ExceptionClass::BrkA64 => {
-                        let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+        let exit = match run_result {
+            VmRunResult::Svc => warpspeed
+                .trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)
+                .unwrap(),
+            VmRunResult::Brk => {
+                let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
 
-                        // Check if this is our single step breakpoint
-                        if Some(pc) == single_step_breakpoint {
-                            println!("Single step completed at {:#x}", pc);
-                            // Remove the single step breakpoint
-                            vm.hooks.remove_breakpoint(pc, &mut vm.vma).unwrap();
-                            single_step_breakpoint = None;
-                            // Don't handle as normal breakpoint since we removed it
-                            ExitKind::Continue
-                        } else {
-                            println!("Breakpoint hit at {:#x}", pc);
-                            ExitKind::Continue
-                        }
-                    }
-                    ExceptionClass::InsAbortLowerEl => {
-                        let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
-                        println!("Instruction Abort (Lower EL) at {:#x}", pc);
-
-                        // Send SIGSEGV signal to GDB to indicate fault
-                        if let Some(ref sender) = notification_sender {
-                            appbox::gdb::send_sigsegv(sender);
-                        }
-
-                        // Enter GDB evaluation loop for system state inspection
-                        loop {
-                            if let Ok(cmd) = command_receiver.recv() {
-                                match cmd {
-                                    appbox::gdb::GdbCommand::Continue => break,
-                                    appbox::gdb::GdbCommand::Kill => return,
-                                    appbox::gdb::GdbCommand::BackwardsStep => {
-                                        // Reset VM to initial state
-                                        vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
-                                        vm.vcpu
-                                            .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
-                                            .unwrap();
-
-                                        // Reset warpspeed to beginning of trace
-                                        warpspeed = warpspeed::Warpspeed::new(
-                                            trace.clone(),
-                                            warpspeed::Mode::Replay,
-                                        );
-
-                                        // Remove any existing single step breakpoint
-                                        if let Some(addr) = single_step_breakpoint.take() {
-                                            let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
-                                        }
-
-                                        // Set breakpoint at PC - 4 (previous instruction)
-                                        if initial_pc >= 4 {
-                                            let prev_pc = initial_pc - 4;
-                                            vm.hooks.add_breakpoint(prev_pc, &mut vm.vma).unwrap();
-                                            single_step_breakpoint = Some(prev_pc);
-                                        }
-                                        break;
-                                    }
-                                    appbox::gdb::GdbCommand::BackwardsContinue => {
-                                        // Reset VM to initial state
-                                        vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
-                                        vm.vcpu
-                                            .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
-                                            .unwrap();
-
-                                        // Reset warpspeed to beginning of trace
-                                        warpspeed = warpspeed::Warpspeed::new(
-                                            trace.clone(),
-                                            warpspeed::Mode::Replay,
-                                        );
-
-                                        // Remove any existing single step breakpoint
-                                        if let Some(addr) = single_step_breakpoint.take() {
-                                            let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
-                                        }
-                                        break;
-                                    }
-                                    _ => handle_gdb_command(cmd, &mut vm, &response_sender),
-                                }
-                            }
-                        }
-
-                        // Always crash after inspection - no recovery possible
-                        ExitKind::Crash("Instruction Abort".to_string())
-                    }
-                    _ => Err(ExceptionError::UnimplementedException(
-                        exit_info.exception.syndrome,
-                    ))
-                    .unwrap(),
+                // Check if this is our single step breakpoint
+                if Some(pc) == single_step_breakpoint {
+                    println!("Single step completed at {:#x}", pc);
+                    // Remove the single step breakpoint
+                    vm.hooks.remove_breakpoint(pc, &mut vm.vma).unwrap();
+                    single_step_breakpoint = None;
+                    // Don't handle as normal breakpoint since we removed it
+                    ExitKind::Continue
+                } else {
+                    println!("Breakpoint hit at {:#x}", pc);
+                    ExitKind::Continue
                 }
             }
-            av::ExitReason::CANCELED => ExitKind::Timeout,
-            av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-            av::ExitReason::UNKNOWN => panic!(
-                "Vcpu exited unexpectedly at address {:#x}",
-                vm.vcpu.get_reg(av::Reg::PC).unwrap()
-            ),
+            VmRunResult::Other(exit_info) => match exit_info.reason {
+                av::ExitReason::EXCEPTION => {
+                    match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
+                        ExceptionClass::InsAbortLowerEl => {
+                            let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                            println!("Instruction Abort (Lower EL) at {:#x}", pc);
+
+                            // Send SIGSEGV signal to GDB to indicate fault
+                            if let Some(ref sender) = notification_sender {
+                                appbox::gdb::send_sigsegv(sender);
+                            }
+
+                            // Enter GDB evaluation loop for system state inspection
+                            loop {
+                                if let Ok(cmd) = command_receiver.recv() {
+                                    match cmd {
+                                        appbox::gdb::GdbCommand::Continue => break,
+                                        appbox::gdb::GdbCommand::Kill => return,
+                                        appbox::gdb::GdbCommand::BackwardsStep => {
+                                            // Reset VM to initial state
+                                            vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                                            vm.vcpu
+                                                .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
+                                                .unwrap();
+
+                                            // Reset warpspeed to beginning of trace
+                                            warpspeed = warpspeed::Warpspeed::new(
+                                                trace.clone(),
+                                                warpspeed::Mode::Replay,
+                                            );
+
+                                            // Remove any existing single step breakpoint
+                                            if let Some(addr) = single_step_breakpoint.take() {
+                                                let _ =
+                                                    vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                                            }
+
+                                            // Set breakpoint at PC - 4 (previous instruction)
+                                            if initial_pc >= 4 {
+                                                let prev_pc = initial_pc - 4;
+                                                vm.hooks
+                                                    .add_breakpoint(prev_pc, &mut vm.vma)
+                                                    .unwrap();
+                                                single_step_breakpoint = Some(prev_pc);
+                                            }
+                                            break;
+                                        }
+                                        appbox::gdb::GdbCommand::BackwardsContinue => {
+                                            // Reset VM to initial state
+                                            vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                                            vm.vcpu
+                                                .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
+                                                .unwrap();
+
+                                            // Reset warpspeed to beginning of trace
+                                            warpspeed = warpspeed::Warpspeed::new(
+                                                trace.clone(),
+                                                warpspeed::Mode::Replay,
+                                            );
+
+                                            // Remove any existing single step breakpoint
+                                            if let Some(addr) = single_step_breakpoint.take() {
+                                                let _ =
+                                                    vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+                                            }
+                                            break;
+                                        }
+                                        _ => handle_gdb_command(cmd, &mut vm, &response_sender),
+                                    }
+                                }
+                            }
+
+                            // Always crash after inspection - no recovery possible
+                            ExitKind::Crash("Instruction Abort".to_string())
+                        }
+                        _ => Err(ExceptionError::UnimplementedException(
+                            exit_info.exception.syndrome,
+                        ))
+                        .unwrap(),
+                    }
+                }
+                av::ExitReason::CANCELED => ExitKind::Timeout,
+                av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
+                av::ExitReason::UNKNOWN => panic!(
+                    "Vcpu exited unexpectedly at address {:#x}",
+                    vm.vcpu.get_reg(av::Reg::PC).unwrap()
+                ),
+            },
         };
 
         match exit {

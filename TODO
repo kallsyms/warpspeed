@@ -3,7 +3,6 @@ Quick:
     * Implicitly rewrite as MAP_ANON + memory writes?
 
 Bigger:
-* Actually implement gdb stub
 * Thread scheduling
     * How to deal with blocking syscalls
 

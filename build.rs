@@ -2,16 +2,6 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[derive(Debug)]
-// Custom ParseCallbacks which forces all int macros to be u64
-struct ParseCallbacks;
-
-impl bindgen::callbacks::ParseCallbacks for ParseCallbacks {
-    fn int_macro(&self, _name: &str, _value: i64) -> Option<bindgen::callbacks::IntKind> {
-        Some(bindgen::callbacks::IntKind::U64)
-    }
-}
-
 fn main() {
     let sdkroot_bytes = Command::new("xcrun")
         .arg("--sdk")

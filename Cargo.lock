@@ -76,6 +76,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 [[package]]
 name = "appbox"
 version = "0.1.0"
+source = "git+https://github.com/kallsyms/appbox#9f90d19203a6c49b622ef7aab97bbe961b9d14ca"
 dependencies = [
  "anyhow",
  "applevisor",
@@ -1282,6 +1283,7 @@ dependencies = [
 name = "warpspeed"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "appbox",
  "bindgen",
  "clap",

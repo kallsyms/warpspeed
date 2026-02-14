@@ -5,7 +5,6 @@ use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
 use appbox::vm::{VmManager, VmRunResult};
 use log::{debug, info, trace};
-use prost::Message;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;

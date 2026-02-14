@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-#appbox = {git = "https://github.com/kallsyms/appbox"}
-appbox = {path = "../appbox"}
-clap = {version = "4.2.7", features = ["derive"]}
+anyhow = "1.0.100"
+appbox = { git = "https://github.com/kallsyms/appbox" }
+clap = { version = "4.2.7", features = ["derive"] }
 clap-verbosity-flag = "2.0.0"
 env_logger = "0.10.0"
 log = "0.4.17"

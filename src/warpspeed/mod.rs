@@ -56,7 +56,6 @@ pub struct Warpspeed {
     mode: Mode,
     event_idx: usize,
 
-    tsd: u64,
     trap_handler: DefaultTrapHandler,
 }
 
@@ -66,7 +65,6 @@ impl Warpspeed {
             trace,
             mode,
             event_idx: 0,
-            tsd: 0,
             trap_handler: DefaultTrapHandler::new(),
         }
     }
@@ -100,13 +98,6 @@ impl Warpspeed {
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
         let mut side_effects = recordable::SideEffects::default();
-        if num == 0x8000_0000 {
-            let code = args[3];
-            if code == 2 {
-                self.tsd = args[0];
-            }
-        }
-
         // Stage 2: do the syscall.
         // If recording:
         //   1. Snapshot "reachable" memory before the syscall
@@ -331,8 +322,6 @@ impl Warpspeed {
 
         debug!("Returning x0={:x} x1={:x} cpsr={:x}", ret0, ret1, cpsr);
         write_syscall_result(vcpu, elr, ret0, ret1, cflags)?;
-        vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, self.tsd)?;
-
         Ok(ExitKind::Continue)
     }
 }

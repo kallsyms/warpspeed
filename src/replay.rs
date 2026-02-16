@@ -4,6 +4,7 @@ use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
 use appbox::vm::{VmManager, VmRunResult};
+use anyhow::{Context, Result};
 use log::{debug, info};
 use prost::Message;
 use std::path::PathBuf;
@@ -20,15 +21,15 @@ fn handle_gdb_command(
     appbox::gdb::handle_command(cmd, vm, response_sender)
 }
 
-pub fn replay(args: &cli::ReplayArgs) {
-    let trace_file = std::fs::read(&args.trace_filename).unwrap();
-    let trace = Trace::decode(trace_file.as_slice()).unwrap();
+pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
+    let trace_file = std::fs::read(&args.trace_filename)?;
+    let trace = Trace::decode(trace_file.as_slice())?;
     debug!("Loaded trace with {} events", trace.events.len());
-    let target = trace.target.clone().unwrap();
+    let target = trace.target.clone().context("trace missing target")?;
 
     let mut warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
 
-    let mut vm = VmManager::new().unwrap();
+    let mut vm = VmManager::new()?;
 
     let loader = appbox::loader::load_macho(
         &mut vm,
@@ -36,12 +37,12 @@ pub fn replay(args: &cli::ReplayArgs) {
         target.arguments,
         target.environment,
     )
-    .unwrap();
+    ?;
 
-    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point).unwrap();
+    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
     vm.vcpu
         .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)
-        .unwrap();
+        ?;
 
     // Store initial state for backward execution
     let initial_pc = loader.entry_point;
@@ -64,7 +65,7 @@ pub fn replay(args: &cli::ReplayArgs) {
                     ..Default::default()
                 },
             )
-            .unwrap(),
+            ?,
         )
     } else {
         None
@@ -77,7 +78,7 @@ pub fn replay(args: &cli::ReplayArgs) {
                 if let Ok(cmd) = command_receiver.recv() {
                     match cmd {
                         appbox::gdb::GdbCommand::Continue => break,
-                        appbox::gdb::GdbCommand::Kill => return,
+                        appbox::gdb::GdbCommand::Kill => return Ok(()),
                         _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
                     }
                 }
@@ -88,7 +89,7 @@ pub fn replay(args: &cli::ReplayArgs) {
     let mut single_step_breakpoint: Option<u64> = None;
 
     loop {
-        let run_result = vm.run().unwrap();
+        let run_result = vm.run()?;
 
         while let Ok(cmd) = command_receiver.try_recv() {
             match cmd {
@@ -102,9 +103,9 @@ pub fn replay(args: &cli::ReplayArgs) {
 
                 appbox::gdb::GdbCommand::Step => {
                     // Get current instruction to determine next PC
-                    let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                    let pc = vm.vcpu.get_reg(av::Reg::PC)?;
                     let mut insn_bytes = [0; 4];
-                    vm.vma.read(pc, &mut insn_bytes).unwrap();
+                    vm.vma.read(pc, &mut insn_bytes)?;
 
                     // Remove previous single step breakpoint if it exists
                     if let Some(addr) = single_step_breakpoint.take() {
@@ -116,19 +117,19 @@ pub fn replay(args: &cli::ReplayArgs) {
                     let next_pc = pc + 4;
 
                     // Set new single step breakpoint
-                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
                     single_step_breakpoint = Some(next_pc);
                     break;
                 }
 
                 appbox::gdb::GdbCommand::Kill => {
-                    return;
+                    return Ok(());
                 }
 
                 appbox::gdb::GdbCommand::BackwardsStep => {
                     // Reset VM to initial state
-                    vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
-                    vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp).unwrap();
+                    vm.vcpu.set_reg(av::Reg::PC, initial_pc)?;
+                    vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp)?;
 
                     // Reset warpspeed to beginning of trace
                     warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
@@ -141,7 +142,7 @@ pub fn replay(args: &cli::ReplayArgs) {
                     // Set breakpoint at PC - 4 (previous instruction)
                     if initial_pc >= 4 {
                         let prev_pc = initial_pc - 4;
-                        vm.hooks.add_breakpoint(prev_pc, &mut vm.vma).unwrap();
+                        vm.hooks.add_breakpoint(prev_pc, &mut vm.vma)?;
                         single_step_breakpoint = Some(prev_pc);
                     }
                     break;
@@ -149,8 +150,8 @@ pub fn replay(args: &cli::ReplayArgs) {
 
                 appbox::gdb::GdbCommand::BackwardsContinue => {
                     // Reset VM to initial state
-                    vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
-                    vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp).unwrap();
+                    vm.vcpu.set_reg(av::Reg::PC, initial_pc)?;
+                    vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp)?;
 
                     // Reset warpspeed to beginning of trace
                     warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
@@ -170,17 +171,15 @@ pub fn replay(args: &cli::ReplayArgs) {
 
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
         let exit = match run_result {
-            VmRunResult::Svc => warpspeed
-                .trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)
-                .unwrap(),
+            VmRunResult::Svc => warpspeed.trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)?,
             VmRunResult::Brk => {
-                let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                let pc = vm.vcpu.get_reg(av::Reg::PC)?;
 
                 // Check if this is our single step breakpoint
                 if Some(pc) == single_step_breakpoint {
                     println!("Single step completed at {:#x}", pc);
                     // Remove the single step breakpoint
-                    vm.hooks.remove_breakpoint(pc, &mut vm.vma).unwrap();
+                    vm.hooks.remove_breakpoint(pc, &mut vm.vma)?;
                     single_step_breakpoint = None;
                     // Don't handle as normal breakpoint since we removed it
                     ExitKind::Continue
@@ -193,7 +192,7 @@ pub fn replay(args: &cli::ReplayArgs) {
                 av::ExitReason::EXCEPTION => {
                     match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
                         ExceptionClass::InsAbortLowerEl => {
-                            let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                            let pc = vm.vcpu.get_reg(av::Reg::PC)?;
                             println!("Instruction Abort (Lower EL) at {:#x}", pc);
 
                             // Send SIGSEGV signal to GDB to indicate fault
@@ -206,13 +205,13 @@ pub fn replay(args: &cli::ReplayArgs) {
                                 if let Ok(cmd) = command_receiver.recv() {
                                     match cmd {
                                         appbox::gdb::GdbCommand::Continue => break,
-                                        appbox::gdb::GdbCommand::Kill => return,
+                                        appbox::gdb::GdbCommand::Kill => return Ok(()),
                                         appbox::gdb::GdbCommand::BackwardsStep => {
                                             // Reset VM to initial state
-                                            vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                                            vm.vcpu.set_reg(av::Reg::PC, initial_pc)?;
                                             vm.vcpu
                                                 .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
-                                                .unwrap();
+                                                ?;
 
                                             // Reset warpspeed to beginning of trace
                                             warpspeed = warpspeed::Warpspeed::new(
@@ -231,17 +230,17 @@ pub fn replay(args: &cli::ReplayArgs) {
                                                 let prev_pc = initial_pc - 4;
                                                 vm.hooks
                                                     .add_breakpoint(prev_pc, &mut vm.vma)
-                                                    .unwrap();
+                                                    ?;
                                                 single_step_breakpoint = Some(prev_pc);
                                             }
                                             break;
                                         }
                                         appbox::gdb::GdbCommand::BackwardsContinue => {
                                             // Reset VM to initial state
-                                            vm.vcpu.set_reg(av::Reg::PC, initial_pc).unwrap();
+                                            vm.vcpu.set_reg(av::Reg::PC, initial_pc)?;
                                             vm.vcpu
                                                 .set_sys_reg(av::SysReg::SP_EL0, initial_sp)
-                                                .unwrap();
+                                                ?;
 
                                             // Reset warpspeed to beginning of trace
                                             warpspeed = warpspeed::Warpspeed::new(
@@ -264,18 +263,22 @@ pub fn replay(args: &cli::ReplayArgs) {
                             // Always crash after inspection - no recovery possible
                             ExitKind::Crash("Instruction Abort".to_string())
                         }
-                        _ => Err(ExceptionError::UnimplementedException(
-                            exit_info.exception.syndrome,
-                        ))
-                        .unwrap(),
+                        _ => {
+                            return Err(
+                                ExceptionError::UnimplementedException(
+                                    exit_info.exception.syndrome,
+                                )
+                                .into(),
+                            );
+                        }
                     }
                 }
                 av::ExitReason::CANCELED => ExitKind::Timeout,
                 av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-                av::ExitReason::UNKNOWN => panic!(
-                    "Vcpu exited unexpectedly at address {:#x}",
-                    vm.vcpu.get_reg(av::Reg::PC).unwrap()
-                ),
+                av::ExitReason::UNKNOWN => {
+                    let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                    panic!("Vcpu exited unexpectedly at address {:#x}", pc);
+                }
             },
         };
 
@@ -284,4 +287,6 @@ pub fn replay(args: &cli::ReplayArgs) {
             _ => break,
         };
     }
+
+    Ok(())
 }

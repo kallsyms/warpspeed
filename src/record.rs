@@ -4,6 +4,7 @@ use appbox::hyperpom::crash::ExitKind;
 use appbox::hyperpom::error::ExceptionError;
 use appbox::hyperpom::exceptions::ExceptionClass;
 use appbox::vm::{VmManager, VmRunResult};
+use anyhow::Result;
 use log::{debug, info, trace};
 use std::fs::File;
 use std::io::Write;
@@ -23,7 +24,7 @@ fn handle_gdb_command(
     appbox::gdb::handle_command(cmd, vm, response_sender)
 }
 
-pub fn record(args: &cli::RecordArgs) {
+pub fn record(args: &cli::RecordArgs) -> Result<()> {
     let mut argv = vec![args.executable.clone()];
     argv.extend_from_slice(&args.arguments);
     let env = vec![]; // TODO
@@ -42,16 +43,16 @@ pub fn record(args: &cli::RecordArgs) {
         warpspeed::Mode::Record,
     );
 
-    let mut vm = VmManager::new().unwrap();
+    let mut vm = VmManager::new()?;
 
     let loader =
         appbox::loader::load_macho(&mut vm, &PathBuf::from(args.executable.clone()), argv, env)
-            .unwrap();
+            ?;
 
-    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point).unwrap();
+    vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
     vm.vcpu
         .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)
-        .unwrap();
+        ?;
 
     // GDB server channels
     let (command_sender, command_receiver) = std::sync::mpsc::channel();
@@ -66,7 +67,7 @@ pub fn record(args: &cli::RecordArgs) {
                 None,
                 appbox::gdb::GdbFeatures::default(),
             )
-            .unwrap(),
+            ?,
         )
     } else {
         None
@@ -83,21 +84,21 @@ pub fn record(args: &cli::RecordArgs) {
                         appbox::gdb::GdbCommand::Continue => break,
                         appbox::gdb::GdbCommand::Step => {
                             // Get current instruction to determine next PC
-                            let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                            let pc = vm.vcpu.get_reg(av::Reg::PC)?;
                             let mut insn_bytes = [0; 4];
-                            vm.vma.read(pc, &mut insn_bytes).unwrap();
+                            vm.vma.read(pc, &mut insn_bytes)?;
 
                             // For now, assume next instruction is at PC + 4
                             // TODO: Enhance this to handle branches properly by using instruction emulation
                             let next_pc = pc + 4;
 
                             // Set new single step breakpoint
-                            vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                            vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
                             single_step_breakpoint = Some(next_pc);
                             break;
                         }
                         appbox::gdb::GdbCommand::Kill => {
-                            return;
+                            return Ok(());
                         }
                         _ => handle_gdb_command(cmd, &mut vm, &response_sender),
                     }
@@ -108,7 +109,7 @@ pub fn record(args: &cli::RecordArgs) {
 
     loop {
         trace!("Running VCPU");
-        let run_result = vm.run().unwrap();
+        let run_result = vm.run()?;
         trace!("VCPU exit");
 
         // while let Ok(cmd) = command_receiver.try_recv() {
@@ -155,9 +156,7 @@ pub fn record(args: &cli::RecordArgs) {
         // https://github.com/kallsyms/hyperpom/blob/a1dd1aebd8f306bb8549595d9d1506c2a361f0d7/src/core.rs#L1535
         let exit = match run_result {
             VmRunResult::Svc => {
-                let exit = warpspeed
-                    .trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)
-                    .unwrap();
+                let exit = warpspeed.trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)?;
 
                 if let ExitKind::Crash(_) = exit {
                     // Send SIGSEGV signal to GDB to indicate fault
@@ -171,7 +170,7 @@ pub fn record(args: &cli::RecordArgs) {
                             match cmd {
                                 appbox::gdb::GdbCommand::Continue => break,
                                 appbox::gdb::GdbCommand::Step => break,
-                                appbox::gdb::GdbCommand::Kill => return,
+                                appbox::gdb::GdbCommand::Kill => return Ok(()),
                                 _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
                             }
                         }
@@ -181,23 +180,23 @@ pub fn record(args: &cli::RecordArgs) {
                 exit
             }
             VmRunResult::Brk => {
-                let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                let pc = vm.vcpu.get_reg(av::Reg::PC)?;
 
                 // Check if this is our single step breakpoint
                 if Some(pc) == single_step_breakpoint {
                     debug!("Single step completed at {:#x}", pc);
                     vm.hooks
                         .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
-                        .unwrap();
+                        ?;
                     // Remove the single step breakpoint
-                    vm.hooks.remove_breakpoint(pc, &mut vm.vma).unwrap();
+                    vm.hooks.remove_breakpoint(pc, &mut vm.vma)?;
                     single_step_breakpoint = None;
                     if let Some(ref sender) = notification_sender {
                         sender
                             .send(appbox::gdb::GdbNotification::Stop(
                                 5, // SIGTRAP
                             ))
-                            .unwrap();
+                            ?;
                     }
                     // Enter GDB evaluation loop for system state inspection
                     loop {
@@ -206,30 +205,30 @@ pub fn record(args: &cli::RecordArgs) {
                                 appbox::gdb::GdbCommand::Continue => break,
                                 appbox::gdb::GdbCommand::Step => {
                                     let next_pc =
-                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma).unwrap();
-                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma)?;
+                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
                                     single_step_breakpoint = Some(next_pc);
                                     break;
                                 }
-                                appbox::gdb::GdbCommand::Kill => return,
+                                appbox::gdb::GdbCommand::Kill => return Ok(()),
                                 _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
                             }
                         }
                     }
-                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma).unwrap();
+                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)?;
                     ExitKind::Continue
                 } else {
                     debug!("Breakpoint hit at {:#x}", pc);
                     // Restore original instruction
                     vm.hooks
                         .prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)
-                        .unwrap();
+                        ?;
                     if let Some(ref sender) = notification_sender {
                         sender
                             .send(appbox::gdb::GdbNotification::Stop(
                                 5, // SIGTRAP
                             ))
-                            .unwrap();
+                            ?;
                     }
                     // Enter GDB evaluation loop for system state inspection
                     loop {
@@ -238,17 +237,17 @@ pub fn record(args: &cli::RecordArgs) {
                                 appbox::gdb::GdbCommand::Continue => break,
                                 appbox::gdb::GdbCommand::Step => {
                                     let next_pc =
-                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma).unwrap();
-                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma)?;
+                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
                                     single_step_breakpoint = Some(next_pc);
                                     break;
                                 }
-                                appbox::gdb::GdbCommand::Kill => return,
+                                appbox::gdb::GdbCommand::Kill => return Ok(()),
                                 _ => appbox::gdb::handle_command(cmd, &mut vm, &response_sender),
                             }
                         }
                     }
-                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma).unwrap();
+                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)?;
                     ExitKind::Continue
                 }
             }
@@ -256,7 +255,7 @@ pub fn record(args: &cli::RecordArgs) {
                 av::ExitReason::EXCEPTION => {
                     match ExceptionClass::from(exit_info.exception.syndrome >> 26) {
                         ExceptionClass::InsAbortLowerEl => {
-                            let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
+                            let pc = vm.vcpu.get_reg(av::Reg::PC)?;
                             println!("Instruction Abort (Lower EL) at {:#x}", pc);
 
                             // Send SIGSEGV signal to GDB to indicate fault
@@ -282,18 +281,22 @@ pub fn record(args: &cli::RecordArgs) {
                             // Always crash after inspection - no recovery possible
                             ExitKind::Crash("Instruction Abort".to_string())
                         }
-                        _ => Err(ExceptionError::UnimplementedException(
-                            exit_info.exception.syndrome,
-                        ))
-                        .unwrap(),
+                        _ => {
+                            return Err(
+                                ExceptionError::UnimplementedException(
+                                    exit_info.exception.syndrome,
+                                )
+                                .into(),
+                            );
+                        }
                     }
                 }
                 av::ExitReason::CANCELED => ExitKind::Timeout,
                 av::ExitReason::VTIMER_ACTIVATED => unimplemented!(),
-                av::ExitReason::UNKNOWN => panic!(
-                    "Vcpu exited unexpectedly at address {:#x}",
-                    vm.vcpu.get_reg(av::Reg::PC).unwrap()
-                ),
+                av::ExitReason::UNKNOWN => {
+                    let pc = vm.vcpu.get_reg(av::Reg::PC)?;
+                    panic!("Vcpu exited unexpectedly at address {:#x}", pc);
+                }
             },
         };
 
@@ -303,8 +306,10 @@ pub fn record(args: &cli::RecordArgs) {
         };
     }
 
-    let mut output = File::create(&args.trace_filename).unwrap();
+    let mut output = File::create(&args.trace_filename)?;
     output
         .write_all(prost::Message::encode_to_vec(&warpspeed.trace).as_slice())
-        .unwrap();
+        ?;
+
+    Ok(())
 }

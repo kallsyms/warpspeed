@@ -1,5 +1,6 @@
 use std::ffi::CString;
 
+use anyhow::Result;
 use clap::Parser;
 use log::debug;
 
@@ -10,7 +11,7 @@ mod replay;
 mod util;
 mod warpspeed;
 
-fn main() {
+fn main() -> Result<()> {
     let args = cli::Cli::parse();
 
     env_logger::Builder::new()
@@ -42,7 +43,11 @@ fn main() {
                 );
             }
 
-            let executable = CString::new(std::env::args().next().unwrap()).unwrap();
+            let executable = CString::new(
+                std::env::args()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing argv[0]"))?,
+            )?;
             let mut all_args = std::env::args().collect::<Vec<_>>();
             all_args.insert(1, "--stage2".to_string());
             let argv = util::CStringArray::new(&all_args);
@@ -63,18 +68,20 @@ fn main() {
                 panic!("posix_spawn failed: {}", std::io::Error::last_os_error());
             }
 
-            nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None).unwrap();
+            nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)?;
         }
 
-        return;
+        return Ok(());
     }
 
     match args.command {
         cli::Command::Record(args) => {
-            record::record(&args);
+            record::record(&args)?;
         }
         cli::Command::Replay(args) => {
-            replay::replay(&args);
+            replay::replay(&args)?;
         }
     }
+
+    Ok(())
 }

@@ -177,10 +177,9 @@ impl Warpspeed {
                         }
 
                         let side_effects_ref = syscall.side_effects.as_ref().unwrap();
-                        let should_call = side_effects_ref.external || num == 0x8000_0000;
                         let mut res: Option<SyscallResult> = None;
 
-                        if should_call {
+                        if side_effects_ref.external {
                             trace!("Replay syscall index {}", self.event_idx);
                             let handler_res =
                                 self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
@@ -293,6 +292,7 @@ impl Warpspeed {
                 side_effects.external = true;
             }
 
+            // And these are needed to get memory mappings correct.
             if num == syscalls::SYS_mmap
                 || num == syscalls::TRAP_mach_vm_allocate
                 || num == syscalls::TRAP_mach_vm_map
@@ -304,6 +304,16 @@ impl Warpspeed {
                 if msgh_id == 4811 {
                     side_effects.external = true;
                 }
+            }
+
+            // And finally, exit() so appbox returns out ExitKind::Exit.
+            if num == syscalls::SYS_exit {
+                side_effects.external = true;
+            }
+
+            // XXX: kinda hack. platform syscalls dealing with TSD are replayed so appbox's TSD management handles things correctly later
+            if num == 0x8000_0000 {
+                side_effects.external = true;
             }
 
             self.trace.events.push(recordable::LogEvent {

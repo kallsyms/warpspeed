@@ -21,3 +21,9 @@ prost-build = "0.11.8"
 [[bin]]
 name = "warpspeed"
 path = "src/main.rs"
+
+[profile.dev.package.appbox]
+opt-level = 3
+
+[profile.test.package.appbox]
+opt-level = 3

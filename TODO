@@ -5,6 +5,14 @@ Quick:
 Bigger:
 * Thread scheduling
     * How to deal with blocking syscalls
+* Multi-threaded target applications
+    * Requires:
+        * Configuring multiple vCPUs in the VM
+        * Tracking when each thread is running in the recording
+* Proper signal/interrupt record+replay
+    * Requires:
+        * PC+state tracking when signal is received. Ideally we could use PMU values to record "this happened XYZ instructions into the program running" however these do not appear to be exposed on macOS in a useful way. PC alone is not specific enough to accurately record program state at time of interrupt.
+        * Replay of the same.
 
 Probably will never get to but for technical completeness:
 * "Send" SIGILL/SIGSEGV to target (i.e. jump to handler if registered) if we get a corresponding trap

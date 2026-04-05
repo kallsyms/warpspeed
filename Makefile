@@ -14,3 +14,7 @@ build-release:
 build-debug:
 	$(CARGO) build
 	$(CODESIGN) --entitlements warpspeed.entitlements --force -s - "$(TARGET_DEBUG)"
+
+.PHONY: test
+test:
+	./scripts/cargo-test-signed.sh

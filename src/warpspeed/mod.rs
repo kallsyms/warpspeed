@@ -138,13 +138,13 @@ pub struct Warpspeed {
 }
 
 impl Warpspeed {
-    pub fn new(trace: recordable::Trace, mode: Mode) -> Self {
-        Self {
+    pub fn new(trace: recordable::Trace, mode: Mode) -> Result<Self> {
+        Ok(Self {
             trace,
             mode,
             event_idx: 0,
-            trap_handler: DefaultTrapHandler::new(),
-        }
+            trap_handler: DefaultTrapHandler::new()?,
+        })
     }
 
     pub fn trap_handler(

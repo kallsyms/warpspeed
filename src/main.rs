@@ -2,7 +2,7 @@ use std::ffi::CString;
 
 use anyhow::Result;
 use clap::Parser;
-use log::debug;
+use log::{debug, warn};
 
 mod cli;
 mod record;
@@ -10,6 +10,18 @@ mod recordable;
 mod replay;
 mod util;
 mod warpspeed;
+
+const STAGE2_RETRY_EXIT_CODE: i32 = 200;
+const MAX_STAGE2_RETRIES: usize = 256;
+
+fn should_retry_stage2(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(nix::libc::ENOMEM)
+    })
+}
 
 fn main() -> Result<()> {
     let args = cli::Cli::parse();
@@ -21,8 +33,6 @@ fn main() -> Result<()> {
     if !args.stage2 {
         debug!("Re-execing with no ASLR");
         unsafe {
-            let mut pid: nix::libc::pid_t = 0;
-
             let mut attr: nix::libc::posix_spawnattr_t = std::mem::zeroed();
             let res = nix::libc::posix_spawnattr_init(&mut attr);
             if res != 0 {
@@ -56,31 +66,58 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>();
             let env = util::CStringArray::new(&all_env)?;
 
-            let res = nix::libc::posix_spawn(
-                &mut pid,
-                executable.as_ptr(),
-                std::ptr::null(),
-                &attr,
-                argv.as_ptr(),
-                env.as_ptr(),
-            );
-            if res != 0 {
-                panic!("posix_spawn failed: {}", std::io::Error::last_os_error());
+            for attempt in 1..=MAX_STAGE2_RETRIES {
+                let mut pid: nix::libc::pid_t = 0;
+                let res = nix::libc::posix_spawn(
+                    &mut pid,
+                    executable.as_ptr(),
+                    std::ptr::null(),
+                    &attr,
+                    argv.as_ptr(),
+                    env.as_ptr(),
+                );
+                if res != 0 {
+                    panic!("posix_spawn failed: {}", std::io::Error::last_os_error());
+                }
+
+                match nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)? {
+                    nix::sys::wait::WaitStatus::Exited(_, 0) => return Ok(()),
+                    nix::sys::wait::WaitStatus::Exited(_, STAGE2_RETRY_EXIT_CODE) => {
+                        if attempt == MAX_STAGE2_RETRIES {
+                            return Err(anyhow::anyhow!(
+                                "stage2 failed {} times with retryable fixed mapping pool reservation errors",
+                                MAX_STAGE2_RETRIES
+                            ));
+                        }
+                        warn!(
+                            "Retrying stage2 after fixed mapping pool reservation failure (attempt {}/{})",
+                            attempt,
+                            MAX_STAGE2_RETRIES
+                        );
+                    }
+                    nix::sys::wait::WaitStatus::Exited(_, code) => std::process::exit(code),
+                    status => {
+                        return Err(anyhow::anyhow!("unexpected child wait status: {:?}", status));
+                    }
+                }
             }
-
-            nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)?;
         }
-
-        return Ok(());
     }
 
-    match args.command {
+    let result = match args.command {
         cli::Command::Record(args) => {
-            record::record(&args)?;
+            record::record(&args)
         }
         cli::Command::Replay(args) => {
-            replay::replay(&args)?;
+            replay::replay(&args)
         }
+    };
+
+    if let Err(err) = result {
+        if should_retry_stage2(&err) {
+            std::process::exit(STAGE2_RETRY_EXIT_CODE);
+        }
+        return Err(err);
     }
 
     Ok(())

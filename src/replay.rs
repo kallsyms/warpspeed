@@ -27,7 +27,7 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
     debug!("Loaded trace with {} events", trace.events.len());
     let target = trace.target.clone().context("trace missing target")?;
 
-    let mut warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
+    let mut warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay)?;
 
     let mut vm = VmManager::new()?;
 
@@ -132,7 +132,8 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
                     vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp)?;
 
                     // Reset warpspeed to beginning of trace
-                    warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
+                    warpspeed =
+                        warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay)?;
 
                     // Remove any existing single step breakpoint
                     if let Some(addr) = single_step_breakpoint.take() {
@@ -154,7 +155,8 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
                     vm.vcpu.set_sys_reg(av::SysReg::SP_EL0, initial_sp)?;
 
                     // Reset warpspeed to beginning of trace
-                    warpspeed = warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay);
+                    warpspeed =
+                        warpspeed::Warpspeed::new(trace.clone(), warpspeed::Mode::Replay)?;
 
                     // Remove any existing single step breakpoint
                     if let Some(addr) = single_step_breakpoint.take() {
@@ -217,7 +219,7 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
                                             warpspeed = warpspeed::Warpspeed::new(
                                                 trace.clone(),
                                                 warpspeed::Mode::Replay,
-                                            );
+                                            )?;
 
                                             // Remove any existing single step breakpoint
                                             if let Some(addr) = single_step_breakpoint.take() {
@@ -246,7 +248,7 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
                                             warpspeed = warpspeed::Warpspeed::new(
                                                 trace.clone(),
                                                 warpspeed::Mode::Replay,
-                                            );
+                                            )?;
 
                                             // Remove any existing single step breakpoint
                                             if let Some(addr) = single_step_breakpoint.take() {

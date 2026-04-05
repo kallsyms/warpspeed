@@ -41,7 +41,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
             events: vec![],
         },
         warpspeed::Mode::Record,
-    );
+    )?;
 
     let mut vm = VmManager::new()?;
 

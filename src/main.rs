@@ -50,11 +50,11 @@ fn main() -> Result<()> {
             )?;
             let mut all_args = std::env::args().collect::<Vec<_>>();
             all_args.insert(1, "--stage2".to_string());
-            let argv = util::CStringArray::new(&all_args);
+            let argv = util::CStringArray::new(&all_args)?;
             let all_env = std::env::vars()
                 .map(|(k, v)| format!("{}={}", k, v))
                 .collect::<Vec<_>>();
-            let env = util::CStringArray::new(&all_env);
+            let env = util::CStringArray::new(&all_env)?;
 
             let res = nix::libc::posix_spawn(
                 &mut pid,

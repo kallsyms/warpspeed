@@ -45,6 +45,84 @@ fn diff_memory(page_addr: u64, old: &[u8], new: &[u8]) -> Vec<side_effects::Memo
     side_effects
 }
 
+#[cfg(test)]
+mod tests {
+    use super::diff_memory;
+    use crate::recordable::side_effects;
+
+    #[test]
+    fn diff_memory_returns_no_ranges_when_pages_match() {
+        let page = 0x1000;
+        let old = [0u8; 8];
+        let new = [0u8; 8];
+
+        assert!(diff_memory(page, &old, &new).is_empty());
+    }
+
+    #[test]
+    fn diff_memory_returns_single_range_for_contiguous_change() {
+        let page = 0x2000;
+        let old = [0, 1, 2, 3, 4, 5];
+        let new = [0, 1, 9, 8, 7, 5];
+
+        assert_eq!(
+            diff_memory(page, &old, &new),
+            vec![side_effects::Memory {
+                address: page + 2,
+                value: vec![9, 8, 7],
+            }]
+        );
+    }
+
+    #[test]
+    fn diff_memory_splits_disjoint_changes() {
+        let page = 0x3000;
+        let old = [1, 2, 3, 4, 5, 6, 7];
+        let new = [1, 9, 8, 4, 5, 0, 7];
+
+        assert_eq!(
+            diff_memory(page, &old, &new),
+            vec![
+                side_effects::Memory {
+                    address: page + 1,
+                    value: vec![9, 8],
+                },
+                side_effects::Memory {
+                    address: page + 5,
+                    value: vec![0],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_memory_captures_changes_at_start_and_end() {
+        let page = 0x4000;
+        let old = [1, 2, 3, 4, 5];
+        let new = [7, 2, 3, 4, 9];
+
+        assert_eq!(
+            diff_memory(page, &old, &new),
+            vec![
+                side_effects::Memory {
+                    address: page,
+                    value: vec![7],
+                },
+                side_effects::Memory {
+                    address: page + 4,
+                    value: vec![9],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn diff_memory_requires_equal_sized_inputs() {
+        let _ = diff_memory(0x5000, &[1, 2], &[1]);
+    }
+}
+
 #[derive(PartialEq)]
 pub enum Mode {
     Record,

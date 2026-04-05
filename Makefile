@@ -5,6 +5,9 @@ TARGET := warpspeed
 TARGET_RELEASE := target/release/$(TARGET)
 TARGET_DEBUG := target/debug/$(TARGET)
 
+.PHONY: build
+build: build-debug
+
 .PHONY: build-release
 build-release:
 	$(CARGO) build --release

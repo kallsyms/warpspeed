@@ -175,6 +175,7 @@ impl Warpspeed {
         let mut ret0: u64 = 0;
         let mut ret1: u64 = 0;
         let mut cflags: u64 = 0;
+        let mut exit_kind = ExitKind::Continue;
         let mut side_effects = recordable::SideEffects::default();
         // Stage 2: do the syscall.
         // If recording:
@@ -192,8 +193,9 @@ impl Warpspeed {
                 }
 
                 let res = self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
-                if res.exit != ExitKind::Continue {
-                    return Ok(res.exit);
+                exit_kind = res.exit.clone();
+                if exit_kind != ExitKind::Continue && exit_kind != ExitKind::Exit {
+                    return Ok(exit_kind);
                 }
                 ret0 = res.ret0;
                 ret1 = res.ret1;
@@ -407,6 +409,10 @@ impl Warpspeed {
         }
 
         self.event_idx += 1;
+
+        if exit_kind != ExitKind::Continue {
+            return Ok(exit_kind);
+        }
 
         debug!("Returning x0={:x} x1={:x} cpsr={:x}", ret0, ret1, cpsr);
         write_syscall_result(vcpu, elr, ret0, ret1, cflags)?;

@@ -10,6 +10,7 @@ mod recordable;
 mod replay;
 mod util;
 mod warpspeed;
+mod shared_files;
 
 const STAGE2_RETRY_EXIT_CODE: i32 = 200;
 const MAX_STAGE2_RETRIES: usize = 256;

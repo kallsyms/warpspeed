@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use appbox::hyperpom::memory::VirtMemAllocator;
 use appbox::loader::Loader;
 use log::{debug, error, trace};
@@ -14,6 +14,7 @@ use appbox::trap::{
 
 use crate::recordable;
 use crate::recordable::side_effects;
+use crate::shared_files::{self, FdState, ShadowFile};
 
 fn diff_memory(page_addr: u64, old: &[u8], new: &[u8]) -> Vec<side_effects::Memory> {
     let mut side_effects = vec![];
@@ -135,16 +136,204 @@ pub struct Warpspeed {
     event_idx: usize,
 
     trap_handler: DefaultTrapHandler,
+    fd_table: HashMap<i32, FdState>,
+    shared_file_ids_by_identity: HashMap<(u64, u64), u64>,
+    shared_files_by_id: HashMap<u64, recordable::trace::SharedFile>,
+    shadow_files: HashMap<u64, ShadowFile>,
 }
 
 impl Warpspeed {
     pub fn new(trace: recordable::Trace, mode: Mode) -> Result<Self> {
+        let shared_file_ids_by_identity = trace
+            .shared_files
+            .iter()
+            .map(|shared_file| {
+                (
+                    (shared_file.device, shared_file.inode),
+                    shared_file.id,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let shared_files_by_id = trace
+            .shared_files
+            .iter()
+            .cloned()
+            .map(|shared_file| (shared_file.id, shared_file))
+            .collect::<HashMap<_, _>>();
+
         Ok(Self {
             trace,
             mode,
             event_idx: 0,
             trap_handler: DefaultTrapHandler::new()?,
+            fd_table: HashMap::new(),
+            shared_file_ids_by_identity,
+            shared_files_by_id,
+            shadow_files: HashMap::new(),
         })
+    }
+
+    fn syscall_failed(cflags: u64) -> bool {
+        cflags & (1 << 29) != 0
+    }
+
+    fn fd_arg_for_shared_file_syscall(num: u64, args: &[u64; 16]) -> Option<i32> {
+        match num {
+            syscalls::SYS_write
+            | syscalls::SYS_write_nocancel
+            | syscalls::SYS_pwrite
+            | syscalls::SYS_pwrite_nocancel
+            | syscalls::SYS_ftruncate => Some(args[0] as i32),
+            _ => None,
+        }
+    }
+
+    fn shared_file_id_for_fd(&self, fd: i32) -> Option<u64> {
+        let state = self.fd_table.get(&fd)?;
+        self.shared_file_ids_by_identity
+            .get(&(state.device, state.inode))
+            .copied()
+    }
+
+    fn update_fd_table(&mut self, num: u64, args: &[u64; 16], ret0: u64, cflags: u64) -> Result<()> {
+        if Self::syscall_failed(cflags) {
+            return Ok(());
+        }
+
+        match num {
+            syscalls::SYS_open
+            | syscalls::SYS_openat
+            | syscalls::SYS_open_nocancel
+            | syscalls::SYS_openat_nocancel => {
+                let fd = ret0 as i32;
+                self.fd_table.insert(fd, FdState::from_fd(fd)?);
+            }
+            syscalls::SYS_dup => {
+                let src = args[0] as i32;
+                let dst = ret0 as i32;
+                if let Some(state) = self.fd_table.get(&src).cloned() {
+                    self.fd_table.insert(dst, state);
+                }
+            }
+            syscalls::SYS_dup2 => {
+                let src = args[0] as i32;
+                let dst = ret0 as i32;
+                if let Some(state) = self.fd_table.get(&src).cloned() {
+                    self.fd_table.insert(dst, state);
+                }
+            }
+            syscalls::SYS_close | syscalls::SYS_close_nocancel => {
+                self.fd_table.remove(&(args[0] as i32));
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn record_shared_map(
+        &mut self,
+        num: u64,
+        args: &[u64; 16],
+        cflags: u64,
+    ) -> Result<Option<recordable::syscall::syscall::SharedMap>> {
+        if num != syscalls::SYS_mmap || Self::syscall_failed(cflags) {
+            return Ok(None);
+        }
+
+        let flags = args[3] as i32;
+        if flags & nix::libc::MAP_SHARED == 0 || flags & nix::libc::MAP_ANON != 0 {
+            return Ok(None);
+        }
+
+        let fd = args[4] as i32;
+        if fd < 0 {
+            return Ok(None);
+        }
+
+        let fd_state = self
+            .fd_table
+            .get(&fd)
+            .cloned()
+            .with_context(|| format!("missing fd tracking for shared mmap fd {}", fd))?;
+        if !fd_state.is_regular {
+            return Ok(None);
+        }
+
+        let identity = (fd_state.device, fd_state.inode);
+        let shared_file_id = if let Some(id) = self.shared_file_ids_by_identity.get(&identity) {
+            *id
+        } else {
+            let stat = nix::sys::stat::fstat(fd)
+                .with_context(|| format!("fstat failed for shared mmap fd {}", fd))?;
+            let contents = shared_files::read_fd_contents(fd, stat.st_size.max(0) as usize)?;
+            let id = self.trace.shared_files.len() as u64 + 1;
+            let shared_file = recordable::trace::SharedFile {
+                id,
+                path: fd_state.path,
+                device: fd_state.device,
+                inode: fd_state.inode,
+                size: contents.len() as u64,
+                initial_contents: contents,
+            };
+            self.trace.shared_files.push(shared_file.clone());
+            self.shared_file_ids_by_identity.insert(identity, id);
+            self.shared_files_by_id.insert(id, shared_file);
+            id
+        };
+
+        Ok(Some(recordable::syscall::syscall::SharedMap {
+            shared_file_id,
+            file_offset: args[5],
+            map_length: args[1],
+            recorded_fd: fd,
+        }))
+    }
+
+    fn ensure_shadow_file(&mut self, shared_file_id: u64) -> Result<()> {
+        if self.shadow_files.contains_key(&shared_file_id) {
+            return Ok(());
+        }
+
+        let shared_file = self
+            .shared_files_by_id
+            .get(&shared_file_id)
+            .cloned()
+            .with_context(|| format!("missing shared file {}", shared_file_id))?;
+        let shadow_file = ShadowFile::from_snapshot(&shared_file)?;
+        self.shadow_files.insert(shared_file_id, shadow_file);
+        Ok(())
+    }
+
+    fn rebind_fd_to_shadow_file(&mut self, fd: i32, shared_file_id: u64) -> Result<()> {
+        self.ensure_shadow_file(shared_file_id)?;
+        let shadow_file = self
+            .shadow_files
+            .get(&shared_file_id)
+            .context("shadow file disappeared unexpectedly")?;
+        shared_files::rebind_fd(fd, shadow_file.fd())
+    }
+
+    fn prepare_replay_external_syscall(
+        &mut self,
+        num: u64,
+        args: &[u64; 16],
+        syscall: &recordable::syscall::Syscall,
+    ) -> Result<()> {
+        if num == syscalls::SYS_mmap {
+            if let Some(shared_map) = &syscall.shared_map {
+                self.rebind_fd_to_shadow_file(shared_map.recorded_fd, shared_map.shared_file_id)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(fd) = Self::fd_arg_for_shared_file_syscall(num, args) {
+            if let Some(shared_file_id) = self.shared_file_id_for_fd(fd) {
+                self.rebind_fd_to_shadow_file(fd, shared_file_id)?;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn trap_handler(
@@ -177,6 +366,7 @@ impl Warpspeed {
         let mut cflags: u64 = 0;
         let mut exit_kind = ExitKind::Continue;
         let mut side_effects = recordable::SideEffects::default();
+        let mut shared_map = None;
         // Stage 2: do the syscall.
         // If recording:
         //   1. Snapshot "reachable" memory before the syscall
@@ -236,6 +426,7 @@ impl Warpspeed {
                         .map(|m| (m.address, m.address + m.value.len() as u64))
                         .collect::<Vec<_>>()
                 );
+                shared_map = self.record_shared_map(num, &args, cflags)?;
             }
             Mode::Replay => {
                 let event = &self.trace.events[self.event_idx];
@@ -249,6 +440,7 @@ impl Warpspeed {
 
                 match &event.event {
                     Some(crate::recordable::log_event::Event::Syscall(syscall)) => {
+                        let syscall = syscall.clone();
                         if num != syscall.syscall_number {
                             error!(
                                 "Replay {}: syscall mismatch: expected 0x{:x}, got 0x{:x}",
@@ -260,6 +452,7 @@ impl Warpspeed {
                         let mut res: Option<SyscallResult> = None;
 
                         if side_effects_ref.external {
+                            self.prepare_replay_external_syscall(num, &args, &syscall)?;
                             trace!("Replay syscall index {}", self.event_idx);
                             let handler_res =
                                 self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
@@ -372,6 +565,12 @@ impl Warpspeed {
                 side_effects.external = true;
             }
 
+            if let Some(fd) = Self::fd_arg_for_shared_file_syscall(num, &args) {
+                if self.shared_file_id_for_fd(fd).is_some() {
+                    side_effects.external = true;
+                }
+            }
+
             // And these are needed to get memory mappings correct.
             if num == syscalls::SYS_mmap
                 || num == syscalls::TRAP_mach_vm_allocate
@@ -403,11 +602,13 @@ impl Warpspeed {
                     recordable::syscall::Syscall {
                         syscall_number: num as _,
                         side_effects: Some(side_effects),
+                        shared_map,
                     },
                 )),
             });
         }
 
+        self.update_fd_table(num, &args, ret0, cflags)?;
         self.event_idx += 1;
 
         if exit_kind != ExitKind::Continue {

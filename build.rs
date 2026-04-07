@@ -3,6 +3,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/recordable/recordable.proto");
+    println!("cargo:rerun-if-changed=src/recordable/side_effects.proto");
+    println!("cargo:rerun-if-changed=src/recordable/syscall/syscall.proto");
+    println!("cargo:rerun-if-changed=src/recordable/scheduling/scheduling.proto");
+
     let sdkroot_bytes = Command::new("xcrun")
         .arg("--sdk")
         .arg("macosx")

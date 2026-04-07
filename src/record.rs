@@ -39,6 +39,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
         Trace {
             target: Some(target),
             events: vec![],
+            shared_files: vec![],
         },
         warpspeed::Mode::Record,
     )?;

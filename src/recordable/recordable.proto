@@ -16,8 +16,18 @@ message Trace {
     repeated string environment = 3;
   }
 
+  message SharedFile {
+    uint64 id = 1;
+    string path = 2;
+    uint64 device = 3;
+    uint64 inode = 4;
+    uint64 size = 5;
+    bytes initial_contents = 6;
+  }
+
   Target target = 1;
   repeated LogEvent events = 2;
+  repeated SharedFile shared_files = 3;
 }
 
 // LogEvent is a single event in the trace.

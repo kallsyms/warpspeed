@@ -8,6 +8,14 @@ import "src/recordable/side_effects.proto";
 // platform specific syscall.
 // Basically anything that is SVC'd into.
 message Syscall {
+  message SharedMap {
+    uint64 shared_file_id = 1;
+    uint64 file_offset = 2;
+    uint64 map_length = 3;
+    int32 recorded_fd = 4;
+  }
+
   uint64 syscall_number = 1;
   warpspeed.recordable.SideEffects side_effects = 2;
+  SharedMap shared_map = 3;
 }

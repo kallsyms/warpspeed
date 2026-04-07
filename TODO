@@ -1,6 +1,5 @@
 Quick:
 * Figure out how to best deal with mmap'd files
-    * Implicitly rewrite as MAP_ANON + memory writes?
 
 Bigger:
 * Thread scheduling

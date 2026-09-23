@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use appbox::hyperpom::error::{Error as HyperpomError, MemoryError};
 use appbox::hyperpom::memory::VirtMemAllocator;
 use appbox::loader::Loader;
 use log::{debug, error, trace};
@@ -408,7 +409,14 @@ impl Warpspeed {
                     _ => {
                         for (page_addr, old_contents) in before_pages {
                             let mut new_contents: Vec<u8> = vec![0; 0x1000];
-                            vma.read(page_addr, &mut new_contents)?;
+                            match vma.read(page_addr, &mut new_contents) {
+                                Ok(_) => {}
+                                // Unmapped by the syscall (e.g. munmap), which replay re-executes.
+                                Err(HyperpomError::Memory(MemoryError::UnallocatedMemoryAccess(
+                                    _,
+                                ))) => continue,
+                                Err(err) => return Err(err.into()),
+                            }
                             side_effects.memory.extend(diff_memory(
                                 page_addr,
                                 &old_contents,
@@ -573,8 +581,10 @@ impl Warpspeed {
 
             // And these are needed to get memory mappings correct.
             if num == syscalls::SYS_mmap
+                || num == syscalls::SYS_munmap
                 || num == syscalls::TRAP_mach_vm_allocate
                 || num == syscalls::TRAP_mach_vm_map
+                || num == syscalls::TRAP_mach_vm_deallocate
             {
                 side_effects.external = true;
             }

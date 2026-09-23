@@ -8,5 +8,13 @@
         -->
         <key>com.apple.security.hypervisor</key>
         <true/>
+        <!--
+        Let appbox::respawn pin the host's malloc layout: the parent needs task_for_pid on the
+        child (a copy of the same binary), which requires both of these.
+        -->
+        <key>com.apple.security.cs.debugger</key>
+        <true/>
+        <key>com.apple.security.get-task-allow</key>
+        <true/>
     </dict>
 </plist>

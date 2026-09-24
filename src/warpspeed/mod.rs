@@ -10,6 +10,7 @@ use appbox::exec::ExecRequest;
 use appbox::hyperpom::crash::ExitKind;
 use appbox::vm::VmManager;
 use appbox::syscalls;
+use appbox::threading::ThreadingModel;
 use appbox::threads::{Registers, ThreadId, ThreadSwitch};
 use appbox::trap::{
     explore_pointers, forward_syscall, read_syscall_context, write_syscall_result,
@@ -268,10 +269,6 @@ pub struct Warpspeed {
 
 impl Warpspeed {
     pub fn new(trace: recordable::Trace, mode: Mode) -> Result<Self> {
-        anyhow::ensure!(
-            appbox::threading::model() == appbox::threading::ThreadingModel::TimeShared,
-            "recording and replaying need the guest's threads time-shared, not in parallel"
-        );
         let shared_file_ids_by_identity = trace
             .shared_files
             .iter()
@@ -289,7 +286,12 @@ impl Warpspeed {
             .map(|shared_file| (shared_file.id, shared_file))
             .collect::<HashMap<_, _>>();
 
-        let mut trap_handler = DefaultTrapHandler::new()?;
+        let mut trap_handler = DefaultTrapHandler::new(ThreadingModel::TimeShared)?;
+        // A guest that parallel threads spawned has them too.
+        anyhow::ensure!(
+            trap_handler.threading() == ThreadingModel::TimeShared,
+            "recording and replaying need the guest's threads time-shared, not in parallel"
+        );
         if mode == Mode::Replay {
             // Thread switches come from the recording.
             trap_handler.set_quantum(None);

@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use appbox::applevisor as av;
 use appbox::hyperpom::crash::ExitKind;
 use appbox::syscalls;
+use appbox::threads::{Registers, ThreadId, ThreadSwitch};
 use appbox::trap::{
-    explore_pointers, read_syscall_context, write_syscall_result, DefaultTrapHandler,
-    SyscallResult, TrapHandler,
+    explore_pointers, forward_syscall, read_syscall_context, write_syscall_result,
+    DefaultTrapHandler, SyscallResult, TrapHandler,
 };
 
 use crate::recordable;
+use crate::recordable::scheduling;
 use crate::recordable::side_effects;
 use crate::shared_files::{self, FdState, ShadowFile};
 
@@ -45,6 +47,84 @@ fn diff_memory(page_addr: u64, old: &[u8], new: &[u8]) -> Vec<side_effects::Memo
     }
 
     side_effects
+}
+
+type PageSnapshot = HashMap<u64, Vec<u8>>;
+
+fn snapshot_pages(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<PageSnapshot> {
+    let mut pages = HashMap::new();
+    for page_addr in explore_pointers(vma, args) {
+        let mut contents: Vec<u8> = vec![0; 0x1000];
+        vma.read(page_addr, &mut contents)?;
+        pages.insert(page_addr, contents);
+    }
+    Ok(pages)
+}
+
+fn diff_pages(vma: &VirtMemAllocator, before: PageSnapshot) -> Result<Vec<side_effects::Memory>> {
+    let mut changes = vec![];
+    for (page_addr, old_contents) in before {
+        let mut new_contents: Vec<u8> = vec![0; 0x1000];
+        match vma.read(page_addr, &mut new_contents) {
+            Ok(_) => {}
+            // Unmapped by the syscall (e.g. munmap), which replay re-executes.
+            Err(HyperpomError::Memory(MemoryError::UnallocatedMemoryAccess(_))) => continue,
+            Err(err) => return Err(err.into()),
+        }
+        changes.extend(diff_memory(page_addr, &old_contents, &new_contents));
+    }
+    Ok(changes)
+}
+
+fn apply_memory(memory: &[side_effects::Memory]) {
+    for mem in memory {
+        trace!("Writing to 0x{:x}", mem.address);
+        unsafe {
+            std::ptr::copy(mem.value.as_ptr(), mem.address as _, mem.value.len());
+        }
+    }
+}
+
+fn registers_to_proto(regs: &Registers) -> scheduling::Registers {
+    scheduling::Registers {
+        x: regs.x.to_vec(),
+        sp: regs.sp,
+        pc: regs.pc,
+        cpsr: regs.cpsr,
+        q: regs.q.iter().map(|q| q.to_le_bytes().to_vec()).collect(),
+        fpcr: regs.fpcr,
+        fpsr: regs.fpsr,
+        tpidr: regs.tpidr,
+        tpidrro: regs.tpidrro,
+    }
+}
+
+fn registers_from_proto(regs: &scheduling::Registers) -> Result<Registers> {
+    Ok(Registers {
+        x: regs.x.as_slice().try_into().context("wrong number of X registers")?,
+        sp: regs.sp,
+        pc: regs.pc,
+        cpsr: regs.cpsr,
+        q: regs
+            .q
+            .iter()
+            .map(|q| Ok(u128::from_le_bytes(q.as_slice().try_into()?)))
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("wrong number of Q registers"))?,
+        fpcr: regs.fpcr,
+        fpsr: regs.fpsr,
+        tpidr: regs.tpidr,
+        tpidrro: regs.tpidrro,
+    })
+}
+
+/// A syscall a thread left the vCPU in, whose results come when it's switched back to.
+struct PendingSyscall {
+    num: u64,
+    args: [u64; 16],
+    /// Recording only: memory the syscall might write, as it was when the syscall began.
+    before_pages: PageSnapshot,
 }
 
 #[cfg(test)]
@@ -137,6 +217,9 @@ pub struct Warpspeed {
     event_idx: usize,
 
     trap_handler: DefaultTrapHandler,
+    /// Replay only: the thread on the vCPU.
+    current_tid: ThreadId,
+    pending: HashMap<ThreadId, PendingSyscall>,
     fd_table: HashMap<i32, FdState>,
     shared_file_ids_by_identity: HashMap<(u64, u64), u64>,
     shared_files_by_id: HashMap<u64, recordable::trace::SharedFile>,
@@ -167,6 +250,8 @@ impl Warpspeed {
             mode,
             event_idx: 0,
             trap_handler: DefaultTrapHandler::new()?,
+            current_tid: 0,
+            pending: HashMap::new(),
             fd_table: HashMap::new(),
             shared_file_ids_by_identity,
             shared_files_by_id,
@@ -337,6 +422,236 @@ impl Warpspeed {
         Ok(())
     }
 
+    /// Whether a syscall's effects reach outside the guest (or appbox's state), so replay must
+    /// re-execute it rather than just apply its recorded side effects.
+    fn is_external(&self, num: u64, args: &[u64; 16]) -> bool {
+        // TODO: open/close and other fd manipulating calls are needed so mmapping fds works,
+        // but these shouldn't be needed eventually.
+        if num == syscalls::SYS_open
+            || num == syscalls::SYS_openat
+            || num == syscalls::SYS_open_nocancel
+            || num == syscalls::SYS_openat_nocancel
+            || num == syscalls::SYS_close
+            || num == syscalls::SYS_close_nocancel
+            || num == syscalls::SYS_dup
+            || num == syscalls::SYS_dup2
+            // and socket is needed so the fd table stays in sync
+            || num == syscalls::SYS_socket
+        {
+            return true;
+        }
+
+        // Also include write_nocancel so we can see stdout/stderr.
+        if num == syscalls::SYS_write_nocancel && (args[0] == 1 || args[0] == 2) {
+            return true;
+        }
+
+        if let Some(fd) = Self::fd_arg_for_shared_file_syscall(num, args) {
+            if self.shared_file_id_for_fd(fd).is_some() {
+                return true;
+            }
+        }
+
+        // And these are needed to get memory mappings correct.
+        if num == syscalls::SYS_mmap
+            || num == syscalls::SYS_munmap
+            || num == syscalls::TRAP_mach_vm_allocate
+            || num == syscalls::TRAP_mach_vm_map
+            || num == syscalls::TRAP_mach_vm_deallocate
+        {
+            return true;
+        }
+        if num == syscalls::TRAP_mach_msg2 {
+            let msgh_id = args[4] >> 32;
+            if msgh_id == 4811 {
+                return true;
+            }
+        }
+
+        // And finally, exit() so appbox returns out ExitKind::Exit.
+        if num == syscalls::SYS_exit {
+            return true;
+        }
+
+        // XXX: kinda hack. platform syscalls dealing with TSD are replayed so appbox's TSD management handles things correctly later
+        num == 0x8000_0000
+    }
+
+    /// Records the changes appbox made to guest memory itself.
+    fn record_guest_memory_changes(
+        &mut self,
+        vma: &VirtMemAllocator,
+        side_effects: &mut recordable::SideEffects,
+    ) -> Result<()> {
+        let changes = self.trap_handler.take_guest_memory_changes();
+        for (address, size) in changes.allocations {
+            side_effects
+                .allocations
+                .push(side_effects::Allocation { address, size });
+        }
+        for (address, len) in changes.writes {
+            let mut value = vec![0; len as usize];
+            vma.read(address, &mut value)?;
+            side_effects.memory.push(side_effects::Memory { address, value });
+        }
+        Ok(())
+    }
+
+    /// Repeats appbox's allocations on the guest's behalf, which must land where they did.
+    fn replay_allocations(
+        &mut self,
+        vma: &mut VirtMemAllocator,
+        side_effects: &recordable::SideEffects,
+    ) -> Result<()> {
+        for allocation in &side_effects.allocations {
+            let address = self
+                .trap_handler
+                .allocate_guest_memory(vma, allocation.size)?;
+            anyhow::ensure!(
+                address == allocation.address,
+                "replay {}: allocation landed at {:#x}, not {:#x}",
+                self.event_idx,
+                address,
+                allocation.address
+            );
+        }
+        Ok(())
+    }
+
+    /// Records a syscall `tid` left the vCPU in, and the switch to the next thread.
+    #[allow(clippy::too_many_arguments)]
+    fn record_switch(
+        &mut self,
+        vcpu: &av::Vcpu,
+        vma: &VirtMemAllocator,
+        pc: u64,
+        num: u64,
+        args: &[u64; 16],
+        tid: ThreadId,
+        before_pages: PageSnapshot,
+        switch: ThreadSwitch,
+    ) -> Result<()> {
+        let mut side_effects = recordable::SideEffects {
+            external: self.is_external(num, args),
+            ..Default::default()
+        };
+        self.record_guest_memory_changes(vma, &mut side_effects)?;
+        self.trace.events.push(recordable::LogEvent {
+            pc,
+            register_state: args.to_vec(),
+            tid,
+            event: Some(recordable::log_event::Event::Syscall(
+                recordable::syscall::Syscall {
+                    syscall_number: num as _,
+                    side_effects: Some(side_effects),
+                    shared_map: None,
+                    descheduled: true,
+                },
+            )),
+        });
+        self.pending.insert(
+            tid,
+            PendingSyscall {
+                num,
+                args: *args,
+                before_pages,
+            },
+        );
+
+        let registers = Registers::save(vcpu)?;
+        let memory = match self.pending.remove(&switch.to) {
+            Some(pending) => {
+                self.complete_pending(&pending, &registers)?;
+                diff_pages(vma, pending.before_pages)?
+            }
+            None => vec![],
+        };
+        self.trace.events.push(recordable::LogEvent {
+            pc: registers.pc,
+            register_state: vec![],
+            tid,
+            event: Some(recordable::log_event::Event::Scheduling(
+                scheduling::Scheduling {
+                    tid,
+                    event: Some(scheduling::scheduling::Event::Switch(
+                        scheduling::scheduling::SwitchCurrent {
+                            new_tid: switch.to,
+                            registers: Some(registers_to_proto(&registers)),
+                            memory,
+                        },
+                    )),
+                },
+            )),
+        });
+        self.event_idx += 2;
+        Ok(())
+    }
+
+    /// Tracks what a thread's pending syscall did now that it has returned with `registers`.
+    fn complete_pending(&mut self, pending: &PendingSyscall, registers: &Registers) -> Result<()> {
+        self.update_fd_table(pending.num, &pending.args, registers.x[0], registers.cpsr)
+    }
+
+    /// Replays a syscall the current thread left the vCPU in, and the switch to the next thread.
+    fn replay_switch(
+        &mut self,
+        vcpu: &mut av::Vcpu,
+        vma: &mut VirtMemAllocator,
+        num: u64,
+        args: &[u64; 16],
+        syscall: &recordable::syscall::Syscall,
+    ) -> Result<ExitKind> {
+        let side_effects = syscall.side_effects.as_ref().unwrap();
+        if side_effects.external {
+            // Only plain forwarded syscalls can block, so there's nothing for appbox to do.
+            self.prepare_replay_external_syscall(num, args, syscall)?;
+            forward_syscall(num, args);
+        }
+        self.replay_allocations(vma, side_effects)?;
+        apply_memory(&side_effects.memory);
+        self.pending.insert(
+            self.current_tid,
+            PendingSyscall {
+                num,
+                args: *args,
+                before_pages: HashMap::new(),
+            },
+        );
+        self.event_idx += 1;
+
+        let Some(event) = self.trace.events.get(self.event_idx) else {
+            error!("Replay {}: trace ended mid thread switch", self.event_idx);
+            return Ok(ExitKind::Exit);
+        };
+        let Some(recordable::log_event::Event::Scheduling(scheduling::Scheduling {
+            event: Some(scheduling::scheduling::Event::Switch(switch)),
+            ..
+        })) = &event.event
+        else {
+            error!(
+                "Replay {}: expected a thread switch, got {:?}",
+                self.event_idx, event.event
+            );
+            return Ok(ExitKind::Exit);
+        };
+        let switch = switch.clone();
+        let registers = registers_from_proto(
+            switch
+                .registers
+                .as_ref()
+                .context("thread switch without registers")?,
+        )?;
+        registers.restore(vcpu)?;
+        apply_memory(&switch.memory);
+        if let Some(pending) = self.pending.remove(&switch.new_tid) {
+            self.complete_pending(&pending, &registers)?;
+        }
+        trace!("Replay {}: switched to thread {}", self.event_idx, switch.new_tid);
+        self.current_tid = switch.new_tid;
+        self.event_idx += 1;
+        Ok(ExitKind::Continue)
+    }
+
     pub fn trap_handler(
         &mut self,
         vcpu: &mut av::Vcpu,
@@ -368,25 +683,27 @@ impl Warpspeed {
         let mut exit_kind = ExitKind::Continue;
         let mut side_effects = recordable::SideEffects::default();
         let mut shared_map = None;
+        let tid;
         // Stage 2: do the syscall.
         // If recording:
         //   1. Snapshot "reachable" memory before the syscall
         //   2. Perform the syscall
         //   3. Diff previously stored reachable pages now that the syscall is done, recording what memory changed.
+        //      If the thread left the vCPU instead, that happens when it's switched back to.
         // If replaying, make sure we're in the correct place and simply apply the side effects.
         match self.mode {
             Mode::Record => {
-                let mut before_pages = HashMap::new();
-                for page_addr in explore_pointers(vma, &args) {
-                    let mut contents: Vec<u8> = vec![0; 0x1000];
-                    vma.read(page_addr, &mut contents)?;
-                    before_pages.insert(page_addr, contents);
-                }
+                tid = self.trap_handler.current_thread();
+                let before_pages = snapshot_pages(vma, &args)?;
 
                 let res = self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
                 exit_kind = res.exit.clone();
                 if exit_kind != ExitKind::Continue && exit_kind != ExitKind::Exit {
                     return Ok(exit_kind);
+                }
+                if let Some(switch) = res.thread_switch {
+                    self.record_switch(vcpu, vma, elr, num, &args, tid, before_pages, switch)?;
+                    return Ok(ExitKind::Continue);
                 }
                 ret0 = res.ret0;
                 ret1 = res.ret1;
@@ -406,25 +723,9 @@ impl Warpspeed {
                             value: data,
                         });
                     }
-                    _ => {
-                        for (page_addr, old_contents) in before_pages {
-                            let mut new_contents: Vec<u8> = vec![0; 0x1000];
-                            match vma.read(page_addr, &mut new_contents) {
-                                Ok(_) => {}
-                                // Unmapped by the syscall (e.g. munmap), which replay re-executes.
-                                Err(HyperpomError::Memory(MemoryError::UnallocatedMemoryAccess(
-                                    _,
-                                ))) => continue,
-                                Err(err) => return Err(err.into()),
-                            }
-                            side_effects.memory.extend(diff_memory(
-                                page_addr,
-                                &old_contents,
-                                &new_contents,
-                            ));
-                        }
-                    }
+                    _ => side_effects.memory.extend(diff_pages(vma, before_pages)?),
                 }
+                self.record_guest_memory_changes(vma, &mut side_effects)?;
 
                 trace!(
                     "Changed mem: {:?}",
@@ -437,11 +738,19 @@ impl Warpspeed {
                 shared_map = self.record_shared_map(num, &args, cflags)?;
             }
             Mode::Replay => {
+                tid = self.current_tid;
                 let event = &self.trace.events[self.event_idx];
                 if elr != event.pc {
                     error!(
                         "Replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
                         self.event_idx, event.pc, elr
+                    );
+                    return Ok(ExitKind::Exit);
+                }
+                if tid != event.tid {
+                    error!(
+                        "Replay {}: thread mismatch: expected {}, got {}",
+                        self.event_idx, event.tid, tid
                     );
                     return Ok(ExitKind::Exit);
                 }
@@ -455,6 +764,9 @@ impl Warpspeed {
                                 self.event_idx, syscall.syscall_number, num
                             );
                         }
+                        if syscall.descheduled {
+                            return self.replay_switch(vcpu, vma, num, &args, &syscall);
+                        }
 
                         let side_effects_ref = syscall.side_effects.as_ref().unwrap();
                         let mut res: Option<SyscallResult> = None;
@@ -462,8 +774,14 @@ impl Warpspeed {
                         if side_effects_ref.external {
                             self.prepare_replay_external_syscall(num, &args, &syscall)?;
                             trace!("Replay syscall index {}", self.event_idx);
+                            // appbox only knows about the main thread on replay, so keep the
+                            // current thread's TSD base unless the syscall sets it.
+                            let tpidrro = vcpu.get_sys_reg(av::SysReg::TPIDRRO_EL0)?;
                             let handler_res =
                                 self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
+                            if !(num == 0x8000_0000 && args[3] == 2) {
+                                vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, tpidrro)?;
+                            }
                             if handler_res.exit != ExitKind::Continue {
                                 return Ok(handler_res.exit);
                             }
@@ -509,16 +827,8 @@ impl Warpspeed {
                                 }
                             }
                         }
-                        for mem in &side_effects_ref.memory {
-                            trace!("Writing to 0x{:x}", mem.address);
-                            unsafe {
-                                std::ptr::copy(
-                                    mem.value.as_ptr(),
-                                    mem.address as _,
-                                    mem.value.len(),
-                                );
-                            }
-                        }
+                        self.replay_allocations(vma, side_effects_ref)?;
+                        apply_memory(&side_effects_ref.memory);
                     }
                     _ => {
                         error!(
@@ -549,70 +859,19 @@ impl Warpspeed {
                     value: cpsr,
                 },
             ]);
-
-            // These syscalls have external side-effects, so the syscall itself must be run on replay.
-            // mmap, mach_vm_allocate, and mach_vm_map already set this above.
-            // TODO: open/close and other fd manipulating calls are needed so mmapping fds works,
-            // but these shouldn't be needed eventually.
-            if num == syscalls::SYS_open
-                || num == syscalls::SYS_openat
-                || num == syscalls::SYS_open_nocancel
-                || num == syscalls::SYS_openat_nocancel
-                || num == syscalls::SYS_close
-                || num == syscalls::SYS_close_nocancel
-                || num == syscalls::SYS_dup
-                || num == syscalls::SYS_dup2
-                // and socket is needed so the fd table stays in sync
-                || num == syscalls::SYS_socket
-            {
-                side_effects.external = true;
-            }
-
-            // Also include write_nocancel so we can see stdout/stderr.
-            if num == syscalls::SYS_write_nocancel && (args[0] == 1 || args[0] == 2) {
-                side_effects.external = true;
-            }
-
-            if let Some(fd) = Self::fd_arg_for_shared_file_syscall(num, &args) {
-                if self.shared_file_id_for_fd(fd).is_some() {
-                    side_effects.external = true;
-                }
-            }
-
-            // And these are needed to get memory mappings correct.
-            if num == syscalls::SYS_mmap
-                || num == syscalls::SYS_munmap
-                || num == syscalls::TRAP_mach_vm_allocate
-                || num == syscalls::TRAP_mach_vm_map
-                || num == syscalls::TRAP_mach_vm_deallocate
-            {
-                side_effects.external = true;
-            }
-            if num == syscalls::TRAP_mach_msg2 {
-                let msgh_id = args[4] >> 32;
-                if msgh_id == 4811 {
-                    side_effects.external = true;
-                }
-            }
-
-            // And finally, exit() so appbox returns out ExitKind::Exit.
-            if num == syscalls::SYS_exit {
-                side_effects.external = true;
-            }
-
-            // XXX: kinda hack. platform syscalls dealing with TSD are replayed so appbox's TSD management handles things correctly later
-            if num == 0x8000_0000 {
-                side_effects.external = true;
-            }
+            // The process ending (e.g. with its last thread) must happen on replay too.
+            side_effects.external = self.is_external(num, &args) || exit_kind == ExitKind::Exit;
 
             self.trace.events.push(recordable::LogEvent {
                 pc: elr,
                 register_state: args.to_vec(),
+                tid,
                 event: Some(recordable::log_event::Event::Syscall(
                     recordable::syscall::Syscall {
                         syscall_number: num as _,
                         side_effects: Some(side_effects),
                         shared_map,
+                        descheduled: false,
                     },
                 )),
             });

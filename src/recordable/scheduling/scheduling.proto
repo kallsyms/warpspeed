@@ -2,10 +2,32 @@ syntax = "proto3";
 
 package warpspeed.recordable.scheduling;
 
+import "src/recordable/side_effects.proto";
+
+// A thread's user register state.
+message Registers {
+  repeated uint64 x = 1;
+  uint64 sp = 2;
+  uint64 pc = 3;
+  uint64 cpsr = 4;
+  // Each 16 bytes, little endian.
+  repeated bytes q = 5;
+  uint64 fpcr = 6;
+  uint64 fpsr = 7;
+  uint64 tpidr = 8;
+  uint64 tpidrro = 9;
+}
+
 message Scheduling {
   uint32 tid = 1; // This is an opaque identifier for the thread.
   message NewThread { uint64 pc = 1; }
-  message SwitchCurrent { uint32 new_tid = 1; }
+  message SwitchCurrent {
+    uint32 new_tid = 1;
+    // new_tid's state as it resumes, including the results of the syscall it left the vCPU in.
+    Registers registers = 2;
+    // What that syscall wrote to memory.
+    repeated warpspeed.recordable.SideEffects.Memory memory = 3;
+  }
   oneof event {
     NewThread start = 2;
     SwitchCurrent switch = 3;

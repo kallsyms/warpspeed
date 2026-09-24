@@ -24,4 +24,12 @@ message SideEffects {
   // An external side effect is one that must be replayed by the system at
   // replay time. E.g. memory management, or a write to stdout.
   bool external = 3;
+
+  // Memory appbox allocated on the guest's behalf (e.g. workqueue thread
+  // stacks), which replay must allocate again in the same order.
+  message Allocation {
+    uint64 address = 1;
+    uint64 size = 2;
+  }
+  repeated Allocation allocations = 4;
 }

@@ -35,6 +35,8 @@ message Trace {
 message LogEvent {
   uint64 pc = 1;
   repeated uint64 register_state = 2;
+  // The guest thread the event happened on (appbox's thread ID).
+  uint32 tid = 3;
   oneof event {
     warpspeed.recordable.syscall.Syscall syscall = 10;
     warpspeed.recordable.scheduling.Scheduling scheduling = 12;

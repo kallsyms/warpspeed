@@ -18,4 +18,8 @@ message Syscall {
   uint64 syscall_number = 1;
   warpspeed.recordable.SideEffects side_effects = 2;
   SharedMap shared_map = 3;
+  // The thread left the vCPU in this syscall (blocked, yielded, parked or exited), so the next
+  // event is the switch to another thread, and the syscall's results come with the switch back.
+  // side_effects then only has memory written meanwhile on other threads' behalf.
+  bool descheduled = 4;
 }

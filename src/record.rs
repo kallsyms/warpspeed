@@ -180,7 +180,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                 warpspeed.handle_timer(&mut vm)?;
                 ExitKind::Continue
             }
-            VmRunResult::HardwareBreakpoint | VmRunResult::Step => {
+            VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
                 ExitKind::Crash("unexpected debug exception".to_string())
             }
             VmRunResult::Brk => {

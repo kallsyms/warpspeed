@@ -5,6 +5,7 @@ mod cli;
 mod record;
 mod recordable;
 mod replay;
+mod replayer;
 mod warpspeed;
 mod shared_files;
 

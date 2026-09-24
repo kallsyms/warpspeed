@@ -2,14 +2,13 @@ use anyhow::{Context, Result};
 use appbox::hyperpom::error::{Error as HyperpomError, MemoryError};
 use appbox::hyperpom::memory::VirtMemAllocator;
 use appbox::loader::Loader;
-use log::{debug, error, info, trace};
-use std::collections::{BTreeSet, HashMap};
+use log::{debug, error, trace};
+use std::collections::HashMap;
 
 use appbox::applevisor as av;
 use appbox::exec::ExecRequest;
 use appbox::hyperpom::crash::ExitKind;
-use appbox::vm::{VmManager, VmRunResult};
-use std::time::Duration;
+use appbox::vm::VmManager;
 use appbox::syscalls;
 use appbox::threads::{Registers, ThreadId, ThreadSwitch};
 use appbox::trap::{
@@ -139,60 +138,8 @@ fn registers_from_proto(regs: &scheduling::Registers) -> Result<Registers> {
     })
 }
 
-/// How far short of a recorded preemption's instruction count replay stops timing the guest and
-/// starts looking for its registers at a breakpoint. It must cover how much host interrupts
-/// inflated the recorded count (seen up to ~100k in a ~3ms slice).
-const PREEMPTION_MARGIN: u64 = 150_000;
-/// Faster than any Apple core retires instructions (8 per cycle at ~3.2GHz), so a timed slice
-/// sized assuming it can't overshoot. Measuring the rate instead isn't safe: a slice in which the
-/// host descheduled the vCPU's thread measures slow.
-const MAX_INSTRUCTIONS_PER_NS: f64 = 26.0;
-/// The shortest timed slice worth running before switching to breakpoints.
-const MIN_TIMER_NS: f64 = 2_000.0;
-/// How far past the point the breakpoint phase could be, given the instruction counts, before
-/// concluding it was missed: covers host interrupts inflating the counts.
-const MISSED_SLACK: u64 = 500_000;
-
-/// Whether `a` is the same point in a thread's execution as `b`, as far as registers show.
-fn same_point(a: &Registers, b: &Registers) -> bool {
-    a.pc == b.pc && a.sp == b.sp && a.x == b.x && a.q == b.q && a.cpsr >> 28 == b.cpsr >> 28
-}
-
-/// How a replay proceeds, adjusted each time it restarts after missing a preemption point.
-#[derive(Clone, Debug)]
-pub struct ReplayPlan {
-    /// Preemptions (by event index) to find without timing the guest first: breakpoint hits from
-    /// the previous event on, which is slow but can't overshoot.
-    pub careful: BTreeSet<usize>,
-    /// Events before this were already replayed by an earlier attempt, so their writes to
-    /// stdout/stderr aren't repeated.
-    pub quiet_until: usize,
-    /// How fast the guest is assumed to run at most, when timing it towards a preemption. Only
-    /// lowered to test recovering from overshooting.
-    pub max_instructions_per_ns: f64,
-}
-
-impl Default for ReplayPlan {
-    fn default() -> Self {
-        Self {
-            careful: BTreeSet::new(),
-            quiet_until: 0,
-            max_instructions_per_ns: MAX_INSTRUCTIONS_PER_NS,
-        }
-    }
-}
-
-/// The outcome of [`Warpspeed::replay_preemption`].
-pub enum PreemptionReplay {
-    Replayed(ExitKind),
-    /// The guest stopped on the way for something to handle as usual, e.g. a debugger's
-    /// breakpoint. Replaying the preemption resumes from there.
-    Stopped(VmRunResult),
-    /// The guest ran past the preemption point, so the replay must restart (see [`ReplayPlan`]).
-    Missed { event: usize },
-}
-
 /// A syscall a thread left the vCPU in, whose results come when it's switched back to.
+#[derive(Clone)]
 struct PendingSyscall {
     num: u64,
     args: [u64; 16],
@@ -284,20 +231,36 @@ pub enum Mode {
     Replay,
 }
 
-pub struct Warpspeed {
-    pub trace: recordable::Trace,
-    mode: Mode,
+/// Where a recording or replay is, which a checkpoint must capture to go back to.
+#[derive(Clone)]
+pub struct ReplayState {
     event_idx: usize,
-
-    trap_handler: DefaultTrapHandler,
     /// Replay only: the thread on the vCPU.
     current_tid: ThreadId,
     /// The VM's count of guest instructions at the last event (see `Preemption.instructions`).
     last_event_instructions: u64,
-    /// Replay only: see [`ReplayPlan`].
-    plan: ReplayPlan,
     pending: HashMap<ThreadId, PendingSyscall>,
     fd_table: HashMap<i32, FdState>,
+    exit_status: Option<i32>,
+}
+
+impl ReplayState {
+    /// The index of the next event to record or replay.
+    pub fn event_index(&self) -> usize {
+        self.event_idx
+    }
+}
+
+pub struct Warpspeed {
+    pub trace: recordable::Trace,
+    mode: Mode,
+    state: ReplayState,
+    trap_handler: DefaultTrapHandler,
+    /// Replay only: events before this were already replayed once, so their writes to
+    /// stdout/stderr aren't repeated.
+    quiet_until: usize,
+    /// Replay only: the guest memory the last event's recorded side effects wrote.
+    event_writes: Vec<(u64, usize)>,
     shared_file_ids_by_identity: HashMap<(u64, u64), u64>,
     shared_files_by_id: HashMap<u64, recordable::trace::SharedFile>,
     shadow_files: HashMap<u64, ShadowFile>,
@@ -330,13 +293,17 @@ impl Warpspeed {
         Ok(Self {
             trace,
             mode,
-            event_idx: 0,
+            state: ReplayState {
+                event_idx: 0,
+                current_tid: 0,
+                last_event_instructions: 0,
+                pending: HashMap::new(),
+                fd_table: HashMap::new(),
+                exit_status: None,
+            },
             trap_handler,
-            current_tid: 0,
-            last_event_instructions: 0,
-            plan: ReplayPlan::default(),
-            pending: HashMap::new(),
-            fd_table: HashMap::new(),
+            quiet_until: 0,
+            event_writes: Vec::new(),
             shared_file_ids_by_identity,
             shared_files_by_id,
             shadow_files: HashMap::new(),
@@ -359,7 +326,7 @@ impl Warpspeed {
     }
 
     fn shared_file_id_for_fd(&self, fd: i32) -> Option<u64> {
-        let state = self.fd_table.get(&fd)?;
+        let state = self.state.fd_table.get(&fd)?;
         self.shared_file_ids_by_identity
             .get(&(state.device, state.inode))
             .copied()
@@ -376,24 +343,24 @@ impl Warpspeed {
             | syscalls::SYS_open_nocancel
             | syscalls::SYS_openat_nocancel => {
                 let fd = ret0 as i32;
-                self.fd_table.insert(fd, FdState::from_fd(fd)?);
+                self.state.fd_table.insert(fd, FdState::from_fd(fd)?);
             }
             syscalls::SYS_dup => {
                 let src = args[0] as i32;
                 let dst = ret0 as i32;
-                if let Some(state) = self.fd_table.get(&src).cloned() {
-                    self.fd_table.insert(dst, state);
+                if let Some(state) = self.state.fd_table.get(&src).cloned() {
+                    self.state.fd_table.insert(dst, state);
                 }
             }
             syscalls::SYS_dup2 => {
                 let src = args[0] as i32;
                 let dst = ret0 as i32;
-                if let Some(state) = self.fd_table.get(&src).cloned() {
-                    self.fd_table.insert(dst, state);
+                if let Some(state) = self.state.fd_table.get(&src).cloned() {
+                    self.state.fd_table.insert(dst, state);
                 }
             }
             syscalls::SYS_close | syscalls::SYS_close_nocancel => {
-                self.fd_table.remove(&(args[0] as i32));
+                self.state.fd_table.remove(&(args[0] as i32));
             }
             _ => {}
         }
@@ -422,6 +389,7 @@ impl Warpspeed {
         }
 
         let fd_state = self
+            .state
             .fd_table
             .get(&fd)
             .cloned()
@@ -609,7 +577,7 @@ impl Warpspeed {
             anyhow::ensure!(
                 address == allocation.address,
                 "replay {}: allocation landed at {:#x}, not {:#x}",
-                self.event_idx,
+                self.state.event_idx,
                 address,
                 allocation.address
             );
@@ -648,7 +616,7 @@ impl Warpspeed {
                 },
             )),
         });
-        self.pending.insert(
+        self.state.pending.insert(
             tid,
             PendingSyscall {
                 num,
@@ -657,7 +625,7 @@ impl Warpspeed {
             },
         );
 
-        self.event_idx += 1;
+        self.state.event_idx += 1;
         self.record_switch_in(vcpu, vma, tid, switch)
     }
 
@@ -670,7 +638,7 @@ impl Warpspeed {
         switch: ThreadSwitch,
     ) -> Result<()> {
         let registers = Registers::save(vcpu)?;
-        let memory = match self.pending.remove(&switch.to) {
+        let memory = match self.state.pending.remove(&switch.to) {
             Some(pending) => {
                 self.complete_pending(&pending, &registers)?;
                 diff_pages(vma, pending.before_pages)?
@@ -694,7 +662,7 @@ impl Warpspeed {
                 },
             )),
         });
-        self.event_idx += 1;
+        self.state.event_idx += 1;
         Ok(())
     }
 
@@ -719,23 +687,27 @@ impl Warpspeed {
             forward_syscall(num, args);
         }
         self.replay_allocations(vma, side_effects)?;
-        apply_memory(&side_effects.memory);
-        self.pending.insert(
-            self.current_tid,
+        self.apply_memory(vma, &side_effects.memory);
+        self.state.pending.insert(
+            self.state.current_tid,
             PendingSyscall {
                 num,
                 args: *args,
                 before_pages: HashMap::new(),
             },
         );
-        self.event_idx += 1;
-        self.replay_switch_in(vcpu)
+        self.state.event_idx += 1;
+        self.replay_switch_in(vcpu, vma)
     }
 
     /// Replays the switch to another thread that the next event records.
-    fn replay_switch_in(&mut self, vcpu: &mut av::Vcpu) -> Result<ExitKind> {
-        let Some(event) = self.trace.events.get(self.event_idx) else {
-            error!("Replay {}: trace ended mid thread switch", self.event_idx);
+    fn replay_switch_in(
+        &mut self,
+        vcpu: &mut av::Vcpu,
+        vma: &mut VirtMemAllocator,
+    ) -> Result<ExitKind> {
+        let Some(event) = self.trace.events.get(self.state.event_idx) else {
+            error!("Replay {}: trace ended mid thread switch", self.state.event_idx);
             return Ok(ExitKind::Exit);
         };
         let Some(recordable::log_event::Event::Scheduling(scheduling::Scheduling {
@@ -745,7 +717,7 @@ impl Warpspeed {
         else {
             error!(
                 "Replay {}: expected a thread switch, got {:?}",
-                self.event_idx, event.event
+                self.state.event_idx, event.event
             );
             return Ok(ExitKind::Exit);
         };
@@ -757,13 +729,13 @@ impl Warpspeed {
                 .context("thread switch without registers")?,
         )?;
         registers.restore(vcpu)?;
-        apply_memory(&switch.memory);
-        if let Some(pending) = self.pending.remove(&switch.new_tid) {
+        self.apply_memory(vma, &switch.memory);
+        if let Some(pending) = self.state.pending.remove(&switch.new_tid) {
             self.complete_pending(&pending, &registers)?;
         }
-        trace!("Replay {}: switched to thread {}", self.event_idx, switch.new_tid);
-        self.current_tid = switch.new_tid;
-        self.event_idx += 1;
+        trace!("Replay {}: switched to thread {}", self.state.event_idx, switch.new_tid);
+        self.state.current_tid = switch.new_tid;
+        self.state.event_idx += 1;
         Ok(ExitKind::Continue)
     }
 
@@ -774,7 +746,7 @@ impl Warpspeed {
             return Ok(());
         }
         let tid = self.trap_handler.current_thread();
-        let instructions = vm.guest_instructions() - self.last_event_instructions;
+        let instructions = vm.guest_instructions() - self.state.last_event_instructions;
         let preempted = Registers::save(&vm.vcpu)?;
         let Some(switch) = self.trap_handler.handle_timer(&vm.vcpu, &mut vm.vma)? else {
             return Ok(());
@@ -793,159 +765,118 @@ impl Warpspeed {
                 },
             )),
         });
-        self.event_idx += 1;
+        self.state.event_idx += 1;
         self.record_switch_in(&vm.vcpu, &vm.vma, tid, switch)?;
-        self.last_event_instructions = vm.guest_instructions();
+        self.state.last_event_instructions = vm.guest_instructions();
         Ok(())
     }
 
-    /// Whether replay's next event is a preemption, which [`Self::replay_preemption`] must run
-    /// the guest to.
-    pub fn preemption_next(&self) -> bool {
-        self.mode == Mode::Replay
-            && matches!(
-                self.trace.events.get(self.event_idx).and_then(|e| e.event.as_ref()),
-                Some(recordable::log_event::Event::Preemption(_))
-            )
+    /// The current thread's next preemption, if replay's next event is one: how many guest
+    /// instructions after the previous event (as counted when recording), and where.
+    pub fn next_preemption(&self) -> Option<(u64, Registers)> {
+        if self.mode != Mode::Replay {
+            return None;
+        }
+        let event = self.trace.events.get(self.state.event_idx)?;
+        let Some(recordable::log_event::Event::Preemption(preemption)) = &event.event else {
+            return None;
+        };
+        let registers = registers_from_proto(preemption.registers.as_ref()?).ok()?;
+        (event.tid == self.state.current_tid).then_some((preemption.instructions, registers))
     }
 
-    /// Runs the current thread to where it was preempted while recording, and replays the switch
-    /// to the next thread.
-    ///
-    /// There's no guest PMU to interrupt the guest after a number of instructions, so this gets
-    /// close using the VM's (approximate) instruction count and its timer, stopping short by
-    /// [`PREEMPTION_MARGIN`], then puts a hardware breakpoint on the recorded pc and stops at the
-    /// first hit with the recorded registers. In a loop, those differ from iteration to iteration
-    /// unless the loop changes nothing (e.g. spinning on memory that no running thread changes),
-    /// in which case any iteration is the same state.
-    pub fn replay_preemption(&mut self, vm: &mut VmManager) -> Result<PreemptionReplay> {
-        let event = self.trace.events[self.event_idx].clone();
+    /// Replays the next event, a preemption, once the guest is where it was preempted: the
+    /// switch to the next thread.
+    pub fn apply_preemption(&mut self, vm: &mut VmManager) -> Result<ExitKind> {
+        let event = self.trace.events[self.state.event_idx].clone();
         let Some(recordable::log_event::Event::Preemption(preemption)) = event.event else {
-            unreachable!("preemption_next checked");
+            anyhow::bail!("replay {}: not a preemption", self.state.event_idx);
         };
-        if event.tid != self.current_tid {
-            error!(
-                "Replay {}: thread mismatch: expected {}, got {}",
-                self.event_idx, event.tid, self.current_tid
-            );
-            return Ok(PreemptionReplay::Replayed(ExitKind::Exit));
-        }
-        let target = registers_from_proto(
-            preemption
-                .registers
-                .as_ref()
-                .context("preemption without registers")?,
-        )?;
-
-        // Coarse: run the guest in timed slices, aiming short of the recorded count.
-        let base = self.last_event_instructions;
-        let mut slices = 0;
-        while !self.plan.careful.contains(&self.event_idx) {
-            let progress = vm.guest_instructions() - base;
-            let remaining =
-                preemption.instructions as f64 - progress as f64 - PREEMPTION_MARGIN as f64;
-            let ns = remaining * 0.8 / self.plan.max_instructions_per_ns;
-            if ns < MIN_TIMER_NS {
-                break;
-            }
-            slices += 1;
-            vm.arm_timer(Duration::from_nanos(ns as u64))?;
-            let result = vm.run()?;
-            vm.disarm_timer()?;
-            if matches!(result, VmRunResult::Brk) {
-                return Ok(PreemptionReplay::Stopped(result));
-            }
-            if !matches!(result, VmRunResult::Timer) {
-                error!(
-                    "Replay {}: the guest stopped for something else while timing it",
-                    self.event_idx
-                );
-                return Ok(self.missed_preemption());
-            }
-        }
-        let coarse_end = vm.guest_instructions() - base;
-        // Each hit retires at least an instruction, so more hits than could possibly remain
-        // mean it was missed.
-        let max_hits = preemption.instructions.saturating_sub(coarse_end) + MISSED_SLACK;
-
-        // Precise: the first breakpoint hit with the recorded registers.
-        vm.set_hardware_breakpoint(Some(target.pc))?;
-        let mut hits = 0u64;
-        let found = loop {
-            match vm.run()? {
-                VmRunResult::Brk => {
-                    vm.set_hardware_breakpoint(None)?;
-                    return Ok(PreemptionReplay::Stopped(VmRunResult::Brk));
-                }
-                VmRunResult::HardwareBreakpoint => {
-                    hits += 1;
-                    if same_point(&Registers::save(&vm.vcpu)?, &target) {
-                        break true;
-                    }
-                    if hits > max_hits {
-                        break false;
-                    }
-                    vm.single_step()?;
-                }
-                VmRunResult::Step => {}
-                // Past the next syscall (or worse) without finding it.
-                _ => break false,
-            }
-        };
-        vm.set_hardware_breakpoint(None)?;
-        if !found {
-            error!(
-                "Replay {}: recorded {} instructions, timed slices got to {} ({} slices), then {} breakpoint hits",
-                self.event_idx, preemption.instructions, coarse_end, slices, hits
-            );
-            return Ok(self.missed_preemption());
-        }
-        debug!(
-            "Replay {}: found preemption point at {:#x}: recorded {} instructions, timed slices got to {} ({} slices), then {} breakpoint hits",
-            self.event_idx, target.pc, preemption.instructions, coarse_end, slices, hits
-        );
-
+        self.event_writes.clear();
         if let Some(side_effects) = &preemption.side_effects {
             self.replay_allocations(&mut vm.vma, side_effects)?;
-            apply_memory(&side_effects.memory);
+            self.apply_memory(&mut vm.vma, &side_effects.memory);
         }
-        self.event_idx += 1;
-        let exit = self.replay_switch_in(&mut vm.vcpu)?;
-        self.last_event_instructions = vm.guest_instructions();
-        Ok(PreemptionReplay::Replayed(exit))
+        self.state.event_idx += 1;
+        let exit = self.replay_switch_in(&mut vm.vcpu, &mut vm.vma)?;
+        self.state.last_event_instructions = vm.guest_instructions();
+        Ok(exit)
     }
 
-    fn missed_preemption(&self) -> PreemptionReplay {
-        info!(
-            "Replay {}: ran past where the thread was preempted",
-            self.event_idx
-        );
-        PreemptionReplay::Missed {
-            event: self.event_idx,
+    /// Where replay is (see [`ReplayState`]).
+    pub fn state(&self) -> ReplayState {
+        self.state.clone()
+    }
+
+    /// Puts replay back to `state`, as of a checkpoint that `vm` was just restored to.
+    pub fn set_state(&mut self, state: ReplayState, vm: &VmManager) {
+        self.state = state;
+        self.state.last_event_instructions = vm.guest_instructions();
+        self.event_writes.clear();
+    }
+
+    /// The index of the next event to record or replay.
+    pub fn event_index(&self) -> usize {
+        self.state.event_idx
+    }
+
+    /// The VM's count of guest instructions at the last event.
+    pub fn last_event_instructions(&self) -> u64 {
+        self.state.last_event_instructions
+    }
+
+    /// The status the guest exited with, once it has.
+    pub fn exit_status(&self) -> Option<i32> {
+        self.state.exit_status
+    }
+
+    /// The guest memory the last event's recorded side effects wrote, as ranges.
+    pub fn event_writes(&self) -> &[(u64, usize)] {
+        &self.event_writes
+    }
+
+    /// Events before `event` were already replayed once, so their writes to stdout/stderr
+    /// aren't repeated.
+    pub fn set_quiet_until(&mut self, event: usize) {
+        self.quiet_until = self.quiet_until.max(event);
+    }
+
+    /// See [`DefaultTrapHandler::checkpoint`].
+    pub fn checkpoint(&mut self, vm: &mut VmManager) -> Result<appbox::checkpoint::Checkpoint> {
+        self.trap_handler.checkpoint(vm)
+    }
+
+    /// See [`DefaultTrapHandler::restore`].
+    pub fn restore_checkpoint(
+        &mut self,
+        vm: &mut VmManager,
+        checkpoint: &appbox::checkpoint::Checkpoint,
+    ) -> Result<()> {
+        self.trap_handler.restore(vm, checkpoint)
+    }
+
+    /// See [`DefaultTrapHandler::discard_checkpoint`].
+    pub fn discard_checkpoint(
+        &mut self,
+        vm: &mut VmManager,
+        checkpoint: &appbox::checkpoint::Checkpoint,
+    ) -> Result<()> {
+        self.trap_handler.discard_checkpoint(vm, checkpoint)
+    }
+
+    /// Applies recorded writes to guest memory, telling checkpoints first.
+    fn apply_memory(&mut self, vma: &mut VirtMemAllocator, memory: &[side_effects::Memory]) {
+        for mem in memory {
+            vma.log_host_write(mem.address, mem.value.len());
+            self.event_writes.push((mem.address, mem.value.len()));
         }
-    }
-
-    /// Whether replay is still redoing what an earlier attempt already did (see
-    /// [`ReplayPlan::quiet_until`]): a debugger has already seen it, so mustn't again.
-    pub fn catching_up(&self) -> bool {
-        self.event_idx < self.plan.quiet_until
-    }
-
-    /// Releases the host memory backing the guest, so another can be loaded in its place (e.g.
-    /// to replay again from the start). Drop the guest's loader and VM afterwards.
-    pub fn release_guest(&mut self) {
-        self.trap_handler.prepare_for_exec();
-    }
-
-    /// Sets how this replay proceeds (see [`ReplayPlan`]).
-    pub fn set_replay_plan(&mut self, plan: ReplayPlan) {
-        self.plan = plan;
+        apply_memory(memory);
     }
 
     /// Whether replaying syscall `num` should skip actually doing it, as a write to
-    /// stdout/stderr an earlier attempt already did.
+    /// stdout/stderr already done.
     fn already_written(&self, num: u64, args: &[u64; 16]) -> bool {
-        self.event_idx < self.plan.quiet_until
+        self.state.event_idx < self.quiet_until
             && num == syscalls::SYS_write_nocancel
             && (args[0] == 1 || args[0] == 2)
     }
@@ -959,10 +890,10 @@ impl Warpspeed {
     ) -> Result<(VmManager, Loader)> {
         let (mut vm, loader) = appbox::exec::exec(vm, loader, &mut self.trap_handler, request)?;
         vm.count_instructions()?;
-        self.last_event_instructions = vm.guest_instructions();
+        self.state.last_event_instructions = vm.guest_instructions();
         // Only the calling thread survives, and close-on-exec descriptors are gone.
-        self.pending.clear();
-        self.fd_table
+        self.state.pending.clear();
+        self.state.fd_table
             .retain(|&fd, _| unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } >= 0);
         Ok((vm, loader))
     }
@@ -970,7 +901,7 @@ impl Warpspeed {
     /// Handles a syscall (`VmRunResult::Svc`), recording or replaying it.
     pub fn trap_handler(&mut self, vm: &mut VmManager, loader: &Loader) -> Result<ExitKind> {
         let exit = self.handle_syscall(&mut vm.vcpu, &mut vm.vma, loader);
-        self.last_event_instructions = vm.guest_instructions();
+        self.state.last_event_instructions = vm.guest_instructions();
         exit
     }
 
@@ -993,7 +924,7 @@ impl Warpspeed {
         let args = ctx.args;
         debug!(
             "{}: Incoming syscall ({}) {:x}(x{:x?})",
-            self.event_idx,
+            self.state.event_idx,
             syscalls::syscall_name(num).unwrap_or("<unknown>"),
             num,
             args
@@ -1031,7 +962,7 @@ impl Warpspeed {
                             envp: request.envp.clone(),
                         })),
                     });
-                    self.event_idx += 1;
+                    self.state.event_idx += 1;
                     return Ok(exit_kind);
                 }
                 if exit_kind != ExitKind::Continue && exit_kind != ExitKind::Exit {
@@ -1074,19 +1005,26 @@ impl Warpspeed {
                 shared_map = self.record_shared_map(num, &args, cflags)?;
             }
             Mode::Replay => {
-                tid = self.current_tid;
-                let event = &self.trace.events[self.event_idx];
+                tid = self.state.current_tid;
+                self.event_writes.clear();
+                if num == syscalls::SYS_exit {
+                    self.state.exit_status = Some(args[0] as i32);
+                }
+                let Some(event) = self.trace.events.get(self.state.event_idx) else {
+                    error!("Replay {}: past the end of the recording", self.state.event_idx);
+                    return Ok(ExitKind::Exit);
+                };
                 if elr != event.pc {
                     error!(
                         "Replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
-                        self.event_idx, event.pc, elr
+                        self.state.event_idx, event.pc, elr
                     );
                     return Ok(ExitKind::Exit);
                 }
                 if tid != event.tid {
                     error!(
                         "Replay {}: thread mismatch: expected {}, got {}",
-                        self.event_idx, event.tid, tid
+                        self.state.event_idx, event.tid, tid
                     );
                     return Ok(ExitKind::Exit);
                 }
@@ -1098,7 +1036,7 @@ impl Warpspeed {
                             argv: exec.argv.clone(),
                             envp: exec.envp.clone(),
                         };
-                        self.event_idx += 1;
+                        self.state.event_idx += 1;
                         return Ok(ExitKind::Exec(request));
                     }
                     Some(crate::recordable::log_event::Event::Syscall(syscall)) => {
@@ -1106,7 +1044,7 @@ impl Warpspeed {
                         if num != syscall.syscall_number {
                             error!(
                                 "Replay {}: syscall mismatch: expected 0x{:x}, got 0x{:x}",
-                                self.event_idx, syscall.syscall_number, num
+                                self.state.event_idx, syscall.syscall_number, num
                             );
                         }
                         if syscall.descheduled {
@@ -1118,7 +1056,7 @@ impl Warpspeed {
 
                         if side_effects_ref.external && !self.already_written(num, &args) {
                             self.prepare_replay_external_syscall(num, &args, &syscall)?;
-                            trace!("Replay syscall index {}", self.event_idx);
+                            trace!("Replay syscall index {}", self.state.event_idx);
                             // appbox only knows about the main thread on replay, so keep the
                             // current thread's TSD base unless the syscall sets it.
                             let tpidrro = vcpu.get_sys_reg(av::SysReg::TPIDRRO_EL0)?;
@@ -1142,7 +1080,7 @@ impl Warpspeed {
                                             if handler_res.ret0 != reg.value {
                                                 error!(
                                                     "Replay {}: syscall return value 0 mismatch: expected 0x{:x}, got 0x{:x}",
-                                                    self.event_idx, reg.value, handler_res.ret0
+                                                    self.state.event_idx, reg.value, handler_res.ret0
                                                 );
                                             }
                                         }
@@ -1155,7 +1093,7 @@ impl Warpspeed {
                                             if handler_res.ret1 != reg.value {
                                                 error!(
                                                     "Replay {}: syscall return value 1 mismatch: expected 0x{:x}, got 0x{:x}",
-                                                    self.event_idx, reg.value, handler_res.ret1
+                                                    self.state.event_idx, reg.value, handler_res.ret1
                                                 );
                                             }
                                         }
@@ -1166,19 +1104,19 @@ impl Warpspeed {
                                 _ => {
                                     error!(
                                         "Replay {}: unexpected register: {:?}",
-                                        self.event_idx, reg.register
+                                        self.state.event_idx, reg.register
                                     );
                                     return Ok(ExitKind::Exit);
                                 }
                             }
                         }
                         self.replay_allocations(vma, side_effects_ref)?;
-                        apply_memory(&side_effects_ref.memory);
+                        self.apply_memory(vma, &side_effects_ref.memory);
                     }
                     _ => {
                         error!(
                             "replay {}: unexpected event type: {:?}",
-                            self.event_idx, event.event
+                            self.state.event_idx, event.event
                         );
                         return Ok(ExitKind::Exit);
                     }
@@ -1223,7 +1161,7 @@ impl Warpspeed {
         }
 
         self.update_fd_table(num, &args, ret0, cflags)?;
-        self.event_idx += 1;
+        self.state.event_idx += 1;
 
         if exit_kind != ExitKind::Continue {
             return Ok(exit_kind);

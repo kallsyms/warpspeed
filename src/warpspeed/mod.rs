@@ -1,21 +1,16 @@
 use anyhow::{Context, Result};
 use appbox::hyperpom::error::{Error as HyperpomError, MemoryError};
 use appbox::hyperpom::memory::VirtMemAllocator;
-use appbox::loader::Loader;
 use log::{debug, error, trace};
 use std::collections::HashMap;
 
 use appbox::applevisor as av;
-use appbox::exec::ExecRequest;
-use appbox::hyperpom::crash::ExitKind;
-use appbox::vm::VmManager;
-use appbox::syscalls;
-use appbox::threading::ThreadingModel;
-use appbox::threads::{Registers, ThreadId, ThreadSwitch};
-use appbox::trap::{
-    explore_pointers, forward_syscall, read_syscall_context, write_syscall_result,
-    DefaultTrapHandler, SyscallResult, TrapHandler,
+use appbox::guest::{
+    Decision, GuestEnd, GuestFault, Outcome, Preemption, Registers, Returned, Syscall, ThreadCx,
+    ThreadId, ThreadSwitch, ThreadingModel,
 };
+use appbox::syscalls;
+use appbox::trap::{explore_pointers, forward_syscall};
 
 use crate::recordable;
 use crate::recordable::scheduling;
@@ -77,23 +72,6 @@ fn diff_pages(vma: &VirtMemAllocator, before: PageSnapshot) -> Result<Vec<side_e
         changes.extend(diff_memory(page_addr, &old_contents, &new_contents));
     }
     Ok(changes)
-}
-
-/// Logs the guest's symbolicated stack, e.g. when it traps.
-pub fn log_guest_stack(vm: &VmManager, loader: &Loader) {
-    for (idx, addr) in appbox::unwind_user_stack(vm, 64).iter().enumerate() {
-        match loader.symbolicate(*addr) {
-            Some(sym) => error!(
-                "{:02} 0x{:016x} {}::{} + 0x{:x}",
-                idx,
-                addr,
-                sym.image,
-                sym.symbol,
-                addr - sym.symbol_addr
-            ),
-            None => error!("{:02} 0x{:016x}", idx, addr),
-        }
-    }
 }
 
 fn apply_memory(memory: &[side_effects::Memory]) {
@@ -226,12 +204,6 @@ mod tests {
     }
 }
 
-#[derive(PartialEq)]
-pub enum Mode {
-    Record,
-    Replay,
-}
-
 /// Where a recording or replay is, which a checkpoint must capture to go back to.
 #[derive(Clone)]
 pub struct ReplayState {
@@ -242,7 +214,6 @@ pub struct ReplayState {
     last_event_instructions: u64,
     pending: HashMap<ThreadId, PendingSyscall>,
     fd_table: HashMap<i32, FdState>,
-    exit_status: Option<i32>,
 }
 
 impl ReplayState {
@@ -252,11 +223,27 @@ impl ReplayState {
     }
 }
 
+/// The syscall under way, between [`Hooks::syscall`](appbox::guest::Hooks::syscall) and
+/// `syscall_done`.
+enum InSyscall {
+    /// Recording: the thread that made it, and the memory it might write as it was before.
+    Recording { tid: ThreadId, before_pages: PageSnapshot },
+    /// Replay: appbox is handling it, as when recording; the results are the recording's.
+    External {
+        syscall: recordable::syscall::Syscall,
+        num: u64,
+        args: [u64; 16],
+        /// The thread's TSD base, which appbox doesn't know on replay (see `replay_syscall`).
+        tpidrro: u64,
+    },
+    /// Replay: replayed from the recording alone.
+    Replayed,
+}
+
 pub struct Warpspeed {
     pub trace: recordable::Trace,
-    mode: Mode,
     state: ReplayState,
-    trap_handler: DefaultTrapHandler,
+    in_syscall: Option<InSyscall>,
     /// Replay only: events before this were already replayed once, so their writes to
     /// stdout/stderr aren't repeated.
     quiet_until: usize,
@@ -267,8 +254,47 @@ pub struct Warpspeed {
     shadow_files: HashMap<u64, ShadowFile>,
 }
 
+/// Recording and replaying rely on the guest's threads taking turns on one vCPU.
+pub fn ensure_time_shared(t: &ThreadCx) -> Result<()> {
+    anyhow::ensure!(
+        t.handler().threading() == ThreadingModel::TimeShared,
+        "recording and replaying need the guest's threads time-shared, not in parallel"
+    );
+    Ok(())
+}
+
+/// Logs a fault the guest took, and where.
+pub fn log_fault(t: &ThreadCx, fault: &GuestFault) {
+    error!(
+        "Guest fault: {:?} at {:#x} (syndrome={:#x}, address={:x?})",
+        fault.kind, fault.pc, fault.syndrome, fault.address
+    );
+    for (idx, addr) in t.stack(64).iter().enumerate() {
+        match t.symbolicate(*addr) {
+            Some(sym) => error!(
+                "{:02} 0x{:016x} {}::{} + 0x{:x}",
+                idx,
+                addr,
+                sym.image,
+                sym.symbol,
+                addr - sym.symbol_addr
+            ),
+            None => error!("{:02} 0x{:016x}", idx, addr),
+        }
+    }
+}
+
+/// Sets the registers a syscall returns in, once it has returned.
+fn set_returned(vcpu: &av::Vcpu, returned: &Returned) -> Result<()> {
+    let cpsr = (vcpu.get_reg(av::Reg::CPSR)? & !(0b1111 << 28)) | returned.flags;
+    vcpu.set_reg(av::Reg::X0, returned.x0)?;
+    vcpu.set_reg(av::Reg::X1, returned.x1)?;
+    vcpu.set_reg(av::Reg::CPSR, cpsr)?;
+    Ok(())
+}
+
 impl Warpspeed {
-    pub fn new(trace: recordable::Trace, mode: Mode) -> Result<Self> {
+    pub fn new(trace: recordable::Trace) -> Result<Self> {
         let shared_file_ids_by_identity = trace
             .shared_files
             .iter()
@@ -286,28 +312,16 @@ impl Warpspeed {
             .map(|shared_file| (shared_file.id, shared_file))
             .collect::<HashMap<_, _>>();
 
-        let mut trap_handler = DefaultTrapHandler::new(ThreadingModel::TimeShared)?;
-        // A guest that parallel threads spawned has them too.
-        anyhow::ensure!(
-            trap_handler.threading() == ThreadingModel::TimeShared,
-            "recording and replaying need the guest's threads time-shared, not in parallel"
-        );
-        if mode == Mode::Replay {
-            // Thread switches come from the recording.
-            trap_handler.set_quantum(None);
-        }
         Ok(Self {
             trace,
-            mode,
             state: ReplayState {
                 event_idx: 0,
                 current_tid: 0,
                 last_event_instructions: 0,
                 pending: HashMap::new(),
                 fd_table: HashMap::new(),
-                exit_status: None,
             },
-            trap_handler,
+            in_syscall: None,
             quiet_until: 0,
             event_writes: Vec::new(),
             shared_file_ids_by_identity,
@@ -541,7 +555,7 @@ impl Warpspeed {
             }
         }
 
-        // And finally, exit() so appbox returns out ExitKind::Exit.
+        // And finally, exit() so appbox ends the guest.
         if num == syscalls::SYS_exit {
             return true;
         }
@@ -553,10 +567,10 @@ impl Warpspeed {
     /// Records the changes appbox made to guest memory itself.
     fn record_guest_memory_changes(
         &mut self,
-        vma: &VirtMemAllocator,
+        t: &mut ThreadCx,
         side_effects: &mut recordable::SideEffects,
     ) -> Result<()> {
-        let changes = self.trap_handler.take_guest_memory_changes();
+        let changes = t.take_guest_memory_changes();
         for (address, size) in changes.allocations {
             side_effects
                 .allocations
@@ -564,7 +578,7 @@ impl Warpspeed {
         }
         for (address, len) in changes.writes {
             let mut value = vec![0; len as usize];
-            vma.read(address, &mut value)?;
+            t.memory().read(address, &mut value)?;
             side_effects.memory.push(side_effects::Memory { address, value });
         }
         Ok(())
@@ -573,13 +587,13 @@ impl Warpspeed {
     /// Repeats appbox's allocations on the guest's behalf, which must land where they did.
     fn replay_allocations(
         &mut self,
-        vma: &mut VirtMemAllocator,
+        t: &mut ThreadCx,
         side_effects: &recordable::SideEffects,
     ) -> Result<()> {
         for allocation in &side_effects.allocations {
-            let address = self
-                .trap_handler
-                .allocate_guest_memory(vma, allocation.size)?;
+            let address = t
+                .handler()
+                .allocate_guest_memory(&mut t.memory(), allocation.size)?;
             anyhow::ensure!(
                 address == allocation.address,
                 "replay {}: allocation landed at {:#x}, not {:#x}",
@@ -591,12 +605,144 @@ impl Warpspeed {
         Ok(())
     }
 
+    /// Before a syscall: notes what's needed to record it once done.
+    pub fn record_syscall(&mut self, t: &ThreadCx, call: &Syscall) -> Result<()> {
+        debug!(
+            "{}: Incoming syscall ({}) {:x}(x{:x?})",
+            self.state.event_idx,
+            call.name().unwrap_or("<unknown>"),
+            call.number,
+            call.args
+        );
+        self.in_syscall = Some(InSyscall::Recording {
+            tid: t.thread(),
+            before_pages: snapshot_pages(&t.memory(), &call.args)?,
+        });
+        Ok(())
+    }
+
+    /// Records a syscall, once it's done.
+    pub fn record_syscall_done(
+        &mut self,
+        t: &mut ThreadCx,
+        call: &Syscall,
+        outcome: &Outcome,
+    ) -> Result<()> {
+        let Some(InSyscall::Recording { tid, before_pages }) = self.in_syscall.take() else {
+            return Ok(());
+        };
+        let result = self.record_outcome(t, call, outcome, tid, before_pages);
+        self.state.last_event_instructions = t.guest_instructions();
+        result
+    }
+
+    fn record_outcome(
+        &mut self,
+        t: &mut ThreadCx,
+        call: &Syscall,
+        outcome: &Outcome,
+        tid: ThreadId,
+        before_pages: PageSnapshot,
+    ) -> Result<()> {
+        let (num, args, elr) = (call.number, call.args, call.return_address);
+        let (returned, ended) = match outcome {
+            Outcome::Returned(returned) => (*returned, false),
+            // The process ending (e.g. with its last thread) must happen on replay too.
+            Outcome::Ended(GuestEnd::Exited(_)) => (Returned { x0: 0, x1: 0, flags: 0 }, true),
+            Outcome::Exec(request) => {
+                self.trace.events.push(recordable::LogEvent {
+                    pc: elr,
+                    register_state: args.to_vec(),
+                    tid,
+                    event: Some(recordable::log_event::Event::Exec(recordable::Exec {
+                        path: request.path.to_string_lossy().into_owned(),
+                        argv: request.argv.clone(),
+                        envp: request.envp.clone(),
+                    })),
+                });
+                self.state.event_idx += 1;
+                return Ok(());
+            }
+            Outcome::Switched(switch) => {
+                return self.record_switch(t, elr, num, &args, tid, before_pages, *switch);
+            }
+            Outcome::Resumed | Outcome::ThreadExited | Outcome::Ended(GuestEnd::Crashed { .. }) => {
+                return Ok(());
+            }
+        };
+
+        let mut side_effects = recordable::SideEffects::default();
+        match num {
+            syscalls::SYS_read
+            | syscalls::SYS_pread
+            | syscalls::SYS_read_nocancel
+            | syscalls::SYS_pread_nocancel => {
+                let buf = args[1];
+                let mut data = vec![0; returned.x0 as usize];
+                t.memory().read(buf, &mut data)?;
+                side_effects.memory.push(recordable::side_effects::Memory {
+                    address: buf,
+                    value: data,
+                });
+            }
+            _ => side_effects.memory.extend(diff_pages(&t.memory(), before_pages)?),
+        }
+        self.record_guest_memory_changes(t, &mut side_effects)?;
+        trace!(
+            "Changed mem: {:?}",
+            side_effects
+                .memory
+                .iter()
+                .map(|m| (m.address, m.address + m.value.len() as u64))
+                .collect::<Vec<_>>()
+        );
+        let shared_map = self.record_shared_map(num, &args, returned.flags)?;
+
+        let cpsr =
+            (t.vcpu().get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | returned.flags;
+        side_effects.registers.extend([
+            recordable::side_effects::Register {
+                register: av::Reg::X0 as _,
+                value: returned.x0,
+            },
+            recordable::side_effects::Register {
+                register: av::Reg::X1 as _,
+                value: returned.x1,
+            },
+            recordable::side_effects::Register {
+                register: av::Reg::CPSR as _,
+                value: cpsr,
+            },
+        ]);
+        side_effects.external = self.is_external(num, &args) || ended;
+
+        self.trace.events.push(recordable::LogEvent {
+            pc: elr,
+            register_state: args.to_vec(),
+            tid,
+            event: Some(recordable::log_event::Event::Syscall(
+                recordable::syscall::Syscall {
+                    syscall_number: num as _,
+                    side_effects: Some(side_effects),
+                    shared_map,
+                    descheduled: false,
+                },
+            )),
+        });
+        self.update_fd_table(num, &args, returned.x0, returned.flags)?;
+        self.state.event_idx += 1;
+        debug!(
+            "Returning x0={:x} x1={:x} cpsr={:x}",
+            returned.x0, returned.x1, cpsr
+        );
+        Ok(())
+    }
+
     /// Records a syscall `tid` left the vCPU in, and the switch to the next thread.
     #[allow(clippy::too_many_arguments)]
     fn record_switch(
         &mut self,
-        vcpu: &av::Vcpu,
-        vma: &VirtMemAllocator,
+        t: &mut ThreadCx,
         pc: u64,
         num: u64,
         args: &[u64; 16],
@@ -608,7 +754,7 @@ impl Warpspeed {
             external: self.is_external(num, args),
             ..Default::default()
         };
-        self.record_guest_memory_changes(vma, &mut side_effects)?;
+        self.record_guest_memory_changes(t, &mut side_effects)?;
         self.trace.events.push(recordable::LogEvent {
             pc,
             register_state: args.to_vec(),
@@ -632,22 +778,16 @@ impl Warpspeed {
         );
 
         self.state.event_idx += 1;
-        self.record_switch_in(vcpu, vma, tid, switch)
+        self.record_switch_in(t, tid, switch)
     }
 
     /// Records the switch from `tid` to the thread now on the vCPU.
-    fn record_switch_in(
-        &mut self,
-        vcpu: &av::Vcpu,
-        vma: &VirtMemAllocator,
-        tid: ThreadId,
-        switch: ThreadSwitch,
-    ) -> Result<()> {
-        let registers = Registers::save(vcpu)?;
+    fn record_switch_in(&mut self, t: &ThreadCx, tid: ThreadId, switch: ThreadSwitch) -> Result<()> {
+        let registers = t.registers()?;
         let memory = match self.state.pending.remove(&switch.to) {
             Some(pending) => {
                 self.complete_pending(&pending, &registers)?;
-                diff_pages(vma, pending.before_pages)?
+                diff_pages(&t.memory(), pending.before_pages)?
             }
             None => vec![],
         };
@@ -677,22 +817,48 @@ impl Warpspeed {
         self.update_fd_table(pending.num, &pending.args, registers.x[0], registers.cpsr)
     }
 
+    /// Records where a thread was preempted, and the switch to the next one (now on the vCPU).
+    pub fn record_preemption(&mut self, t: &mut ThreadCx, preemption: &Preemption) -> Result<()> {
+        let tid = preemption
+            .switch
+            .from
+            .context("a preempted thread that had exited")?;
+        let mut side_effects = recordable::SideEffects::default();
+        self.record_guest_memory_changes(t, &mut side_effects)?;
+        self.trace.events.push(recordable::LogEvent {
+            pc: preemption.registers.pc,
+            register_state: vec![],
+            tid,
+            event: Some(recordable::log_event::Event::Preemption(
+                recordable::Preemption {
+                    instructions: preemption.instructions - self.state.last_event_instructions,
+                    registers: Some(registers_to_proto(&preemption.registers)),
+                    side_effects: Some(side_effects),
+                },
+            )),
+        });
+        self.state.event_idx += 1;
+        self.record_switch_in(t, tid, preemption.switch)?;
+        self.state.last_event_instructions = t.guest_instructions();
+        Ok(())
+    }
+
     /// Replays a syscall the current thread left the vCPU in, and the switch to the next thread.
     fn replay_switch(
         &mut self,
-        vm: &mut VmManager,
+        t: &mut ThreadCx,
         num: u64,
         args: &[u64; 16],
         syscall: &recordable::syscall::Syscall,
-    ) -> Result<ExitKind> {
+    ) -> Result<()> {
         let side_effects = syscall.side_effects.as_ref().unwrap();
         if side_effects.external && !self.already_written(num, args) {
             // Only plain forwarded syscalls can block, so there's nothing for appbox to do.
             self.prepare_replay_external_syscall(num, args, syscall)?;
             forward_syscall(num, args);
         }
-        self.replay_allocations(&mut vm.vma(), side_effects)?;
-        self.apply_memory(&mut vm.vma(), &side_effects.memory);
+        self.replay_allocations(t, side_effects)?;
+        self.apply_memory(t, &side_effects.memory);
         self.state.pending.insert(
             self.state.current_tid,
             PendingSyscall {
@@ -702,28 +868,26 @@ impl Warpspeed {
             },
         );
         self.state.event_idx += 1;
-        self.replay_switch_in(vm)
+        self.replay_switch_in(t)
     }
 
     /// Replays the switch to another thread that the next event records.
-    fn replay_switch_in(
-        &mut self,
-        vm: &mut VmManager,
-    ) -> Result<ExitKind> {
-        let Some(event) = self.trace.events.get(self.state.event_idx) else {
-            error!("Replay {}: trace ended mid thread switch", self.state.event_idx);
-            return Ok(ExitKind::Exit);
-        };
+    fn replay_switch_in(&mut self, t: &mut ThreadCx) -> Result<()> {
+        let event = self
+            .trace
+            .events
+            .get(self.state.event_idx)
+            .with_context(|| format!("replay {}: trace ended mid thread switch", self.state.event_idx))?;
         let Some(recordable::log_event::Event::Scheduling(scheduling::Scheduling {
             event: Some(scheduling::scheduling::Event::Switch(switch)),
             ..
         })) = &event.event
         else {
-            error!(
-                "Replay {}: expected a thread switch, got {:?}",
-                self.state.event_idx, event.event
+            anyhow::bail!(
+                "replay {}: expected a thread switch, got {:?}",
+                self.state.event_idx,
+                event.event
             );
-            return Ok(ExitKind::Exit);
         };
         let switch = switch.clone();
         let registers = registers_from_proto(
@@ -732,55 +896,20 @@ impl Warpspeed {
                 .as_ref()
                 .context("thread switch without registers")?,
         )?;
-        registers.restore(&vm.vcpu)?;
-        self.apply_memory(&mut vm.vma(), &switch.memory);
+        t.set_registers(&registers)?;
+        self.apply_memory(t, &switch.memory);
         if let Some(pending) = self.state.pending.remove(&switch.new_tid) {
             self.complete_pending(&pending, &registers)?;
         }
         trace!("Replay {}: switched to thread {}", self.state.event_idx, switch.new_tid);
         self.state.current_tid = switch.new_tid;
         self.state.event_idx += 1;
-        Ok(ExitKind::Continue)
-    }
-
-    /// Handles the current thread's time slice running out (`VmRunResult::Timer`) while recording:
-    /// if appbox preempts it for another thread, records where, and the switch.
-    pub fn handle_timer(&mut self, vm: &mut VmManager) -> Result<()> {
-        if self.mode == Mode::Replay {
-            return Ok(());
-        }
-        let tid = self.trap_handler.current_thread();
-        let instructions = vm.guest_instructions() - self.state.last_event_instructions;
-        let preempted = Registers::save(&vm.vcpu)?;
-        let Some(switch) = self.trap_handler.handle_timer(vm)? else {
-            return Ok(());
-        };
-        let mut side_effects = recordable::SideEffects::default();
-        self.record_guest_memory_changes(&vm.vma(), &mut side_effects)?;
-        self.trace.events.push(recordable::LogEvent {
-            pc: preempted.pc,
-            register_state: vec![],
-            tid,
-            event: Some(recordable::log_event::Event::Preemption(
-                recordable::Preemption {
-                    instructions,
-                    registers: Some(registers_to_proto(&preempted)),
-                    side_effects: Some(side_effects),
-                },
-            )),
-        });
-        self.state.event_idx += 1;
-        self.record_switch_in(&vm.vcpu, &vm.vma(), tid, switch)?;
-        self.state.last_event_instructions = vm.guest_instructions();
         Ok(())
     }
 
     /// The current thread's next preemption, if replay's next event is one: how many guest
     /// instructions after the previous event (as counted when recording), and where.
     pub fn next_preemption(&self) -> Option<(u64, Registers)> {
-        if self.mode != Mode::Replay {
-            return None;
-        }
         let event = self.trace.events.get(self.state.event_idx)?;
         let Some(recordable::log_event::Event::Preemption(preemption)) = &event.event else {
             return None;
@@ -791,20 +920,20 @@ impl Warpspeed {
 
     /// Replays the next event, a preemption, once the guest is where it was preempted: the
     /// switch to the next thread.
-    pub fn apply_preemption(&mut self, vm: &mut VmManager) -> Result<ExitKind> {
+    pub fn apply_preemption(&mut self, t: &mut ThreadCx) -> Result<()> {
         let event = self.trace.events[self.state.event_idx].clone();
         let Some(recordable::log_event::Event::Preemption(preemption)) = event.event else {
             anyhow::bail!("replay {}: not a preemption", self.state.event_idx);
         };
         self.event_writes.clear();
         if let Some(side_effects) = &preemption.side_effects {
-            self.replay_allocations(&mut vm.vma(), side_effects)?;
-            self.apply_memory(&mut vm.vma(), &side_effects.memory);
+            self.replay_allocations(t, side_effects)?;
+            self.apply_memory(t, &side_effects.memory);
         }
         self.state.event_idx += 1;
-        let exit = self.replay_switch_in(vm)?;
-        self.state.last_event_instructions = vm.guest_instructions();
-        Ok(exit)
+        self.replay_switch_in(t)?;
+        self.state.last_event_instructions = t.guest_instructions();
+        Ok(())
     }
 
     /// Where replay is (see [`ReplayState`]).
@@ -812,10 +941,12 @@ impl Warpspeed {
         self.state.clone()
     }
 
-    /// Puts replay back to `state`, as of a checkpoint that `vm` was just restored to.
-    pub fn set_state(&mut self, state: ReplayState, vm: &VmManager) {
+    /// Puts replay back to `state`, as of a checkpoint the guest was just restored to (with
+    /// `instructions` counted so far).
+    pub fn set_state(&mut self, state: ReplayState, instructions: u64) {
         self.state = state;
-        self.state.last_event_instructions = vm.guest_instructions();
+        self.state.last_event_instructions = instructions;
+        self.in_syscall = None;
         self.event_writes.clear();
     }
 
@@ -829,11 +960,6 @@ impl Warpspeed {
         self.state.last_event_instructions
     }
 
-    /// The status the guest exited with, once it has.
-    pub fn exit_status(&self) -> Option<i32> {
-        self.state.exit_status
-    }
-
     /// The guest memory the last event's recorded side effects wrote, as ranges.
     pub fn event_writes(&self) -> &[(u64, usize)] {
         &self.event_writes
@@ -845,31 +971,9 @@ impl Warpspeed {
         self.quiet_until = self.quiet_until.max(event);
     }
 
-    /// See [`DefaultTrapHandler::checkpoint`].
-    pub fn checkpoint(&mut self, vm: &mut VmManager) -> Result<appbox::checkpoint::Checkpoint> {
-        self.trap_handler.checkpoint(vm)
-    }
-
-    /// See [`DefaultTrapHandler::restore`].
-    pub fn restore_checkpoint(
-        &mut self,
-        vm: &mut VmManager,
-        checkpoint: &appbox::checkpoint::Checkpoint,
-    ) -> Result<()> {
-        self.trap_handler.restore(vm, checkpoint)
-    }
-
-    /// See [`DefaultTrapHandler::discard_checkpoint`].
-    pub fn discard_checkpoint(
-        &mut self,
-        vm: &mut VmManager,
-        checkpoint: &appbox::checkpoint::Checkpoint,
-    ) -> Result<()> {
-        self.trap_handler.discard_checkpoint(vm, checkpoint)
-    }
-
     /// Applies recorded writes to guest memory, telling checkpoints first.
-    fn apply_memory(&mut self, vma: &mut VirtMemAllocator, memory: &[side_effects::Memory]) {
+    fn apply_memory(&mut self, t: &ThreadCx, memory: &[side_effects::Memory]) {
+        let mut vma = t.memory();
         for mem in memory {
             vma.log_host_write(mem.address, mem.value.len());
             self.event_writes.push((mem.address, mem.value.len()));
@@ -885,289 +989,179 @@ impl Warpspeed {
             && (args[0] == 1 || args[0] == 2)
     }
 
-    /// Replaces the guest's image as `request` says, like the kernel's exec.
-    pub fn exec(
-        &mut self,
-        vm: VmManager,
-        loader: Loader,
-        request: &ExecRequest,
-    ) -> Result<(VmManager, Loader)> {
-        let (mut vm, loader) = appbox::exec::exec(vm, loader, &mut self.trap_handler, request)?;
-        vm.count_instructions()?;
-        self.state.last_event_instructions = vm.guest_instructions();
-        // Only the calling thread survives, and close-on-exec descriptors are gone.
+    /// Once the guest has exec'd: only the calling thread survives, and close-on-exec
+    /// descriptors are gone.
+    pub fn exec_done(&mut self, t: &ThreadCx) {
+        self.state.last_event_instructions = t.guest_instructions();
         self.state.pending.clear();
-        self.state.fd_table
+        self.state
+            .fd_table
             .retain(|&fd, _| unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } >= 0);
-        Ok((vm, loader))
     }
 
-    /// Handles a syscall (`VmRunResult::Svc`), recording or replaying it.
-    pub fn trap_handler(&mut self, vm: &mut VmManager, loader: &Loader) -> Result<ExitKind> {
-        let exit = self.handle_syscall(vm, loader);
-        self.state.last_event_instructions = vm.guest_instructions();
-        exit
-    }
-
-    fn handle_syscall(&mut self, vm: &mut VmManager, loader: &Loader) -> Result<ExitKind> {
-        let ctx = read_syscall_context(&mut vm.vcpu)?;
-        let elr = ctx.elr;
+    /// Replays a syscall: checks it's the one recorded, then either replays it from the
+    /// recording, or has appbox do it again (its results are then the recording's, see
+    /// [`Self::replay_syscall_done`]).
+    pub fn replay_syscall(&mut self, t: &mut ThreadCx, call: &Syscall) -> Result<Decision> {
+        let (num, args, elr) = (call.number, call.args, call.return_address);
         trace!("ELR_EL1: {:#x}", elr);
-        if ctx.esr != 0x56000080 {
-            error!("Fault!");
-            error!("{}", vm.vcpu);
-            return Ok(ExitKind::Crash("Unhandled fault".to_string()));
-        }
-
-        let num = ctx.num;
-        let args = ctx.args;
         debug!(
             "{}: Incoming syscall ({}) {:x}(x{:x?})",
             self.state.event_idx,
-            syscalls::syscall_name(num).unwrap_or("<unknown>"),
+            call.name().unwrap_or("<unknown>"),
             num,
             args
         );
+        let diverged = Decision::End(GuestEnd::Exited(0));
+        let tid = self.state.current_tid;
+        self.event_writes.clear();
+        let Some(event) = self.trace.events.get(self.state.event_idx) else {
+            error!("Replay {}: past the end of the recording", self.state.event_idx);
+            return Ok(diverged);
+        };
+        if elr != event.pc {
+            error!(
+                "Replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
+                self.state.event_idx, event.pc, elr
+            );
+            return Ok(diverged);
+        }
+        if tid != event.tid {
+            error!(
+                "Replay {}: thread mismatch: expected {}, got {}",
+                self.state.event_idx, event.tid, tid
+            );
+            return Ok(diverged);
+        }
 
-        let mut ret0: u64 = 0;
-        let mut ret1: u64 = 0;
-        let mut cflags: u64 = 0;
-        let mut exit_kind = ExitKind::Continue;
-        let mut side_effects = recordable::SideEffects::default();
-        let mut shared_map = None;
-        let tid;
-        // Stage 2: do the syscall.
-        // If recording:
-        //   1. Snapshot "reachable" memory before the syscall
-        //   2. Perform the syscall
-        //   3. Diff previously stored reachable pages now that the syscall is done, recording what memory changed.
-        //      If the thread left the vCPU instead, that happens when it's switched back to.
-        // If replaying, make sure we're in the correct place and simply apply the side effects.
-        match self.mode {
-            Mode::Record => {
-                tid = self.trap_handler.current_thread();
-                let before_pages = snapshot_pages(&vm.vma(), &args)?;
-
-                let res = self.trap_handler.handle_syscall(&ctx, vm, loader)?;
-                exit_kind = res.exit.clone();
-                if let ExitKind::Exec(request) = &exit_kind {
-                    self.trace.events.push(recordable::LogEvent {
-                        pc: elr,
-                        register_state: args.to_vec(),
-                        tid,
-                        event: Some(recordable::log_event::Event::Exec(recordable::Exec {
-                            path: request.path.to_string_lossy().into_owned(),
-                            argv: request.argv.clone(),
-                            envp: request.envp.clone(),
-                        })),
-                    });
-                    self.state.event_idx += 1;
-                    return Ok(exit_kind);
-                }
-                if exit_kind != ExitKind::Continue && exit_kind != ExitKind::Exit {
-                    return Ok(exit_kind);
-                }
-                if let Some(switch) = res.thread_switch {
-                    self.record_switch(&vm.vcpu, &vm.vma(), elr, num, &args, tid, before_pages, switch)?;
-                    return Ok(ExitKind::Continue);
-                }
-                ret0 = res.ret0;
-                ret1 = res.ret1;
-                cflags = res.cflags;
-
-                match num {
-                    syscalls::SYS_read
-                    | syscalls::SYS_pread
-                    | syscalls::SYS_read_nocancel
-                    | syscalls::SYS_pread_nocancel => {
-                        let buf = args[1];
-                        let count = ret0;
-                        let mut data = vec![0; count as usize];
-                        vm.vma().read(buf, &mut data)?;
-                        side_effects.memory.push(recordable::side_effects::Memory {
-                            address: buf,
-                            value: data,
-                        });
-                    }
-                    _ => side_effects.memory.extend(diff_pages(&vm.vma(), before_pages)?),
-                }
-                self.record_guest_memory_changes(&vm.vma(), &mut side_effects)?;
-
-                trace!(
-                    "Changed mem: {:?}",
-                    side_effects
-                        .memory
-                        .iter()
-                        .map(|m| (m.address, m.address + m.value.len() as u64))
-                        .collect::<Vec<_>>()
+        let syscall = match &event.event {
+            Some(recordable::log_event::Event::Exec(_)) => {
+                self.state.event_idx += 1;
+                return Ok(Decision::Default);
+            }
+            Some(recordable::log_event::Event::Syscall(syscall)) => syscall.clone(),
+            _ => {
+                error!(
+                    "replay {}: unexpected event type: {:?}",
+                    self.state.event_idx, event.event
                 );
-                shared_map = self.record_shared_map(num, &args, cflags)?;
+                return Ok(diverged);
             }
-            Mode::Replay => {
-                tid = self.state.current_tid;
-                self.event_writes.clear();
-                if num == syscalls::SYS_exit {
-                    self.state.exit_status = Some(args[0] as i32);
-                }
-                let Some(event) = self.trace.events.get(self.state.event_idx) else {
-                    error!("Replay {}: past the end of the recording", self.state.event_idx);
-                    return Ok(ExitKind::Exit);
-                };
-                if elr != event.pc {
-                    error!(
-                        "Replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
-                        self.state.event_idx, event.pc, elr
-                    );
-                    return Ok(ExitKind::Exit);
-                }
-                if tid != event.tid {
-                    error!(
-                        "Replay {}: thread mismatch: expected {}, got {}",
-                        self.state.event_idx, event.tid, tid
-                    );
-                    return Ok(ExitKind::Exit);
-                }
-
-                match &event.event {
-                    Some(recordable::log_event::Event::Exec(exec)) => {
-                        let request = ExecRequest {
-                            path: exec.path.clone().into(),
-                            argv: exec.argv.clone(),
-                            envp: exec.envp.clone(),
-                        };
-                        self.state.event_idx += 1;
-                        return Ok(ExitKind::Exec(request));
-                    }
-                    Some(crate::recordable::log_event::Event::Syscall(syscall)) => {
-                        let syscall = syscall.clone();
-                        if num != syscall.syscall_number {
-                            error!(
-                                "Replay {}: syscall mismatch: expected 0x{:x}, got 0x{:x}",
-                                self.state.event_idx, syscall.syscall_number, num
-                            );
-                        }
-                        if syscall.descheduled {
-                            return self.replay_switch(vm, num, &args, &syscall);
-                        }
-
-                        let side_effects_ref = syscall.side_effects.as_ref().unwrap();
-                        let mut res: Option<SyscallResult> = None;
-
-                        if side_effects_ref.external && !self.already_written(num, &args) {
-                            self.prepare_replay_external_syscall(num, &args, &syscall)?;
-                            trace!("Replay syscall index {}", self.state.event_idx);
-                            // appbox only knows about the main thread on replay, so keep the
-                            // current thread's TSD base unless the syscall sets it.
-                            let tpidrro = vm.vcpu.get_sys_reg(av::SysReg::TPIDRRO_EL0)?;
-                            let handler_res =
-                                self.trap_handler.handle_syscall(&ctx, vm, loader)?;
-                            if !(num == 0x8000_0000 && args[3] == 2) {
-                                vm.vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, tpidrro)?;
-                            }
-                            if handler_res.exit != ExitKind::Continue {
-                                return Ok(handler_res.exit);
-                            }
-                            res = Some(handler_res);
-                        }
-
-                        for reg in &side_effects_ref.registers {
-                            trace!("Setting X{:?} to 0x{:x}", reg.register, reg.value);
-                            match reg.register {
-                                0x0 => {
-                                    if side_effects_ref.external {
-                                        if let Some(handler_res) = &res {
-                                            if handler_res.ret0 != reg.value {
-                                                error!(
-                                                    "Replay {}: syscall return value 0 mismatch: expected 0x{:x}, got 0x{:x}",
-                                                    self.state.event_idx, reg.value, handler_res.ret0
-                                                );
-                                            }
-                                        }
-                                    }
-                                    ret0 = reg.value
-                                }
-                                0x1 => {
-                                    if side_effects_ref.external {
-                                        if let Some(handler_res) = &res {
-                                            if handler_res.ret1 != reg.value {
-                                                error!(
-                                                    "Replay {}: syscall return value 1 mismatch: expected 0x{:x}, got 0x{:x}",
-                                                    self.state.event_idx, reg.value, handler_res.ret1
-                                                );
-                                            }
-                                        }
-                                    }
-                                    ret1 = reg.value
-                                }
-                                0x22 => cflags = reg.value,
-                                _ => {
-                                    error!(
-                                        "Replay {}: unexpected register: {:?}",
-                                        self.state.event_idx, reg.register
-                                    );
-                                    return Ok(ExitKind::Exit);
-                                }
-                            }
-                        }
-                        self.replay_allocations(&mut vm.vma(), side_effects_ref)?;
-                        self.apply_memory(&mut vm.vma(), &side_effects_ref.memory);
-                    }
-                    _ => {
-                        error!(
-                            "replay {}: unexpected event type: {:?}",
-                            self.state.event_idx, event.event
-                        );
-                        return Ok(ExitKind::Exit);
-                    }
-                }
-            }
+        };
+        if num != syscall.syscall_number {
+            error!(
+                "Replay {}: syscall mismatch: expected 0x{:x}, got 0x{:x}",
+                self.state.event_idx, syscall.syscall_number, num
+            );
+        }
+        if syscall.descheduled {
+            self.replay_switch(t, num, &args, &syscall)?;
+            self.in_syscall = Some(InSyscall::Replayed);
+            return Ok(Decision::Resumed);
         }
 
-        // Stage 3: now that we've done the syscall, record the final state as side effects.
-        let cpsr = (vm.vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags;
-
-        if self.mode == Mode::Record {
-            side_effects.registers.extend(vec![
-                recordable::side_effects::Register {
-                    register: av::Reg::X0 as _,
-                    value: ret0,
-                },
-                recordable::side_effects::Register {
-                    register: av::Reg::X1 as _,
-                    value: ret1,
-                },
-                recordable::side_effects::Register {
-                    register: av::Reg::CPSR as _,
-                    value: cpsr,
-                },
-            ]);
-            // The process ending (e.g. with its last thread) must happen on replay too.
-            side_effects.external = self.is_external(num, &args) || exit_kind == ExitKind::Exit;
-
-            self.trace.events.push(recordable::LogEvent {
-                pc: elr,
-                register_state: args.to_vec(),
-                tid,
-                event: Some(recordable::log_event::Event::Syscall(
-                    recordable::syscall::Syscall {
-                        syscall_number: num as _,
-                        side_effects: Some(side_effects),
-                        shared_map,
-                        descheduled: false,
-                    },
-                )),
+        let side_effects = syscall.side_effects.as_ref().unwrap();
+        if side_effects.external && !self.already_written(num, &args) {
+            self.prepare_replay_external_syscall(num, &args, &syscall)?;
+            trace!("Replay syscall index {}", self.state.event_idx);
+            self.in_syscall = Some(InSyscall::External {
+                tpidrro: t.vcpu().get_sys_reg(av::SysReg::TPIDRRO_EL0)?,
+                syscall,
+                num,
+                args,
             });
+            return Ok(Decision::Default);
         }
 
-        self.update_fd_table(num, &args, ret0, cflags)?;
+        let Some(returned) = self.recorded_return(&syscall, None) else {
+            return Ok(diverged);
+        };
+        self.replay_side_effects(t, &syscall, num, &args, &returned)?;
+        self.in_syscall = Some(InSyscall::Replayed);
+        Ok(Decision::Return(returned))
+    }
+
+    /// What a syscall returned when recorded (checked against what appbox just returned, if it
+    /// did it again).
+    fn recorded_return(
+        &self,
+        syscall: &recordable::syscall::Syscall,
+        again: Option<&Returned>,
+    ) -> Option<Returned> {
+        let mut returned = Returned { x0: 0, x1: 0, flags: 0 };
+        for reg in &syscall.side_effects.as_ref().unwrap().registers {
+            trace!("Setting X{:?} to 0x{:x}", reg.register, reg.value);
+            let (name, value, recorded) = match reg.register {
+                0x0 => ("0", again.map(|again| again.x0), &mut returned.x0),
+                0x1 => ("1", again.map(|again| again.x1), &mut returned.x1),
+                0x22 => {
+                    returned.flags = reg.value;
+                    continue;
+                }
+                _ => {
+                    error!(
+                        "Replay {}: unexpected register: {:?}",
+                        self.state.event_idx, reg.register
+                    );
+                    return None;
+                }
+            };
+            if let Some(value) = value.filter(|&value| value != reg.value) {
+                error!(
+                    "Replay {}: syscall return value {name} mismatch: expected 0x{:x}, got 0x{:x}",
+                    self.state.event_idx, reg.value, value
+                );
+            }
+            *recorded = reg.value;
+        }
+        Some(returned)
+    }
+
+    fn replay_side_effects(
+        &mut self,
+        t: &mut ThreadCx,
+        syscall: &recordable::syscall::Syscall,
+        num: u64,
+        args: &[u64; 16],
+        returned: &Returned,
+    ) -> Result<()> {
+        let side_effects = syscall.side_effects.as_ref().unwrap();
+        self.replay_allocations(t, side_effects)?;
+        self.apply_memory(t, &side_effects.memory);
+        self.update_fd_table(num, args, returned.x0, returned.flags)?;
         self.state.event_idx += 1;
+        Ok(())
+    }
 
-        if exit_kind != ExitKind::Continue {
-            return Ok(exit_kind);
-        }
-
-        debug!("Returning x0={:x} x1={:x} cpsr={:x}", ret0, ret1, cpsr);
-        write_syscall_result(&mut vm.vcpu, elr, ret0, ret1, cflags)?;
-        Ok(ExitKind::Continue)
+    /// Finishes replaying a syscall once appbox is done with it. Returns whether it was an event
+    /// replayed (rather than e.g. one ending the guest).
+    pub fn replay_syscall_done(&mut self, t: &mut ThreadCx, outcome: &Outcome) -> Result<bool> {
+        let replayed = match self.in_syscall.take() {
+            Some(InSyscall::Replayed) => true,
+            Some(InSyscall::External {
+                syscall,
+                num,
+                args,
+                tpidrro,
+            }) => match outcome {
+                Outcome::Returned(again) => {
+                    // appbox only knows about the main thread on replay, so keep the current
+                    // thread's TSD base unless the syscall sets it.
+                    if !(num == 0x8000_0000 && args[3] == 2) {
+                        t.vcpu().set_sys_reg(av::SysReg::TPIDRRO_EL0, tpidrro)?;
+                    }
+                    let Some(returned) = self.recorded_return(&syscall, Some(again)) else {
+                        anyhow::bail!("replay {}: unreplayable syscall", self.state.event_idx);
+                    };
+                    set_returned(t.vcpu(), &returned)?;
+                    self.replay_side_effects(t, &syscall, num, &args, &returned)?;
+                    true
+                }
+                _ => false,
+            },
+            Some(InSyscall::Recording { .. }) | None => false,
+        };
+        self.state.last_event_instructions = t.guest_instructions();
+        Ok(replayed)
     }
 }

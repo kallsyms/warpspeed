@@ -4,7 +4,10 @@
 //! (and thins out, keeping more of the recent ones), and replays forwards from there.
 //! Reverse-continue scans forwards from the latest checkpoint before where replay is, noting the
 //! debugger's breakpoint and watchpoint hits on the way, then goes back and lands on the last of
-//! them; if there were none, it tries the checkpoint before, and so on.
+//! them; if there were none, it tries the checkpoint before, and so on. Reverse-step replays to
+//! shortly before where replay is and single-steps the rest of the way, noting the state before
+//! it, then replays to that; the first instruction after an event steps back to before the event
+//! (its svc, or where its thread was preempted).
 //!
 //! Positions in the replay (where the debugger stopped, or where a thread was preempted) are
 //! found like preemptions: timed runs of the guest, by its approximate instruction count, to
@@ -21,7 +24,7 @@ use appbox::hyperpom::crash::ExitKind;
 use appbox::loader::Loader;
 use appbox::threads::Registers;
 use appbox::vm::{VmManager, VmRunResult, WatchKind, Watchpoint};
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::recordable::Trace;
 use crate::warpspeed::{Mode, ReplayState, Warpspeed};
@@ -130,6 +133,8 @@ enum Goal<'a> {
     Scan { to: &'a Position, hits: &'a mut Vec<Hit> },
     /// That hit, silently.
     Land(&'a Hit),
+    /// The start of that event, silently.
+    ToEvent(usize),
 }
 
 enum Outcome {
@@ -154,6 +159,17 @@ enum GuestEvent {
     /// Executed the one instruction it was asked to.
     Stepped,
     Other(VmRunResult),
+}
+
+/// What stepping to a position found before it.
+enum Trail {
+    /// The state before it. The instruction count is the position's, as the count drifts while
+    /// stepping.
+    Before(Position),
+    /// Nothing: it's the first state of its event.
+    First,
+    /// It was passed, so the count led the coarse phase astray.
+    Passed,
 }
 
 fn same_point(a: &Registers, b: &Registers) -> bool {
@@ -267,6 +283,22 @@ impl Replayer {
         Ok(())
     }
 
+    /// Takes the debugger's breakpoints and watchpoints out of the VM, or puts them back.
+    fn arm_debugger(&mut self, armed: bool) -> Result<()> {
+        if armed {
+            self.arm_debugger_breakpoints()?;
+        } else {
+            for slot in 1..self.vm_ref().breakpoint_slots()? {
+                self.vm().set_hardware_breakpoint_slot(slot, None)?;
+            }
+        }
+        for slot in 0..self.vm_ref().watchpoint_slots()? {
+            let watchpoint = self.watchpoints.get(slot).copied().filter(|_| armed);
+            self.vm().set_hardware_watchpoint(slot, watchpoint)?;
+        }
+        Ok(())
+    }
+
     /// Sets or clears a debugger watchpoint, as a hardware watchpoint.
     pub fn set_watchpoint(&mut self, watchpoint: Watchpoint, set: bool) -> Result<()> {
         if set {
@@ -293,12 +325,24 @@ impl Replayer {
 
     /// Replays until the debugger's next breakpoint or watchpoint hit, or the end.
     pub fn cont(&mut self) -> Result<Stop> {
+        self.leave_breakpoint()?;
         self.run_recovering(|replayer| replayer.run(Goal::Debugger))
     }
 
     /// Replays one instruction.
     pub fn step(&mut self) -> Result<Stop> {
+        self.leave_breakpoint()?;
         self.run_recovering(|replayer| replayer.run(Goal::Step))
+    }
+
+    /// Resuming at one of the debugger's breakpoints runs its instruction rather than stopping
+    /// for it again, however replay got there.
+    fn leave_breakpoint(&mut self) -> Result<()> {
+        let pc = self.vm_ref().vcpu.get_reg(av::Reg::PC)?;
+        if self.breakpoints.contains(&pc) {
+            self.at_breakpoint = Some(pc);
+        }
+        Ok(())
     }
 
     /// Replays to the end, without a debugger.
@@ -383,6 +427,127 @@ impl Replayer {
             end = self.checkpoints[index].position();
             index -= 1;
         }
+    }
+
+    /// Replays backwards by one instruction: to the state the guest was in before the current
+    /// one, which is found by stepping forwards to here from shortly before.
+    pub fn reverse_step(&mut self) -> Result<Stop> {
+        let target = self.position()?;
+        self.arm_debugger(false)?;
+        let stop = self.go_before(&target).or_else(|err| {
+            warn!("couldn't step backwards, staying put: {err:#}");
+            self.replay_to(&target).map(|()| Stop::Step)
+        });
+        self.arm_debugger(true)?;
+        stop
+    }
+
+    fn go_before(&mut self, target: &Position) -> Result<Stop> {
+        loop {
+            self.replay_to_event(target.event)?;
+            match self.trail(target)? {
+                Trail::Before(previous) => {
+                    self.replay_to(&previous)?;
+                    return Ok(Stop::Step);
+                }
+                Trail::First => break,
+                Trail::Passed if self.careful.contains(&target.event) => {
+                    anyhow::bail!("stepping to {target:?} passed it")
+                }
+                Trail::Passed => {
+                    self.careful.insert(target.event);
+                }
+            }
+        }
+
+        // It's the first instruction since the previous event, so go to just before that.
+        if target.event == self.checkpoints[0].state_event() {
+            self.restore(0)?;
+            return Ok(Stop::Start);
+        }
+        let event = target.event - 1;
+        self.replay_to_event(event)?;
+        if let Some((instructions, registers)) = self.warpspeed.next_preemption() {
+            self.replay_to(&Position {
+                event,
+                instructions,
+                registers,
+            })?;
+            return Ok(Stop::Step);
+        }
+        match self.run_guest(None)? {
+            GuestEvent::Syscall => {}
+            _ => anyhow::bail!("replaying event {event} didn't end in its syscall"),
+        }
+        // Back out of the exception, to before the svc.
+        let vcpu = &self.vm_ref().vcpu;
+        let mut registers = Registers::save_at_syscall(vcpu)?;
+        registers.pc -= 4;
+        registers.restore(vcpu)?;
+        Ok(Stop::Step)
+    }
+
+    /// From the start of `target`'s event, runs to shortly before it, then steps to it, to find
+    /// the state before it.
+    fn trail(&mut self, target: &Position) -> Result<Trail> {
+        if self.run_coarse(target)?.is_some() {
+            return Ok(Trail::Passed);
+        }
+        let mut previous = None;
+        loop {
+            let registers = Registers::save(&self.vm_ref().vcpu)?;
+            if same_point(&registers, &target.registers) {
+                return Ok(previous.map_or(Trail::First, Trail::Before));
+            }
+            previous = Some(Position {
+                event: target.event,
+                instructions: target.instructions,
+                registers,
+            });
+            match self.single_step()? {
+                GuestEvent::Stepped | GuestEvent::Other(VmRunResult::Timer) => {}
+                _ => return Ok(Trail::Passed),
+            }
+        }
+    }
+
+    /// Replays silently from the latest checkpoint before event `event` to its start.
+    fn replay_to_event(&mut self, event: usize) -> Result<()> {
+        loop {
+            self.restore(self.checkpoint_before(event))?;
+            match self.run(Goal::ToEvent(event))? {
+                Outcome::Reached => return Ok(()),
+                Outcome::Missed(missed) => {
+                    self.careful.insert(missed);
+                }
+                Outcome::Stopped(stop) => anyhow::bail!("replaying to event {event}: {stop:?}"),
+            }
+        }
+    }
+
+    /// Replays silently from the latest checkpoint before `position` to it.
+    fn replay_to(&mut self, position: &Position) -> Result<()> {
+        loop {
+            self.restore(self.checkpoint_before(position.event))?;
+            match self.run(Goal::Scan {
+                to: position,
+                hits: &mut Vec::new(),
+            })? {
+                Outcome::Reached => return Ok(()),
+                Outcome::Missed(missed) => {
+                    self.careful.insert(missed);
+                }
+                Outcome::Stopped(stop) => anyhow::bail!("replaying to {position:?}: {stop:?}"),
+            }
+        }
+    }
+
+    /// The latest checkpoint at or before the start of event `event`.
+    fn checkpoint_before(&self, event: usize) -> usize {
+        self.checkpoints
+            .iter()
+            .rposition(|checkpoint| checkpoint.state_event() <= event)
+            .unwrap_or(0)
     }
 
     fn position(&self) -> Result<Position> {
@@ -474,12 +639,15 @@ impl Replayer {
             if let Some(exit) = &self.finished {
                 let stop = Stop::Exited(exit.clone(), self.warpspeed.exit_status());
                 return Ok(match goal {
-                    Goal::Scan { .. } => Outcome::Reached,
+                    Goal::Scan { .. } | Goal::ToEvent(_) => Outcome::Reached,
                     _ => Outcome::Stopped(stop),
                 });
             }
             let event = self.warpspeed.event_index();
             self.high_water = self.high_water.max(event);
+            if matches!(goal, Goal::ToEvent(to) if to == event) {
+                return Ok(Outcome::Reached);
+            }
 
             // The scan's end, if it's in this event. It comes before any preemption in it.
             let mut target = match &goal {
@@ -616,6 +784,7 @@ impl Replayer {
                     return Ok(Some(Outcome::Stopped(hit.stop())));
                 }
             }
+            Goal::ToEvent(_) => {}
         }
         Ok(None)
     }
@@ -671,32 +840,13 @@ impl Replayer {
             }
         };
 
-        // Coarse: timed runs, aiming short of the position.
-        let base = self.warpspeed.last_event_instructions();
-        if !self.careful.contains(&target.event) {
-            loop {
-                let progress = self.vm_ref().guest_instructions() - base;
-                let remaining =
-                    target.instructions as f64 - progress as f64 - POSITION_MARGIN as f64;
-                let ns = remaining * 0.8 / self.max_instructions_per_ns;
-                if ns < MIN_TIMER_NS {
-                    break;
-                }
-                let vm = self.vm();
-                vm.arm_timer(Duration::from_nanos(ns as u64))?;
-                let result = vm.run()?;
-                vm.disarm_timer()?;
-                match self.classify(result)? {
-                    GuestEvent::Other(VmRunResult::Timer) => {}
-                    // The position comes before the next syscall.
-                    GuestEvent::Syscall => return Ok(GuestEvent::Missed),
-                    event => return Ok(event),
-                }
-            }
+        if let Some(event) = self.run_coarse(target)? {
+            return Ok(event);
         }
 
         // Precise: the first breakpoint hit with the position's registers. Each hit retires at
         // least an instruction, so more hits than could possibly remain mean it was missed.
+        let base = self.warpspeed.last_event_instructions();
         let progress = self.vm_ref().guest_instructions() - base;
         let max_hits = target.instructions.saturating_sub(progress) + MISSED_SLACK;
         self.vm()
@@ -727,6 +877,33 @@ impl Replayer {
         };
         self.vm().set_hardware_breakpoint_slot(POSITION_SLOT, None)?;
         Ok(event)
+    }
+
+    /// Runs the guest in timed slices to short of `target` (unless it's to be found carefully).
+    /// Returns what happened instead, if something did.
+    fn run_coarse(&mut self, target: &Position) -> Result<Option<GuestEvent>> {
+        if self.careful.contains(&target.event) {
+            return Ok(None);
+        }
+        let base = self.warpspeed.last_event_instructions();
+        loop {
+            let progress = self.vm_ref().guest_instructions() - base;
+            let remaining = target.instructions as f64 - progress as f64 - POSITION_MARGIN as f64;
+            let ns = remaining * 0.8 / self.max_instructions_per_ns;
+            if ns < MIN_TIMER_NS {
+                return Ok(None);
+            }
+            let vm = self.vm();
+            vm.arm_timer(Duration::from_nanos(ns as u64))?;
+            let result = vm.run()?;
+            vm.disarm_timer()?;
+            match self.classify(result)? {
+                GuestEvent::Other(VmRunResult::Timer) => {}
+                // The position comes before the next syscall.
+                GuestEvent::Syscall => return Ok(Some(GuestEvent::Missed)),
+                event => return Ok(Some(event)),
+            }
+        }
     }
 
     /// What a run's result means, stepping over a watched access so it completes.

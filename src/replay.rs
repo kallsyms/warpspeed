@@ -47,7 +47,7 @@ fn debug_with_gdb(replayer: &mut Replayer, port: u16) -> Result<()> {
         None,
         GdbFeatures {
             reverse_continue: true,
-            reverse_step: false,
+            reverse_step: true,
         },
     )?;
     info!("Waiting for GDB connection on port {port}...");
@@ -68,10 +68,7 @@ fn debug_with_gdb(replayer: &mut Replayer, port: u16) -> Result<()> {
             GdbCommand::Continue => replayer.cont()?,
             GdbCommand::Step => replayer.step()?,
             GdbCommand::BackwardsContinue => replayer.reverse_cont()?,
-            GdbCommand::BackwardsStep => {
-                warn!("stepping backwards isn't supported yet");
-                Stop::Step
-            }
+            GdbCommand::BackwardsStep => replayer.reverse_step()?,
             GdbCommand::Kill => return Ok(()),
             GdbCommand::AddBreakpoint { addr, .. } => {
                 respond(replayer.set_breakpoint(addr, true));

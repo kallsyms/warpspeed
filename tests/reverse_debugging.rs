@@ -180,6 +180,8 @@ fn reverse_continue_to_watchpoints_and_breakpoints() {
             .unwrap(),
     );
     let mut gdb = Gdb::connect(port);
+    // Nothing comes before the start.
+    assert_eq!(gdb.request("bs"), "T05replaylog:begin;");
 
     // Watching writes to `value`, forwards...
     assert_eq!(gdb.request(&format!("Z2,{value:x},8")), "OK");
@@ -208,10 +210,36 @@ fn reverse_continue_to_watchpoints_and_breakpoints() {
     assert_eq!(gdb.register(0), 2);
     assert_eq!(gdb.request("bc"), "S05");
     assert_eq!(gdb.register(0), 1);
+    // Stepping backwards out of set_value goes back through the call to it.
+    let return_address = gdb.register(30);
+    assert_eq!(gdb.request("bs"), "S05");
+    assert_eq!(gdb.register(32), return_address - 4);
+    assert_eq!(gdb.register(0), 1);
+    assert_eq!(gdb.request("s"), "S05");
+    assert_eq!(gdb.register(32), set_value);
     for expected in 2..=5 {
         assert_eq!(gdb.request("c"), "S05");
         assert_eq!(gdb.register(0), expected);
     }
+
+    // Stepping backwards over a syscall: step on into the write() after set_value, over its svc,
+    // then back.
+    assert_eq!(gdb.request(&format!("z0,{set_value:x},4")), "OK");
+    const SVC_0X80: u32 = 0xd4001001;
+    let svc = loop {
+        let pc = gdb.register(32);
+        if gdb.read_u64(pc) as u32 == SVC_0X80 {
+            break pc;
+        }
+        assert_eq!(gdb.request("s"), "S05");
+    };
+    let before = (gdb.register(0), gdb.register(16));
+    assert_eq!(gdb.request("s"), "S05");
+    assert_eq!(gdb.register(32), svc + 4);
+    assert_eq!(gdb.register(0), 8, "write()'s result");
+    assert_eq!(gdb.request("bs"), "S05");
+    assert_eq!(gdb.register(32), svc);
+    assert_eq!((gdb.register(0), gdb.register(16)), before);
     assert_eq!(gdb.request("c"), "W00");
 
     // Which has no reply.

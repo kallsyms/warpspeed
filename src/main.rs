@@ -10,14 +10,17 @@ mod warpspeed;
 mod shared_files;
 
 fn main() -> Result<()> {
+    // Record and replay need the same host (and so guest) address space layout.
+    if let Some(program) = appbox::guest::prepare()? {
+        // A guest the recorded one spawned, which isn't recorded.
+        appbox::guest::Guest::builder(program).run()?.end_process();
+    }
+
     let args = cli::Cli::parse();
 
     env_logger::Builder::new()
         .filter_level(args.verbose.log_level_filter())
         .init();
-
-    // Record and replay need the same host (and so guest) address space layout.
-    appbox::respawn::respawn()?;
 
     match args.command {
         cli::Command::Record(args) => {

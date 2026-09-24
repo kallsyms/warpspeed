@@ -1,16 +1,13 @@
 use anyhow::{Context, Result};
-use appbox::hyperpom::error::{Error as HyperpomError, MemoryError};
-use appbox::hyperpom::memory::VirtMemAllocator;
 use log::{debug, error, trace};
 use std::collections::HashMap;
 
 use appbox::applevisor as av;
 use appbox::guest::{
-    Decision, GuestEnd, GuestFault, Outcome, Preemption, Registers, Returned, Syscall, ThreadCx,
-    ThreadId, ThreadSwitch, ThreadingModel,
+    forward_syscall, Decision, GuestEnd, GuestFault, Memory, Outcome,
+    Preemption, Registers, Returned, Syscall, ThreadCx, ThreadId, ThreadSwitch, ThreadingModel,
 };
 use appbox::syscalls;
-use appbox::trap::{explore_pointers, forward_syscall};
 
 use crate::recordable;
 use crate::recordable::scheduling;
@@ -49,9 +46,9 @@ fn diff_memory(page_addr: u64, old: &[u8], new: &[u8]) -> Vec<side_effects::Memo
 
 type PageSnapshot = HashMap<u64, Vec<u8>>;
 
-fn snapshot_pages(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<PageSnapshot> {
+fn snapshot_pages(vma: &Memory, args: &[u64; 16]) -> Result<PageSnapshot> {
     let mut pages = HashMap::new();
-    for page_addr in explore_pointers(vma, args) {
+    for page_addr in vma.pages_reachable(args) {
         let mut contents: Vec<u8> = vec![0; 0x1000];
         vma.read(page_addr, &mut contents)?;
         pages.insert(page_addr, contents);
@@ -59,28 +56,18 @@ fn snapshot_pages(vma: &VirtMemAllocator, args: &[u64; 16]) -> Result<PageSnapsh
     Ok(pages)
 }
 
-fn diff_pages(vma: &VirtMemAllocator, before: PageSnapshot) -> Result<Vec<side_effects::Memory>> {
+fn diff_pages(vma: &Memory, before: PageSnapshot) -> Result<Vec<side_effects::Memory>> {
     let mut changes = vec![];
     for (page_addr, old_contents) in before {
-        let mut new_contents: Vec<u8> = vec![0; 0x1000];
-        match vma.read(page_addr, &mut new_contents) {
-            Ok(_) => {}
-            // Unmapped by the syscall (e.g. munmap), which replay re-executes.
-            Err(HyperpomError::Memory(MemoryError::UnallocatedMemoryAccess(_))) => continue,
-            Err(err) => return Err(err.into()),
+        // Unmapped by the syscall (e.g. munmap), which replay re-executes.
+        if !vma.is_mapped(page_addr) {
+            continue;
         }
+        let mut new_contents: Vec<u8> = vec![0; 0x1000];
+        vma.read(page_addr, &mut new_contents)?;
         changes.extend(diff_memory(page_addr, &old_contents, &new_contents));
     }
     Ok(changes)
-}
-
-fn apply_memory(memory: &[side_effects::Memory]) {
-    for mem in memory {
-        trace!("Writing to 0x{:x}", mem.address);
-        unsafe {
-            std::ptr::copy(mem.value.as_ptr(), mem.address as _, mem.value.len());
-        }
-    }
 }
 
 fn registers_to_proto(regs: &Registers) -> scheduling::Registers {
@@ -257,7 +244,7 @@ pub struct Warpspeed {
 /// Recording and replaying rely on the guest's threads taking turns on one vCPU.
 pub fn ensure_time_shared(t: &ThreadCx) -> Result<()> {
     anyhow::ensure!(
-        t.handler().threading() == ThreadingModel::TimeShared,
+        t.threading() == ThreadingModel::TimeShared,
         "recording and replaying need the guest's threads time-shared, not in parallel"
     );
     Ok(())
@@ -591,9 +578,7 @@ impl Warpspeed {
         side_effects: &recordable::SideEffects,
     ) -> Result<()> {
         for allocation in &side_effects.allocations {
-            let address = t
-                .handler()
-                .allocate_guest_memory(&mut t.memory(), allocation.size)?;
+            let address = t.allocate_guest_memory(allocation.size)?;
             anyhow::ensure!(
                 address == allocation.address,
                 "replay {}: allocation landed at {:#x}, not {:#x}",
@@ -858,7 +843,7 @@ impl Warpspeed {
             forward_syscall(num, args);
         }
         self.replay_allocations(t, side_effects)?;
-        self.apply_memory(t, &side_effects.memory);
+        self.apply_memory(t, &side_effects.memory)?;
         self.state.pending.insert(
             self.state.current_tid,
             PendingSyscall {
@@ -897,7 +882,7 @@ impl Warpspeed {
                 .context("thread switch without registers")?,
         )?;
         t.set_registers(&registers)?;
-        self.apply_memory(t, &switch.memory);
+        self.apply_memory(t, &switch.memory)?;
         if let Some(pending) = self.state.pending.remove(&switch.new_tid) {
             self.complete_pending(&pending, &registers)?;
         }
@@ -928,7 +913,7 @@ impl Warpspeed {
         self.event_writes.clear();
         if let Some(side_effects) = &preemption.side_effects {
             self.replay_allocations(t, side_effects)?;
-            self.apply_memory(t, &side_effects.memory);
+            self.apply_memory(t, &side_effects.memory)?;
         }
         self.state.event_idx += 1;
         self.replay_switch_in(t)?;
@@ -971,14 +956,15 @@ impl Warpspeed {
         self.quiet_until = self.quiet_until.max(event);
     }
 
-    /// Applies recorded writes to guest memory, telling checkpoints first.
-    fn apply_memory(&mut self, t: &ThreadCx, memory: &[side_effects::Memory]) {
+    /// Applies recorded writes to guest memory.
+    fn apply_memory(&mut self, t: &ThreadCx, memory: &[side_effects::Memory]) -> Result<()> {
         let mut vma = t.memory();
         for mem in memory {
-            vma.log_host_write(mem.address, mem.value.len());
+            trace!("Writing to 0x{:x}", mem.address);
+            vma.write(mem.address, &mem.value)?;
             self.event_writes.push((mem.address, mem.value.len()));
         }
-        apply_memory(memory);
+        Ok(())
     }
 
     /// Whether replaying syscall `num` should skip actually doing it, as a write to
@@ -1127,7 +1113,7 @@ impl Warpspeed {
     ) -> Result<()> {
         let side_effects = syscall.side_effects.as_ref().unwrap();
         self.replay_allocations(t, side_effects)?;
-        self.apply_memory(t, &side_effects.memory);
+        self.apply_memory(t, &side_effects.memory)?;
         self.update_fd_table(num, args, returned.x0, returned.flags)?;
         self.state.event_idx += 1;
         Ok(())

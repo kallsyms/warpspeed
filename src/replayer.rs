@@ -106,7 +106,7 @@ impl Hit {
 }
 
 struct Checkpoint {
-    appbox: appbox::checkpoint::Checkpoint,
+    appbox: appbox::guest::Checkpoint,
     state: ReplayState,
     registers: Registers,
     /// Checkpoints taken before, to judge its age when thinning them out.

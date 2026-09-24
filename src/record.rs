@@ -215,7 +215,6 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                             }
                         }
                     }
-                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)?;
                     ExitKind::Continue
                 } else if notification_sender.is_none() {
                     // No debugger set any breakpoints, so the guest trapped (e.g. abort()).
@@ -248,7 +247,6 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                             }
                         }
                     }
-                    appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)?;
                     ExitKind::Continue
                 }
             }

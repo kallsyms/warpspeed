@@ -3,6 +3,7 @@ syntax = "proto3";
 package warpspeed.recordable;
 
 import "src/recordable/scheduling/scheduling.proto";
+import "src/recordable/side_effects.proto";
 import "src/recordable/syscall/syscall.proto";
 
 // Top level messages are broken up roughly by if they would be self-contained
@@ -30,6 +31,18 @@ message Trace {
   repeated SharedFile shared_files = 3;
 }
 
+// The current thread's time slice ran out at an instruction that isn't a syscall. The next event
+// is the switch to another thread.
+message Preemption {
+  // Guest instructions retired since the previous event, as appbox counts them: an upper bound,
+  // exact but for host interrupts meanwhile, which only add.
+  uint64 instructions = 1;
+  // The thread's registers where it was preempted.
+  warpspeed.recordable.scheduling.Registers registers = 2;
+  // What appbox did to guest memory while switching threads (e.g. delivering kevents).
+  warpspeed.recordable.SideEffects side_effects = 3;
+}
+
 // The guest replaced its image, as with execve().
 message Exec {
   string path = 1;
@@ -48,5 +61,6 @@ message LogEvent {
     warpspeed.recordable.syscall.Syscall syscall = 10;
     warpspeed.recordable.scheduling.Scheduling scheduling = 12;
     Exec exec = 13;
+    Preemption preemption = 14;
   }
 }

@@ -52,6 +52,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
     vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
     vm.vcpu
         .set_sys_reg(av::SysReg::SP_EL0, loader.stack_pointer)?;
+    vm.count_instructions()?;
 
     // GDB server channels
     let (command_sender, command_receiver) = std::sync::mpsc::channel();
@@ -103,7 +104,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
         }
     }
 
-    let mut final_exit = ExitKind::Continue;
+    let final_exit;
     loop {
         trace!("Running VCPU");
         let run_result = vm.run()?;
@@ -152,7 +153,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
 
         let exit = match run_result {
             VmRunResult::Svc => {
-                let exit = warpspeed.trap_handler(&mut vm.vcpu, &mut vm.vma, &loader)?;
+                let exit = warpspeed.trap_handler(&mut vm, &loader)?;
 
                 if let ExitKind::Crash(_) = exit {
                     // Send SIGSEGV signal to GDB to indicate fault
@@ -174,6 +175,13 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                 }
 
                 exit
+            }
+            VmRunResult::Timer => {
+                warpspeed.handle_timer(&mut vm)?;
+                ExitKind::Continue
+            }
+            VmRunResult::HardwareBreakpoint | VmRunResult::Step => {
+                ExitKind::Crash("unexpected debug exception".to_string())
             }
             VmRunResult::Brk => {
                 let pc = vm.vcpu.get_reg(av::Reg::PC)?;

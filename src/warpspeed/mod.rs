@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use appbox::hyperpom::error::{Error as HyperpomError, MemoryError};
 use appbox::hyperpom::memory::VirtMemAllocator;
 use appbox::loader::Loader;
-use log::{debug, error, trace};
-use std::collections::HashMap;
+use log::{debug, error, info, trace};
+use std::collections::{BTreeSet, HashMap};
 
 use appbox::applevisor as av;
 use appbox::exec::ExecRequest;
 use appbox::hyperpom::crash::ExitKind;
-use appbox::vm::VmManager;
+use appbox::vm::{VmManager, VmRunResult};
+use std::time::Duration;
 use appbox::syscalls;
 use appbox::threads::{Registers, ThreadId, ThreadSwitch};
 use appbox::trap::{
@@ -138,6 +139,59 @@ fn registers_from_proto(regs: &scheduling::Registers) -> Result<Registers> {
     })
 }
 
+/// How far short of a recorded preemption's instruction count replay stops timing the guest and
+/// starts looking for its registers at a breakpoint. It must cover how much host interrupts
+/// inflated the recorded count (seen up to ~100k in a ~3ms slice).
+const PREEMPTION_MARGIN: u64 = 150_000;
+/// Faster than any Apple core retires instructions (8 per cycle at ~3.2GHz), so a timed slice
+/// sized assuming it can't overshoot. Measuring the rate instead isn't safe: a slice in which the
+/// host descheduled the vCPU's thread measures slow.
+const MAX_INSTRUCTIONS_PER_NS: f64 = 26.0;
+/// The shortest timed slice worth running before switching to breakpoints.
+const MIN_TIMER_NS: f64 = 2_000.0;
+/// How far past the point the breakpoint phase could be, given the instruction counts, before
+/// concluding it was missed: covers host interrupts inflating the counts.
+const MISSED_SLACK: u64 = 500_000;
+
+/// Whether `a` is the same point in a thread's execution as `b`, as far as registers show.
+fn same_point(a: &Registers, b: &Registers) -> bool {
+    a.pc == b.pc && a.sp == b.sp && a.x == b.x && a.q == b.q && a.cpsr >> 28 == b.cpsr >> 28
+}
+
+/// How a replay proceeds, adjusted each time it restarts after missing a preemption point.
+#[derive(Clone, Debug)]
+pub struct ReplayPlan {
+    /// Preemptions (by event index) to find without timing the guest first: breakpoint hits from
+    /// the previous event on, which is slow but can't overshoot.
+    pub careful: BTreeSet<usize>,
+    /// Events before this were already replayed by an earlier attempt, so their writes to
+    /// stdout/stderr aren't repeated.
+    pub quiet_until: usize,
+    /// How fast the guest is assumed to run at most, when timing it towards a preemption. Only
+    /// lowered to test recovering from overshooting.
+    pub max_instructions_per_ns: f64,
+}
+
+impl Default for ReplayPlan {
+    fn default() -> Self {
+        Self {
+            careful: BTreeSet::new(),
+            quiet_until: 0,
+            max_instructions_per_ns: MAX_INSTRUCTIONS_PER_NS,
+        }
+    }
+}
+
+/// The outcome of [`Warpspeed::replay_preemption`].
+pub enum PreemptionReplay {
+    Replayed(ExitKind),
+    /// The guest stopped on the way for something to handle as usual, e.g. a debugger's
+    /// breakpoint. Replaying the preemption resumes from there.
+    Stopped(VmRunResult),
+    /// The guest ran past the preemption point, so the replay must restart (see [`ReplayPlan`]).
+    Missed { event: usize },
+}
+
 /// A syscall a thread left the vCPU in, whose results come when it's switched back to.
 struct PendingSyscall {
     num: u64,
@@ -238,6 +292,10 @@ pub struct Warpspeed {
     trap_handler: DefaultTrapHandler,
     /// Replay only: the thread on the vCPU.
     current_tid: ThreadId,
+    /// The VM's count of guest instructions at the last event (see `Preemption.instructions`).
+    last_event_instructions: u64,
+    /// Replay only: see [`ReplayPlan`].
+    plan: ReplayPlan,
     pending: HashMap<ThreadId, PendingSyscall>,
     fd_table: HashMap<i32, FdState>,
     shared_file_ids_by_identity: HashMap<(u64, u64), u64>,
@@ -264,12 +322,19 @@ impl Warpspeed {
             .map(|shared_file| (shared_file.id, shared_file))
             .collect::<HashMap<_, _>>();
 
+        let mut trap_handler = DefaultTrapHandler::new()?;
+        if mode == Mode::Replay {
+            // Thread switches come from the recording.
+            trap_handler.set_quantum(None);
+        }
         Ok(Self {
             trace,
             mode,
             event_idx: 0,
-            trap_handler: DefaultTrapHandler::new()?,
+            trap_handler,
             current_tid: 0,
+            last_event_instructions: 0,
+            plan: ReplayPlan::default(),
             pending: HashMap::new(),
             fd_table: HashMap::new(),
             shared_file_ids_by_identity,
@@ -592,6 +657,18 @@ impl Warpspeed {
             },
         );
 
+        self.event_idx += 1;
+        self.record_switch_in(vcpu, vma, tid, switch)
+    }
+
+    /// Records the switch from `tid` to the thread now on the vCPU.
+    fn record_switch_in(
+        &mut self,
+        vcpu: &av::Vcpu,
+        vma: &VirtMemAllocator,
+        tid: ThreadId,
+        switch: ThreadSwitch,
+    ) -> Result<()> {
         let registers = Registers::save(vcpu)?;
         let memory = match self.pending.remove(&switch.to) {
             Some(pending) => {
@@ -617,7 +694,7 @@ impl Warpspeed {
                 },
             )),
         });
-        self.event_idx += 2;
+        self.event_idx += 1;
         Ok(())
     }
 
@@ -636,7 +713,7 @@ impl Warpspeed {
         syscall: &recordable::syscall::Syscall,
     ) -> Result<ExitKind> {
         let side_effects = syscall.side_effects.as_ref().unwrap();
-        if side_effects.external {
+        if side_effects.external && !self.already_written(num, args) {
             // Only plain forwarded syscalls can block, so there's nothing for appbox to do.
             self.prepare_replay_external_syscall(num, args, syscall)?;
             forward_syscall(num, args);
@@ -652,7 +729,11 @@ impl Warpspeed {
             },
         );
         self.event_idx += 1;
+        self.replay_switch_in(vcpu)
+    }
 
+    /// Replays the switch to another thread that the next event records.
+    fn replay_switch_in(&mut self, vcpu: &mut av::Vcpu) -> Result<ExitKind> {
         let Some(event) = self.trace.events.get(self.event_idx) else {
             error!("Replay {}: trace ended mid thread switch", self.event_idx);
             return Ok(ExitKind::Exit);
@@ -686,6 +767,189 @@ impl Warpspeed {
         Ok(ExitKind::Continue)
     }
 
+    /// Handles the current thread's time slice running out (`VmRunResult::Timer`) while recording:
+    /// if appbox preempts it for another thread, records where, and the switch.
+    pub fn handle_timer(&mut self, vm: &mut VmManager) -> Result<()> {
+        if self.mode == Mode::Replay {
+            return Ok(());
+        }
+        let tid = self.trap_handler.current_thread();
+        let instructions = vm.guest_instructions() - self.last_event_instructions;
+        let preempted = Registers::save(&vm.vcpu)?;
+        let Some(switch) = self.trap_handler.handle_timer(&vm.vcpu, &mut vm.vma)? else {
+            return Ok(());
+        };
+        let mut side_effects = recordable::SideEffects::default();
+        self.record_guest_memory_changes(&vm.vma, &mut side_effects)?;
+        self.trace.events.push(recordable::LogEvent {
+            pc: preempted.pc,
+            register_state: vec![],
+            tid,
+            event: Some(recordable::log_event::Event::Preemption(
+                recordable::Preemption {
+                    instructions,
+                    registers: Some(registers_to_proto(&preempted)),
+                    side_effects: Some(side_effects),
+                },
+            )),
+        });
+        self.event_idx += 1;
+        self.record_switch_in(&vm.vcpu, &vm.vma, tid, switch)?;
+        self.last_event_instructions = vm.guest_instructions();
+        Ok(())
+    }
+
+    /// Whether replay's next event is a preemption, which [`Self::replay_preemption`] must run
+    /// the guest to.
+    pub fn preemption_next(&self) -> bool {
+        self.mode == Mode::Replay
+            && matches!(
+                self.trace.events.get(self.event_idx).and_then(|e| e.event.as_ref()),
+                Some(recordable::log_event::Event::Preemption(_))
+            )
+    }
+
+    /// Runs the current thread to where it was preempted while recording, and replays the switch
+    /// to the next thread.
+    ///
+    /// There's no guest PMU to interrupt the guest after a number of instructions, so this gets
+    /// close using the VM's (approximate) instruction count and its timer, stopping short by
+    /// [`PREEMPTION_MARGIN`], then puts a hardware breakpoint on the recorded pc and stops at the
+    /// first hit with the recorded registers. In a loop, those differ from iteration to iteration
+    /// unless the loop changes nothing (e.g. spinning on memory that no running thread changes),
+    /// in which case any iteration is the same state.
+    pub fn replay_preemption(&mut self, vm: &mut VmManager) -> Result<PreemptionReplay> {
+        let event = self.trace.events[self.event_idx].clone();
+        let Some(recordable::log_event::Event::Preemption(preemption)) = event.event else {
+            unreachable!("preemption_next checked");
+        };
+        if event.tid != self.current_tid {
+            error!(
+                "Replay {}: thread mismatch: expected {}, got {}",
+                self.event_idx, event.tid, self.current_tid
+            );
+            return Ok(PreemptionReplay::Replayed(ExitKind::Exit));
+        }
+        let target = registers_from_proto(
+            preemption
+                .registers
+                .as_ref()
+                .context("preemption without registers")?,
+        )?;
+
+        // Coarse: run the guest in timed slices, aiming short of the recorded count.
+        let base = self.last_event_instructions;
+        let mut slices = 0;
+        while !self.plan.careful.contains(&self.event_idx) {
+            let progress = vm.guest_instructions() - base;
+            let remaining =
+                preemption.instructions as f64 - progress as f64 - PREEMPTION_MARGIN as f64;
+            let ns = remaining * 0.8 / self.plan.max_instructions_per_ns;
+            if ns < MIN_TIMER_NS {
+                break;
+            }
+            slices += 1;
+            vm.arm_timer(Duration::from_nanos(ns as u64))?;
+            let result = vm.run()?;
+            vm.disarm_timer()?;
+            if matches!(result, VmRunResult::Brk) {
+                return Ok(PreemptionReplay::Stopped(result));
+            }
+            if !matches!(result, VmRunResult::Timer) {
+                error!(
+                    "Replay {}: the guest stopped for something else while timing it",
+                    self.event_idx
+                );
+                return Ok(self.missed_preemption());
+            }
+        }
+        let coarse_end = vm.guest_instructions() - base;
+        // Each hit retires at least an instruction, so more hits than could possibly remain
+        // mean it was missed.
+        let max_hits = preemption.instructions.saturating_sub(coarse_end) + MISSED_SLACK;
+
+        // Precise: the first breakpoint hit with the recorded registers.
+        vm.set_hardware_breakpoint(Some(target.pc))?;
+        let mut hits = 0u64;
+        let found = loop {
+            match vm.run()? {
+                VmRunResult::Brk => {
+                    vm.set_hardware_breakpoint(None)?;
+                    return Ok(PreemptionReplay::Stopped(VmRunResult::Brk));
+                }
+                VmRunResult::HardwareBreakpoint => {
+                    hits += 1;
+                    if same_point(&Registers::save(&vm.vcpu)?, &target) {
+                        break true;
+                    }
+                    if hits > max_hits {
+                        break false;
+                    }
+                    vm.single_step()?;
+                }
+                VmRunResult::Step => {}
+                // Past the next syscall (or worse) without finding it.
+                _ => break false,
+            }
+        };
+        vm.set_hardware_breakpoint(None)?;
+        if !found {
+            error!(
+                "Replay {}: recorded {} instructions, timed slices got to {} ({} slices), then {} breakpoint hits",
+                self.event_idx, preemption.instructions, coarse_end, slices, hits
+            );
+            return Ok(self.missed_preemption());
+        }
+        debug!(
+            "Replay {}: found preemption point at {:#x}: recorded {} instructions, timed slices got to {} ({} slices), then {} breakpoint hits",
+            self.event_idx, target.pc, preemption.instructions, coarse_end, slices, hits
+        );
+
+        if let Some(side_effects) = &preemption.side_effects {
+            self.replay_allocations(&mut vm.vma, side_effects)?;
+            apply_memory(&side_effects.memory);
+        }
+        self.event_idx += 1;
+        let exit = self.replay_switch_in(&mut vm.vcpu)?;
+        self.last_event_instructions = vm.guest_instructions();
+        Ok(PreemptionReplay::Replayed(exit))
+    }
+
+    fn missed_preemption(&self) -> PreemptionReplay {
+        info!(
+            "Replay {}: ran past where the thread was preempted",
+            self.event_idx
+        );
+        PreemptionReplay::Missed {
+            event: self.event_idx,
+        }
+    }
+
+    /// Whether replay is still redoing what an earlier attempt already did (see
+    /// [`ReplayPlan::quiet_until`]): a debugger has already seen it, so mustn't again.
+    pub fn catching_up(&self) -> bool {
+        self.event_idx < self.plan.quiet_until
+    }
+
+    /// Releases the host memory backing the guest, so another can be loaded in its place (e.g.
+    /// to replay again from the start). Drop the guest's loader and VM afterwards.
+    pub fn release_guest(&mut self) {
+        self.trap_handler.prepare_for_exec();
+    }
+
+    /// Sets how this replay proceeds (see [`ReplayPlan`]).
+    pub fn set_replay_plan(&mut self, plan: ReplayPlan) {
+        self.plan = plan;
+    }
+
+    /// Whether replaying syscall `num` should skip actually doing it, as a write to
+    /// stdout/stderr an earlier attempt already did.
+    fn already_written(&self, num: u64, args: &[u64; 16]) -> bool {
+        self.event_idx < self.plan.quiet_until
+            && num == syscalls::SYS_write_nocancel
+            && (args[0] == 1 || args[0] == 2)
+    }
+
     /// Replaces the guest's image as `request` says, like the kernel's exec.
     pub fn exec(
         &mut self,
@@ -693,7 +957,9 @@ impl Warpspeed {
         loader: Loader,
         request: &ExecRequest,
     ) -> Result<(VmManager, Loader)> {
-        let (vm, loader) = appbox::exec::exec(vm, loader, &mut self.trap_handler, request)?;
+        let (mut vm, loader) = appbox::exec::exec(vm, loader, &mut self.trap_handler, request)?;
+        vm.count_instructions()?;
+        self.last_event_instructions = vm.guest_instructions();
         // Only the calling thread survives, and close-on-exec descriptors are gone.
         self.pending.clear();
         self.fd_table
@@ -701,7 +967,14 @@ impl Warpspeed {
         Ok((vm, loader))
     }
 
-    pub fn trap_handler(
+    /// Handles a syscall (`VmRunResult::Svc`), recording or replaying it.
+    pub fn trap_handler(&mut self, vm: &mut VmManager, loader: &Loader) -> Result<ExitKind> {
+        let exit = self.handle_syscall(&mut vm.vcpu, &mut vm.vma, loader);
+        self.last_event_instructions = vm.guest_instructions();
+        exit
+    }
+
+    fn handle_syscall(
         &mut self,
         vcpu: &mut av::Vcpu,
         vma: &mut VirtMemAllocator,
@@ -843,7 +1116,7 @@ impl Warpspeed {
                         let side_effects_ref = syscall.side_effects.as_ref().unwrap();
                         let mut res: Option<SyscallResult> = None;
 
-                        if side_effects_ref.external {
+                        if side_effects_ref.external && !self.already_written(num, &args) {
                             self.prepare_replay_external_syscall(num, &args, &syscall)?;
                             trace!("Replay syscall index {}", self.event_idx);
                             // appbox only knows about the main thread on replay, so keep the

@@ -3,6 +3,7 @@ echo
 exec
 mmap_shared
 multithread
+preempt
 rand
 threads
 time

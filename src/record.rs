@@ -83,14 +83,14 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                             // Get current instruction to determine next PC
                             let pc = vm.vcpu.get_reg(av::Reg::PC)?;
                             let mut insn_bytes = [0; 4];
-                            vm.vma.read(pc, &mut insn_bytes)?;
+                            vm.vma().read(pc, &mut insn_bytes)?;
 
                             // For now, assume next instruction is at PC + 4
                             // TODO: Enhance this to handle branches properly by using instruction emulation
                             let next_pc = pc + 4;
 
                             // Set new single step breakpoint
-                            vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
+                            vm.hooks().add_breakpoint(next_pc, &mut vm.vma())?;
                             single_step_breakpoint = Some(next_pc);
                             break;
                         }
@@ -115,7 +115,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
         //         appbox::gdb::GdbCommand::Continue => {
         //             // Remove single step breakpoint if it exists
         //             if let Some(addr) = single_step_breakpoint.take() {
-        //                 let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+        //                 let _ = vm.hooks().remove_breakpoint(addr, &mut vm.vma());
         //             }
         //             break;
         //         }
@@ -124,11 +124,11 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
         //             // Get current instruction to determine next PC
         //             let pc = vm.vcpu.get_reg(av::Reg::PC).unwrap();
         //             let mut insn_bytes = [0; 4];
-        //             vm.vma.read(pc, &mut insn_bytes).unwrap();
+        //             vm.vma().read(pc, &mut insn_bytes).unwrap();
 
         //             // Remove previous single step breakpoint if it exists
         //             if let Some(addr) = single_step_breakpoint.take() {
-        //                 let _ = vm.hooks.remove_breakpoint(addr, &mut vm.vma);
+        //                 let _ = vm.hooks().remove_breakpoint(addr, &mut vm.vma());
         //             }
 
         //             // For now, assume next instruction is at PC + 4
@@ -136,7 +136,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
         //             let next_pc = pc + 4;
 
         //             // Set new single step breakpoint
-        //             vm.hooks.add_breakpoint(next_pc, &mut vm.vma).unwrap();
+        //             vm.hooks().add_breakpoint(next_pc, &mut vm.vma()).unwrap();
         //             single_step_breakpoint = Some(next_pc);
         //             break;
         //         }
@@ -189,9 +189,9 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                 // Check if this is our single step breakpoint
                 if Some(pc) == single_step_breakpoint {
                     debug!("Single step completed at {:#x}", pc);
-                    vm.hooks.prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)?;
+                    vm.prepare_for_debugger()?;
                     // Remove the single step breakpoint
-                    vm.hooks.remove_breakpoint(pc, &mut vm.vma)?;
+                    vm.hooks().remove_breakpoint(pc, &mut vm.vma())?;
                     single_step_breakpoint = None;
                     if let Some(ref sender) = notification_sender {
                         sender.send(appbox::gdb::GdbNotification::Stop(
@@ -205,8 +205,8 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                                 appbox::gdb::GdbCommand::Continue => break,
                                 appbox::gdb::GdbCommand::Step => {
                                     let next_pc =
-                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma)?;
-                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
+                                        vm.hooks().compute_step_target(&vm.vcpu, &vm.vma())?;
+                                    vm.hooks().add_breakpoint(next_pc, &mut vm.vma())?;
                                     single_step_breakpoint = Some(next_pc);
                                     break;
                                 }
@@ -224,7 +224,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                 } else {
                     debug!("Breakpoint hit at {:#x}", pc);
                     // Restore original instruction
-                    vm.hooks.prepare_for_debugger(&mut vm.vcpu, &mut vm.vma)?;
+                    vm.prepare_for_debugger()?;
                     if let Some(ref sender) = notification_sender {
                         sender.send(appbox::gdb::GdbNotification::Stop(
                             5, // SIGTRAP
@@ -237,8 +237,8 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                                 appbox::gdb::GdbCommand::Continue => break,
                                 appbox::gdb::GdbCommand::Step => {
                                     let next_pc =
-                                        vm.hooks.compute_step_target(&vm.vcpu, &vm.vma)?;
-                                    vm.hooks.add_breakpoint(next_pc, &mut vm.vma)?;
+                                        vm.hooks().compute_step_target(&vm.vcpu, &vm.vma())?;
+                                    vm.hooks().add_breakpoint(next_pc, &mut vm.vma())?;
                                     single_step_breakpoint = Some(next_pc);
                                     break;
                                 }
@@ -289,7 +289,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                             let elr = vm.vcpu.get_sys_reg(av::SysReg::ELR_EL1).unwrap_or(0);
                             if elr != 0 {
                                 let mut insn = [0u8; 4];
-                                if vm.vma.read(elr, &mut insn).is_ok() {
+                                if vm.vma().read(elr, &mut insn).is_ok() {
                                     let word = u32::from_le_bytes(insn);
                                     error!("ELR_EL1: 0x{:016x} insn=0x{:08x}", elr, word);
                                 } else {

@@ -674,8 +674,7 @@ impl Warpspeed {
     /// Replays a syscall the current thread left the vCPU in, and the switch to the next thread.
     fn replay_switch(
         &mut self,
-        vcpu: &mut av::Vcpu,
-        vma: &mut VirtMemAllocator,
+        vm: &mut VmManager,
         num: u64,
         args: &[u64; 16],
         syscall: &recordable::syscall::Syscall,
@@ -686,8 +685,8 @@ impl Warpspeed {
             self.prepare_replay_external_syscall(num, args, syscall)?;
             forward_syscall(num, args);
         }
-        self.replay_allocations(vma, side_effects)?;
-        self.apply_memory(vma, &side_effects.memory);
+        self.replay_allocations(&mut vm.vma(), side_effects)?;
+        self.apply_memory(&mut vm.vma(), &side_effects.memory);
         self.state.pending.insert(
             self.state.current_tid,
             PendingSyscall {
@@ -697,14 +696,13 @@ impl Warpspeed {
             },
         );
         self.state.event_idx += 1;
-        self.replay_switch_in(vcpu, vma)
+        self.replay_switch_in(vm)
     }
 
     /// Replays the switch to another thread that the next event records.
     fn replay_switch_in(
         &mut self,
-        vcpu: &mut av::Vcpu,
-        vma: &mut VirtMemAllocator,
+        vm: &mut VmManager,
     ) -> Result<ExitKind> {
         let Some(event) = self.trace.events.get(self.state.event_idx) else {
             error!("Replay {}: trace ended mid thread switch", self.state.event_idx);
@@ -728,8 +726,8 @@ impl Warpspeed {
                 .as_ref()
                 .context("thread switch without registers")?,
         )?;
-        registers.restore(vcpu)?;
-        self.apply_memory(vma, &switch.memory);
+        registers.restore(&vm.vcpu)?;
+        self.apply_memory(&mut vm.vma(), &switch.memory);
         if let Some(pending) = self.state.pending.remove(&switch.new_tid) {
             self.complete_pending(&pending, &registers)?;
         }
@@ -748,11 +746,11 @@ impl Warpspeed {
         let tid = self.trap_handler.current_thread();
         let instructions = vm.guest_instructions() - self.state.last_event_instructions;
         let preempted = Registers::save(&vm.vcpu)?;
-        let Some(switch) = self.trap_handler.handle_timer(&vm.vcpu, &mut vm.vma)? else {
+        let Some(switch) = self.trap_handler.handle_timer(vm)? else {
             return Ok(());
         };
         let mut side_effects = recordable::SideEffects::default();
-        self.record_guest_memory_changes(&vm.vma, &mut side_effects)?;
+        self.record_guest_memory_changes(&vm.vma(), &mut side_effects)?;
         self.trace.events.push(recordable::LogEvent {
             pc: preempted.pc,
             register_state: vec![],
@@ -766,7 +764,7 @@ impl Warpspeed {
             )),
         });
         self.state.event_idx += 1;
-        self.record_switch_in(&vm.vcpu, &vm.vma, tid, switch)?;
+        self.record_switch_in(&vm.vcpu, &vm.vma(), tid, switch)?;
         self.state.last_event_instructions = vm.guest_instructions();
         Ok(())
     }
@@ -794,11 +792,11 @@ impl Warpspeed {
         };
         self.event_writes.clear();
         if let Some(side_effects) = &preemption.side_effects {
-            self.replay_allocations(&mut vm.vma, side_effects)?;
-            self.apply_memory(&mut vm.vma, &side_effects.memory);
+            self.replay_allocations(&mut vm.vma(), side_effects)?;
+            self.apply_memory(&mut vm.vma(), &side_effects.memory);
         }
         self.state.event_idx += 1;
-        let exit = self.replay_switch_in(&mut vm.vcpu, &mut vm.vma)?;
+        let exit = self.replay_switch_in(vm)?;
         self.state.last_event_instructions = vm.guest_instructions();
         Ok(exit)
     }
@@ -900,23 +898,18 @@ impl Warpspeed {
 
     /// Handles a syscall (`VmRunResult::Svc`), recording or replaying it.
     pub fn trap_handler(&mut self, vm: &mut VmManager, loader: &Loader) -> Result<ExitKind> {
-        let exit = self.handle_syscall(&mut vm.vcpu, &mut vm.vma, loader);
+        let exit = self.handle_syscall(vm, loader);
         self.state.last_event_instructions = vm.guest_instructions();
         exit
     }
 
-    fn handle_syscall(
-        &mut self,
-        vcpu: &mut av::Vcpu,
-        vma: &mut VirtMemAllocator,
-        loader: &Loader,
-    ) -> Result<ExitKind> {
-        let ctx = read_syscall_context(vcpu)?;
+    fn handle_syscall(&mut self, vm: &mut VmManager, loader: &Loader) -> Result<ExitKind> {
+        let ctx = read_syscall_context(&mut vm.vcpu)?;
         let elr = ctx.elr;
         trace!("ELR_EL1: {:#x}", elr);
         if ctx.esr != 0x56000080 {
             error!("Fault!");
-            error!("{}", vcpu);
+            error!("{}", vm.vcpu);
             return Ok(ExitKind::Crash("Unhandled fault".to_string()));
         }
 
@@ -947,9 +940,9 @@ impl Warpspeed {
         match self.mode {
             Mode::Record => {
                 tid = self.trap_handler.current_thread();
-                let before_pages = snapshot_pages(vma, &args)?;
+                let before_pages = snapshot_pages(&vm.vma(), &args)?;
 
-                let res = self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
+                let res = self.trap_handler.handle_syscall(&ctx, vm, loader)?;
                 exit_kind = res.exit.clone();
                 if let ExitKind::Exec(request) = &exit_kind {
                     self.trace.events.push(recordable::LogEvent {
@@ -969,7 +962,7 @@ impl Warpspeed {
                     return Ok(exit_kind);
                 }
                 if let Some(switch) = res.thread_switch {
-                    self.record_switch(vcpu, vma, elr, num, &args, tid, before_pages, switch)?;
+                    self.record_switch(&vm.vcpu, &vm.vma(), elr, num, &args, tid, before_pages, switch)?;
                     return Ok(ExitKind::Continue);
                 }
                 ret0 = res.ret0;
@@ -984,15 +977,15 @@ impl Warpspeed {
                         let buf = args[1];
                         let count = ret0;
                         let mut data = vec![0; count as usize];
-                        vma.read(buf, &mut data)?;
+                        vm.vma().read(buf, &mut data)?;
                         side_effects.memory.push(recordable::side_effects::Memory {
                             address: buf,
                             value: data,
                         });
                     }
-                    _ => side_effects.memory.extend(diff_pages(vma, before_pages)?),
+                    _ => side_effects.memory.extend(diff_pages(&vm.vma(), before_pages)?),
                 }
-                self.record_guest_memory_changes(vma, &mut side_effects)?;
+                self.record_guest_memory_changes(&vm.vma(), &mut side_effects)?;
 
                 trace!(
                     "Changed mem: {:?}",
@@ -1048,7 +1041,7 @@ impl Warpspeed {
                             );
                         }
                         if syscall.descheduled {
-                            return self.replay_switch(vcpu, vma, num, &args, &syscall);
+                            return self.replay_switch(vm, num, &args, &syscall);
                         }
 
                         let side_effects_ref = syscall.side_effects.as_ref().unwrap();
@@ -1059,11 +1052,11 @@ impl Warpspeed {
                             trace!("Replay syscall index {}", self.state.event_idx);
                             // appbox only knows about the main thread on replay, so keep the
                             // current thread's TSD base unless the syscall sets it.
-                            let tpidrro = vcpu.get_sys_reg(av::SysReg::TPIDRRO_EL0)?;
+                            let tpidrro = vm.vcpu.get_sys_reg(av::SysReg::TPIDRRO_EL0)?;
                             let handler_res =
-                                self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
+                                self.trap_handler.handle_syscall(&ctx, vm, loader)?;
                             if !(num == 0x8000_0000 && args[3] == 2) {
-                                vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, tpidrro)?;
+                                vm.vcpu.set_sys_reg(av::SysReg::TPIDRRO_EL0, tpidrro)?;
                             }
                             if handler_res.exit != ExitKind::Continue {
                                 return Ok(handler_res.exit);
@@ -1110,8 +1103,8 @@ impl Warpspeed {
                                 }
                             }
                         }
-                        self.replay_allocations(vma, side_effects_ref)?;
-                        self.apply_memory(vma, &side_effects_ref.memory);
+                        self.replay_allocations(&mut vm.vma(), side_effects_ref)?;
+                        self.apply_memory(&mut vm.vma(), &side_effects_ref.memory);
                     }
                     _ => {
                         error!(
@@ -1125,7 +1118,7 @@ impl Warpspeed {
         }
 
         // Stage 3: now that we've done the syscall, record the final state as side effects.
-        let cpsr = (vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags;
+        let cpsr = (vm.vcpu.get_sys_reg(av::SysReg::SPSR_EL1)? & !(0b1111 << 28)) | cflags;
 
         if self.mode == Mode::Record {
             side_effects.registers.extend(vec![
@@ -1168,7 +1161,7 @@ impl Warpspeed {
         }
 
         debug!("Returning x0={:x} x1={:x} cpsr={:x}", ret0, ret1, cpsr);
-        write_syscall_result(vcpu, elr, ret0, ret1, cflags)?;
+        write_syscall_result(&mut vm.vcpu, elr, ret0, ret1, cflags)?;
         Ok(ExitKind::Continue)
     }
 }

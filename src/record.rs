@@ -183,6 +183,8 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
             VmRunResult::HardwareBreakpoint | VmRunResult::Step | VmRunResult::Watchpoint { .. } => {
                 ExitKind::Crash("unexpected debug exception".to_string())
             }
+            // Only parallel guest threads stop the VM, and those can't be recorded.
+            VmRunResult::Stopped => ExitKind::Crash("VM stopped".to_string()),
             VmRunResult::Brk => {
                 let pc = vm.vcpu.get_reg(av::Reg::PC)?;
 

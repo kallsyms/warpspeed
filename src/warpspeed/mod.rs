@@ -268,6 +268,10 @@ pub struct Warpspeed {
 
 impl Warpspeed {
     pub fn new(trace: recordable::Trace, mode: Mode) -> Result<Self> {
+        anyhow::ensure!(
+            appbox::threading::model() == appbox::threading::ThreadingModel::TimeShared,
+            "recording and replaying need the guest's threads time-shared, not in parallel"
+        );
         let shared_file_ids_by_identity = trace
             .shared_files
             .iter()

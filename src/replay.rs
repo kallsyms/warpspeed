@@ -31,7 +31,7 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
 
     let mut vm = VmManager::new()?;
 
-    let loader = appbox::loader::load_macho(
+    let mut loader = appbox::loader::load_macho(
         &mut vm,
         &PathBuf::from(target.path),
         target.arguments,
@@ -88,6 +88,7 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
 
     let mut single_step_breakpoint: Option<u64> = None;
 
+    let mut final_exit = ExitKind::Continue;
     loop {
         let run_result = vm.run()?;
 
@@ -185,6 +186,11 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
                     single_step_breakpoint = None;
                     // Don't handle as normal breakpoint since we removed it
                     ExitKind::Continue
+                } else if notification_sender.is_none() {
+                    // No debugger set any breakpoints, so the guest trapped (e.g. abort()).
+                    log::error!("Guest trapped (brk) at {:#x}", pc);
+                    warpspeed::log_guest_stack(&vm, &loader);
+                    ExitKind::Crash("guest trap (brk)".to_string())
                 } else {
                     println!("Breakpoint hit at {:#x}", pc);
                     ExitKind::Continue
@@ -286,9 +292,20 @@ pub fn replay(args: &cli::ReplayArgs) -> Result<()> {
 
         match exit {
             ExitKind::Continue => continue,
-            _ => break,
+            ExitKind::Exec(request) => {
+                // Breakpoints went with the old image.
+                single_step_breakpoint = None;
+                (vm, loader) = warpspeed.exec(vm, loader, &request)?;
+            }
+            exit => {
+                final_exit = exit;
+                break;
+            }
         };
     }
 
+    if let ExitKind::Crash(reason) = final_exit {
+        anyhow::bail!("guest crashed: {reason}");
+    }
     Ok(())
 }

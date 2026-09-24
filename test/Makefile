@@ -1,5 +1,5 @@
 .PHONY: all
-all: echo multithread time rand mmap_shared threads
+all: echo multithread time rand mmap_shared threads exec
 
 echo: echo.c
 	$(CC) -o $@ $^
@@ -19,6 +19,9 @@ mmap_shared: mmap_shared.c
 threads: threads.c
 	$(CC) -o $@ $^
 
+exec: exec.c
+	$(CC) -o $@ $^
+
 .PHONY: clean
 clean:
-	rm -f echo multithread time rand mmap_shared threads
+	rm -f echo multithread time rand mmap_shared threads exec

@@ -46,7 +46,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
 
     let mut vm = VmManager::new()?;
 
-    let loader =
+    let mut loader =
         appbox::loader::load_macho(&mut vm, &PathBuf::from(args.executable.clone()), argv, env)?;
 
     vm.vcpu.set_reg(av::Reg::PC, loader.entry_point)?;
@@ -103,6 +103,7 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
         }
     }
 
+    let mut final_exit = ExitKind::Continue;
     loop {
         trace!("Running VCPU");
         let run_result = vm.run()?;
@@ -208,6 +209,11 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
                     }
                     appbox::hyperpom::caches::Caches::ic_ivau(&mut vm.vcpu, &mut vm.vma)?;
                     ExitKind::Continue
+                } else if notification_sender.is_none() {
+                    // No debugger set any breakpoints, so the guest trapped (e.g. abort()).
+                    error!("Guest trapped (brk) at {:#x}", pc);
+                    warpspeed::log_guest_stack(&vm, &loader);
+                    ExitKind::Crash("guest trap (brk)".to_string())
                 } else {
                     debug!("Breakpoint hit at {:#x}", pc);
                     // Restore original instruction
@@ -321,12 +327,23 @@ pub fn record(args: &cli::RecordArgs) -> Result<()> {
 
         match exit {
             ExitKind::Continue => continue,
-            _ => break,
+            ExitKind::Exec(request) => {
+                // Breakpoints went with the old image.
+                single_step_breakpoint = None;
+                (vm, loader) = warpspeed.exec(vm, loader, &request)?;
+            }
+            exit => {
+                final_exit = exit;
+                break;
+            }
         };
     }
 
     let mut output = File::create(&args.trace_filename)?;
     output.write_all(prost::Message::encode_to_vec(&warpspeed.trace).as_slice())?;
 
+    if let ExitKind::Crash(reason) = final_exit {
+        anyhow::bail!("guest crashed: {reason}");
+    }
     Ok(())
 }

@@ -30,6 +30,13 @@ message Trace {
   repeated SharedFile shared_files = 3;
 }
 
+// The guest replaced its image, as with execve().
+message Exec {
+  string path = 1;
+  repeated string argv = 2;
+  repeated string envp = 3;
+}
+
 // LogEvent is a single event in the trace.
 // It contains a program counter and a union of all possible events.
 message LogEvent {
@@ -40,5 +47,6 @@ message LogEvent {
   oneof event {
     warpspeed.recordable.syscall.Syscall syscall = 10;
     warpspeed.recordable.scheduling.Scheduling scheduling = 12;
+    Exec exec = 13;
   }
 }

@@ -6,7 +6,9 @@ use log::{debug, error, trace};
 use std::collections::HashMap;
 
 use appbox::applevisor as av;
+use appbox::exec::ExecRequest;
 use appbox::hyperpom::crash::ExitKind;
+use appbox::vm::VmManager;
 use appbox::syscalls;
 use appbox::threads::{Registers, ThreadId, ThreadSwitch};
 use appbox::trap::{
@@ -74,6 +76,23 @@ fn diff_pages(vma: &VirtMemAllocator, before: PageSnapshot) -> Result<Vec<side_e
         changes.extend(diff_memory(page_addr, &old_contents, &new_contents));
     }
     Ok(changes)
+}
+
+/// Logs the guest's symbolicated stack, e.g. when it traps.
+pub fn log_guest_stack(vm: &VmManager, loader: &Loader) {
+    for (idx, addr) in appbox::unwind_user_stack(vm, 64).iter().enumerate() {
+        match loader.symbolicate(*addr) {
+            Some(sym) => error!(
+                "{:02} 0x{:016x} {}::{} + 0x{:x}",
+                idx,
+                addr,
+                sym.image,
+                sym.symbol,
+                addr - sym.symbol_addr
+            ),
+            None => error!("{:02} 0x{:016x}", idx, addr),
+        }
+    }
 }
 
 fn apply_memory(memory: &[side_effects::Memory]) {
@@ -441,6 +460,21 @@ impl Warpspeed {
             return true;
         }
 
+        // Duplicating descriptors, and close-on-exec flags, which exec relies on.
+        if matches!(num, syscalls::SYS_fcntl | syscalls::SYS_fcntl_nocancel)
+            && matches!(
+                args[1] as i32,
+                nix::libc::F_SETFD | nix::libc::F_DUPFD | nix::libc::F_DUPFD_CLOEXEC
+            )
+        {
+            return true;
+        }
+        if num == syscalls::SYS_ioctl
+            && matches!(args[1], nix::libc::FIOCLEX | nix::libc::FIONCLEX)
+        {
+            return true;
+        }
+
         // Also include write_nocancel so we can see stdout/stderr.
         if num == syscalls::SYS_write_nocancel && (args[0] == 1 || args[0] == 2) {
             return true;
@@ -652,6 +686,21 @@ impl Warpspeed {
         Ok(ExitKind::Continue)
     }
 
+    /// Replaces the guest's image as `request` says, like the kernel's exec.
+    pub fn exec(
+        &mut self,
+        vm: VmManager,
+        loader: Loader,
+        request: &ExecRequest,
+    ) -> Result<(VmManager, Loader)> {
+        let (vm, loader) = appbox::exec::exec(vm, loader, &mut self.trap_handler, request)?;
+        // Only the calling thread survives, and close-on-exec descriptors are gone.
+        self.pending.clear();
+        self.fd_table
+            .retain(|&fd, _| unsafe { nix::libc::fcntl(fd, nix::libc::F_GETFD) } >= 0);
+        Ok((vm, loader))
+    }
+
     pub fn trap_handler(
         &mut self,
         vcpu: &mut av::Vcpu,
@@ -698,6 +747,20 @@ impl Warpspeed {
 
                 let res = self.trap_handler.handle_syscall(&ctx, vcpu, vma, loader)?;
                 exit_kind = res.exit.clone();
+                if let ExitKind::Exec(request) = &exit_kind {
+                    self.trace.events.push(recordable::LogEvent {
+                        pc: elr,
+                        register_state: args.to_vec(),
+                        tid,
+                        event: Some(recordable::log_event::Event::Exec(recordable::Exec {
+                            path: request.path.to_string_lossy().into_owned(),
+                            argv: request.argv.clone(),
+                            envp: request.envp.clone(),
+                        })),
+                    });
+                    self.event_idx += 1;
+                    return Ok(exit_kind);
+                }
                 if exit_kind != ExitKind::Continue && exit_kind != ExitKind::Exit {
                     return Ok(exit_kind);
                 }
@@ -756,6 +819,15 @@ impl Warpspeed {
                 }
 
                 match &event.event {
+                    Some(recordable::log_event::Event::Exec(exec)) => {
+                        let request = ExecRequest {
+                            path: exec.path.clone().into(),
+                            argv: exec.argv.clone(),
+                            envp: exec.envp.clone(),
+                        };
+                        self.event_idx += 1;
+                        return Ok(ExitKind::Exec(request));
+                    }
                     Some(crate::recordable::log_event::Event::Syscall(syscall)) => {
                         let syscall = syscall.clone();
                         if num != syscall.syscall_number {

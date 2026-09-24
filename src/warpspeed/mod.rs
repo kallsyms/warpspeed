@@ -998,27 +998,25 @@ impl Warpspeed {
             num,
             args
         );
-        let diverged = Decision::End(GuestEnd::Exited(0));
         let tid = self.state.current_tid;
         self.event_writes.clear();
         let Some(event) = self.trace.events.get(self.state.event_idx) else {
-            error!("Replay {}: past the end of the recording", self.state.event_idx);
-            return Ok(diverged);
+            anyhow::bail!("replay {}: past the end of the recording", self.state.event_idx);
         };
-        if elr != event.pc {
-            error!(
-                "Replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
-                self.state.event_idx, event.pc, elr
-            );
-            return Ok(diverged);
-        }
-        if tid != event.tid {
-            error!(
-                "Replay {}: thread mismatch: expected {}, got {}",
-                self.state.event_idx, event.tid, tid
-            );
-            return Ok(diverged);
-        }
+        anyhow::ensure!(
+            elr == event.pc,
+            "replay {}: pc mismatch: expected 0x{:x}, got 0x{:x}",
+            self.state.event_idx,
+            event.pc,
+            elr
+        );
+        anyhow::ensure!(
+            tid == event.tid,
+            "replay {}: thread mismatch: expected {}, got {}",
+            self.state.event_idx,
+            event.tid,
+            tid
+        );
 
         let syscall = match &event.event {
             Some(recordable::log_event::Event::Exec(_)) => {
@@ -1026,13 +1024,11 @@ impl Warpspeed {
                 return Ok(Decision::Default);
             }
             Some(recordable::log_event::Event::Syscall(syscall)) => syscall.clone(),
-            _ => {
-                error!(
-                    "replay {}: unexpected event type: {:?}",
-                    self.state.event_idx, event.event
-                );
-                return Ok(diverged);
-            }
+            _ => anyhow::bail!(
+                "replay {}: unexpected event type: {:?}",
+                self.state.event_idx,
+                event.event
+            ),
         };
         if num != syscall.syscall_number {
             error!(
@@ -1059,9 +1055,7 @@ impl Warpspeed {
             return Ok(Decision::Default);
         }
 
-        let Some(returned) = self.recorded_return(&syscall, None) else {
-            return Ok(diverged);
-        };
+        let returned = self.recorded_return(&syscall, None)?;
         self.replay_side_effects(t, &syscall, num, &args, &returned)?;
         self.in_syscall = Some(InSyscall::Replayed);
         Ok(Decision::Return(returned))
@@ -1073,7 +1067,7 @@ impl Warpspeed {
         &self,
         syscall: &recordable::syscall::Syscall,
         again: Option<&Returned>,
-    ) -> Option<Returned> {
+    ) -> Result<Returned> {
         let mut returned = Returned { x0: 0, x1: 0, flags: 0 };
         for reg in &syscall.side_effects.as_ref().unwrap().registers {
             trace!("Setting X{:?} to 0x{:x}", reg.register, reg.value);
@@ -1084,13 +1078,11 @@ impl Warpspeed {
                     returned.flags = reg.value;
                     continue;
                 }
-                _ => {
-                    error!(
-                        "Replay {}: unexpected register: {:?}",
-                        self.state.event_idx, reg.register
-                    );
-                    return None;
-                }
+                _ => anyhow::bail!(
+                    "replay {}: unexpected register: {:?}",
+                    self.state.event_idx,
+                    reg.register
+                ),
             };
             if let Some(value) = value.filter(|&value| value != reg.value) {
                 error!(
@@ -1100,7 +1092,7 @@ impl Warpspeed {
             }
             *recorded = reg.value;
         }
-        Some(returned)
+        Ok(returned)
     }
 
     fn replay_side_effects(
@@ -1136,9 +1128,7 @@ impl Warpspeed {
                     if !(num == 0x8000_0000 && args[3] == 2) {
                         t.vcpu().set_sys_reg(av::SysReg::TPIDRRO_EL0, tpidrro)?;
                     }
-                    let Some(returned) = self.recorded_return(&syscall, Some(again)) else {
-                        anyhow::bail!("replay {}: unreplayable syscall", self.state.event_idx);
-                    };
+                    let returned = self.recorded_return(&syscall, Some(again))?;
                     set_returned(t.vcpu(), &returned)?;
                     self.replay_side_effects(t, &syscall, num, &args, &returned)?;
                     true

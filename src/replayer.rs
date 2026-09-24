@@ -161,9 +161,9 @@ enum Goal {
 struct Replayer {
     warpspeed: Warpspeed,
     debugger: Option<GdbServer>,
-    /// The debugger's, by hardware slot (see [`ThreadCx::hardware_breakpoints`]).
-    breakpoints: Vec<Option<u64>>,
-    watchpoints: Vec<Option<Watchpoint>>,
+    /// The debugger's.
+    breakpoints: Vec<u64>,
+    watchpoints: Vec<Watchpoint>,
     goal: Goal,
     /// A stop to report to the debugger before running on (see [`Slice::Stop`]).
     pending_stop: Option<DebugStop>,
@@ -279,11 +279,17 @@ impl Replayer {
 
     /// Takes the debugger's breakpoints and watchpoints out of the VM, or puts them back.
     fn arm(&self, t: &mut ThreadCx, armed: bool) -> Result<()> {
-        for (slot, addr) in self.breakpoints.iter().enumerate() {
-            t.set_hardware_breakpoint(slot, addr.filter(|_| armed))?;
+        for &addr in &self.breakpoints {
+            match armed {
+                true => t.add_breakpoint(addr)?,
+                false => t.remove_breakpoint(addr)?,
+            }
         }
-        for (slot, watchpoint) in self.watchpoints.iter().enumerate() {
-            t.set_hardware_watchpoint(slot, watchpoint.filter(|_| armed))?;
+        for &watchpoint in &self.watchpoints {
+            match armed {
+                true => t.add_watchpoint(watchpoint)?,
+                false => t.remove_watchpoint(watchpoint)?,
+            }
         }
         Ok(())
     }
@@ -304,8 +310,8 @@ impl Replayer {
         }
         while let Some(command) = debugger.recv() {
             if debugger.handle(&command, t) {
-                self.breakpoints = t.hardware_breakpoints();
-                self.watchpoints = t.hardware_watchpoints();
+                self.breakpoints = t.breakpoints();
+                self.watchpoints = t.watchpoints();
                 continue;
             }
             match command {
@@ -568,7 +574,7 @@ impl Replayer {
 
         // The event's recorded writes (e.g. a read() filling a buffer) can hit watchpoints.
         let written = self.warpspeed.event_writes().to_vec();
-        for watchpoint in self.watchpoints.clone().into_iter().flatten() {
+        for watchpoint in self.watchpoints.clone() {
             if watchpoint.kind == WatchKind::Read {
                 continue;
             }
@@ -586,7 +592,7 @@ impl Replayer {
     }
 
     fn watchpoint_at(&self, addr: u64) -> Result<Watchpoint> {
-        let mut watchpoints = self.watchpoints.iter().flatten();
+        let mut watchpoints = self.watchpoints.iter();
         watchpoints
             .clone()
             .find(|w| w.addr <= addr && addr < w.addr + w.len.max(8))

@@ -142,7 +142,8 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn parse_addresses(stdout: &str) -> (u64, u64) {
+/// The fixture's `value`, `set_value` and `never_called` addresses.
+fn parse_addresses(stdout: &str) -> (u64, u64, u64) {
     let line = stdout.lines().next().unwrap();
     let field = |name: &str| {
         let start = line.find(&format!("{name}=0x")).unwrap() + name.len() + 3;
@@ -152,11 +153,12 @@ fn parse_addresses(stdout: &str) -> (u64, u64) {
             .collect();
         u64::from_str_radix(&hex, 16).unwrap()
     };
-    (field("value"), field("set_value"))
+    (field("value"), field("set_value"), field("never_called"))
 }
 
-#[test]
-fn reverse_continue_to_watchpoints_and_breakpoints() {
+/// Records the fixture, and replays it for a debugger. Returns the replay, the connection to
+/// it, the fixture's addresses and the directory holding the trace.
+fn record_and_replay() -> (Replay, Gdb, (u64, u64, u64), PathBuf) {
     let fixture = build_fixture();
     let test_dir = unique_test_dir();
     std::fs::create_dir_all(&test_dir).unwrap();
@@ -168,10 +170,10 @@ fn reverse_continue_to_watchpoints_and_breakpoints() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&record.stdout);
     assert!(record.status.success(), "record failed:\n{stdout}\n{}", String::from_utf8_lossy(&record.stderr));
-    let (value, set_value) = parse_addresses(&stdout);
+    let addresses = parse_addresses(&stdout);
 
     let port = free_port();
-    let _replay = Replay(
+    let replay = Replay(
         warpspeed(&["replay", trace, "--gdb-port", &port.to_string()])
             // Several checkpoints, so going backwards has to look through more than one.
             .env("WARPSPEED_CHECKPOINT_EVERY", "10000000")
@@ -179,7 +181,26 @@ fn reverse_continue_to_watchpoints_and_breakpoints() {
             .spawn()
             .unwrap(),
     );
-    let mut gdb = Gdb::connect(port);
+    let gdb = Gdb::connect(port);
+    (replay, gdb, addresses, test_dir)
+}
+
+const SVC_0X80: u32 = 0xd4001001;
+
+/// Steps to the next `svc`, returning its address.
+fn step_to_svc(gdb: &mut Gdb) -> u64 {
+    loop {
+        let pc = gdb.register(32);
+        if gdb.read_u64(pc) as u32 == SVC_0X80 {
+            return pc;
+        }
+        assert_eq!(gdb.request("s"), "S05");
+    }
+}
+
+#[test]
+fn reverse_continue_to_watchpoints_and_breakpoints() {
+    let (_replay, mut gdb, (value, set_value, _), test_dir) = record_and_replay();
     // Nothing comes before the start.
     assert_eq!(gdb.request("bs"), "T05replaylog:begin;");
 
@@ -225,14 +246,7 @@ fn reverse_continue_to_watchpoints_and_breakpoints() {
     // Stepping backwards over a syscall: step on into the write() after set_value, over its svc,
     // then back.
     assert_eq!(gdb.request(&format!("z0,{set_value:x},4")), "OK");
-    const SVC_0X80: u32 = 0xd4001001;
-    let svc = loop {
-        let pc = gdb.register(32);
-        if gdb.read_u64(pc) as u32 == SVC_0X80 {
-            break pc;
-        }
-        assert_eq!(gdb.request("s"), "S05");
-    };
+    let svc = step_to_svc(&mut gdb);
     let before = (gdb.register(0), gdb.register(16));
     assert_eq!(gdb.request("s"), "S05");
     assert_eq!(gdb.register(32), svc + 4);
@@ -243,6 +257,54 @@ fn reverse_continue_to_watchpoints_and_breakpoints() {
     assert_eq!(gdb.request("c"), "W00");
 
     // Which has no reply.
+    gdb.send("k");
+    std::fs::remove_dir_all(test_dir).unwrap();
+}
+
+/// Breakpoints beyond the hardware ones are planted in the guest's code (here, in the fixture and
+/// in the shared cache), which going backwards through checkpoints mustn't disturb.
+#[test]
+fn breakpoints_beyond_the_hardware_ones() {
+    let (_replay, mut gdb, (_, set_value, never_called), test_dir) = record_and_replay();
+
+    // Into the first write().
+    assert_eq!(gdb.request(&format!("Z0,{set_value:x},4")), "OK");
+    assert_eq!(gdb.request("c"), "S05");
+    assert_eq!(gdb.request(&format!("z0,{set_value:x},4")), "OK");
+    let svc = step_to_svc(&mut gdb);
+
+    // More than there are hardware breakpoints, before the ones that are hit.
+    for i in 0..8 {
+        assert_eq!(gdb.request(&format!("Z0,{:x},4", never_called + 4 * i)), "OK");
+    }
+    assert_eq!(gdb.request(&format!("Z0,{set_value:x},4")), "OK");
+    assert_eq!(gdb.request(&format!("Z0,{svc:x},4")), "OK");
+    // The debugger sees the instruction, not the breakpoint.
+    assert_eq!(gdb.read_u64(svc) as u32, SVC_0X80);
+
+    for expected in [2, 3] {
+        assert_eq!(gdb.request("c"), "S05");
+        assert_eq!((gdb.register(32), gdb.register(0)), (set_value, expected));
+        assert_eq!(gdb.request("c"), "S05");
+        assert_eq!(gdb.register(32), svc);
+    }
+    // Back through each (set_value's with its argument).
+    let stops = [(set_value, Some(3)), (svc, None), (set_value, Some(2)), (svc, None)];
+    for (pc, x0) in stops.into_iter().chain([(set_value, Some(1))]) {
+        assert_eq!(gdb.request("bc"), "S05");
+        assert_eq!(gdb.register(32), pc);
+        if let Some(x0) = x0 {
+            assert_eq!(gdb.register(0), x0);
+        }
+    }
+    assert_eq!(gdb.request("bc"), "T05replaylog:begin;");
+    assert_eq!(gdb.request("c"), "S05");
+    assert_eq!((gdb.register(32), gdb.register(0)), (set_value, 1));
+
+    for addr in (0..8).map(|i| never_called + 4 * i).chain([set_value, svc]) {
+        assert_eq!(gdb.request(&format!("z0,{addr:x},4")), "OK");
+    }
+    assert_eq!(gdb.request("c"), "W00");
     gdb.send("k");
     std::fs::remove_dir_all(test_dir).unwrap();
 }
